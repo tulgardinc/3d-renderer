@@ -23,6 +23,8 @@ pub fn build(b: *std.Build) void {
 
     exe.addRPath(b.path("zig-out/bin/"));
 
+    exe.addCSourceFile(.{ .file = b.path("c/sdl3webgpu.c") });
+
     exe.linkFramework("Metal");
     exe.linkFramework("QuartzCore");
     exe.linkFramework("Foundation");
