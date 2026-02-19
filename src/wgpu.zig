@@ -170,3 +170,149 @@ pub fn getNextSurfaceView(surface: c.WGPUSurface) !c.WGPUTextureView {
     );
     return target_view;
 }
+
+const GPUContext = struct {
+    instance: c.WGPUInstance,
+    adapter: c.WGPUAdapter,
+    device: c.WGPUDevice,
+    queue: c.WGPUQueue,
+
+    const Self = @This();
+
+    pub fn initSync(surface: c.WGPUSurface) !Self {
+        const instance = try getInstance();
+        const adapter = try requestAdapterSync(instance, surface);
+        const device = try requestDeviceSync(instance, adapter);
+        const queue = c.wgpuDeviceGetQueue(device);
+
+        return .{
+            .instance = instance,
+            .adapter = adapter,
+            .device = device,
+            .queue = queue,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        c.wgpuQueueRelease(self.queue);
+        c.wgpuDeviceRelease(self.device);
+        c.wgpuAdapterRelease(self.adapter);
+        c.wgpuInstanceRelease(self.instance);
+    }
+};
+
+const SurfaceRenderer = struct {
+    surface: c.WGPUSurface,
+    gpu_context: *GPUContext,
+
+    const Self = @This();
+
+    pub fn init(
+        surface: c.WGPUSurface,
+        gpu_context: *GPUContext,
+        width: u32,
+        height: u32,
+    ) Self {
+        var config = z_WGPU_SURFACE_CONFIGURATION_INIT();
+        config.width = width;
+        config.height = height;
+        config.device = gpu_context.device;
+        var surface_capabilities = z_WGPU_SURFACE_CAPABILITIES_INIT();
+        _ = c.wgpuSurfaceGetCapabilities(
+            surface,
+            gpu_context.adapter,
+            &surface_capabilities,
+        );
+        config.format = surface_capabilities.formats[0];
+        c.wgpuSurfaceCapabilitiesFreeMembers(surface_capabilities);
+        config.presentMode = c.WGPUPresentMode_Fifo;
+        config.alphaMode = c.WGPUCompositeAlphaMode_Auto;
+
+        // configure the surface
+        c.wgpuSurfaceConfigure(surface, &config);
+
+        return .{
+            .surface = surface,
+            .gpu_context = gpu_context,
+        };
+    }
+
+    pub fn beginFrame(self: Self) Frame {
+        return Frame.init(
+            self.gpu_context.device,
+            self.surface,
+        );
+    }
+
+    pub fn endFrame(self: *Self, frame: *Frame) void {
+        const command_buffer = getCommandBuffer(frame.encoder);
+        submitCommand(self.gpu_context.queue, &.{command_buffer});
+
+        _ = c.wgpuSurfacePresent(self.surface);
+
+        frame.deinit();
+    }
+
+    pub fn deinit(self: *Self) void {
+        c.wgpuSurfaceRelease(self.surface);
+    }
+};
+
+const Frame = struct {
+    encoder: c.WGPUCommandEncoder,
+    target_view: c.WGPUTextureView,
+
+    const Self = @This();
+
+    pub fn init(
+        device: c.WGPUDevice,
+        surface: c.WGPUSurface,
+    ) Self {
+        return .{
+            .encoder = getEncoder(device),
+            .target_view = getNextSurfaceView(surface),
+        };
+    }
+
+    pub fn beginRenderPass(self: *Self) RenderPass {
+        return RenderPass.init(self.encoder, self.target_view);
+    }
+
+    pub fn deinit(self: *Self) void {
+        c.wgpuCommandEncoderRelease(self.encoder);
+        c.wgpuTextureViewRelease(self.target_view);
+    }
+};
+
+const RenderPass = struct {
+    render_pass: c.WGPURenderPassEncoder,
+
+    const Self = @This();
+
+    pub fn init(encoder: c.WGPUCommandEncoder, target_view: c.WGPUTextureView) Self {
+        var render_pass_desc = z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
+
+        // color attachement
+        var color_attachment = z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
+        color_attachment.loadOp = c.WGPULoadOp_Clear;
+        color_attachment.storeOp = c.WGPUStoreOp_Store;
+        color_attachment.clearValue = c.WGPUColor{ .a = 1.0, .r = 0.8, .g = 0.0, .b = 1.0 };
+        render_pass_desc.colorAttachmentCount = 1;
+        render_pass_desc.colorAttachments = &color_attachment;
+        color_attachment.view = target_view;
+
+        const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(
+            encoder,
+            &render_pass_desc,
+        );
+
+        return .{
+            .render_pass = render_pass_encoder,
+        };
+    }
+
+    pub fn end(self: *Self) void {
+        c.wgpuRenderPassEncoderEnd(self.render_pass);
+        c.wgpuRenderPassEncoderRelease(self.render_pass);
+    }
+};
