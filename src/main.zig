@@ -1,89 +1,108 @@
 const std = @import("std");
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("webgpu/webgpu.h");
     @cInclude("SDL3/SDL.h");
     @cInclude("sdl3webgpu.h");
 });
 
-const AdapterRequest = struct {
-    done: bool,
-    adapter: c.WGPUAdapter,
-};
-
-fn onAdapterRequest(
-    status: c.WGPURequestAdapterStatus,
-    adapter: c.WGPUAdapter,
-    message: [*]const u8,
-    userdata: *void,
-) void {
-    var req_ptr: *AdapterRequest = @ptrCast(userdata);
-    _ = message;
-    if (status == c.WGPURequestAdapterStatus_Success) {
-        req_ptr.adapter = adapter;
-        req_ptr.done = true;
-    }
-}
-
-const DeviceRequest = struct { done: bool, device: c.WGPUDevice };
-
-fn onDeviceRequest(
-    status: c.WGPURequestDeviceStatus,
-    device: c.WGPUDevice,
-    message: [*]const u8,
-    userdata: *void,
-) void {
-    _ = message;
-
-    var req_ptr: *DeviceRequest = @ptrCast(userdata);
-    _ = message;
-    if (status == c.WGPURequestDeviceStatus_Success) {
-        req_ptr.device = device;
-        req_ptr.done = true;
-    }
-}
+const wgpu = @import("wgpu.zig");
 
 pub fn main() !void {
+    // Initialize SDL
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         c.SDL_Log("SDL_Init failed: %s", c.SDL_GetError());
         return error.SDL_FAILED;
     }
     defer c.SDL_Quit();
 
-    const win_ptr = c.SDL_CreateWindow(
-        "Test Window",
+    // Create window
+    const window = c.SDL_CreateWindow(
+        "WebGPU Clear Color",
         800,
         600,
         c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY,
     );
-    defer c.SDL_DestroyWindow(win_ptr);
-
-    var width: i32 = 0;
-    var height: i32 = 0;
-    _ = c.SDL_GetWindowSizeInPixels(win_ptr, &width, &height);
-
-    if (win_ptr == null) {
+    if (window == null) {
         c.SDL_Log("SDL_CreateWindow failed: %s", c.SDL_GetError());
         return error.SDL_FAILED;
     }
+    defer c.SDL_DestroyWindow(window);
 
-    const instDesc = c.WGPUInstanceDescriptor{};
-    const instance_ptr = c.wgpuCreateInstance(&instDesc);
+    // Get window size
+    var width: i32 = 0;
+    var height: i32 = 0;
+    _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
 
-    const surface_ptr = c.SDL_GetWGPUSurface(instance_ptr, win_ptr);
+    const instance = try wgpu.getInstance();
+    defer c.wgpuInstanceRelease(instance);
 
-    var adapterOptions = c.WGPURequestAdapterOptions{};
-    adapterOptions.compatibleSurface = surface_ptr;
-    c.wgpuInstanceRequestAdapter(instance_ptr, &adapterOptions, onAdapterRequest);
+    const surface = c.SDL_GetWGPUSurface(instance, window);
+    defer c.wgpuSurfaceRelease(surface);
 
+    const adapter = try wgpu.requestAdapterSync(instance, surface);
+    defer c.wgpuAdapterRelease(adapter);
+    const device = try wgpu.requestDeviceSync(instance, adapter);
+    defer c.wgpuDeviceRelease(device);
+
+    const queue = c.wgpuDeviceGetQueue(device);
+    defer c.wgpuQueueRelease(queue);
+
+    // surface config (abstract this)
+    var config = wgpu.z_WGPU_SURFACE_CONFIGURATION_INIT();
+    config.width = @intCast(width);
+    config.height = @intCast(height);
+    config.device = device;
+    var surface_capabilities = wgpu.z_WGPU_SURFACE_CAPABILITIES_INIT();
+    _ = c.wgpuSurfaceGetCapabilities(surface, adapter, &surface_capabilities);
+    config.format = surface_capabilities.formats[0];
+    c.wgpuSurfaceCapabilitiesFreeMembers(surface_capabilities);
+    config.presentMode = c.WGPUPresentMode_Fifo;
+    config.alphaMode = c.WGPUCompositeAlphaMode_Auto;
+
+    // configure the surface
+    c.wgpuSurfaceConfigure(surface, &config);
+
+    // Main loop
     var running = true;
     while (running) {
-        var e: c.SDL_Event = undefined;
-        while (c.SDL_PollEvent(&e)) {
-            if (e.type == c.SDL_EVENT_QUIT) {
+        // Handle events
+        var event: c.SDL_Event = undefined;
+        while (c.SDL_PollEvent(&event)) {
+            if (event.type == c.SDL_EVENT_QUIT) {
                 running = false;
             }
         }
 
-        c.SDL_Delay(10);
+        const encoder = wgpu.getEncoder(device);
+        defer c.wgpuCommandEncoderRelease(encoder);
+
+        // get the texture view
+        const target_view = try wgpu.getNextSurfaceView(surface);
+        defer c.wgpuTextureViewRelease(target_view);
+
+        // render pass
+        // abstract this
+        var render_pass_desc = wgpu.z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
+
+        // color attachement
+        var color_attachment = wgpu.z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
+        color_attachment.loadOp = c.WGPULoadOp_Clear;
+        color_attachment.storeOp = c.WGPUStoreOp_Store;
+        color_attachment.clearValue = c.WGPUColor{ .a = 1.0, .r = 0.8, .g = 0.0, .b = 1.0 };
+        render_pass_desc.colorAttachmentCount = 1;
+        render_pass_desc.colorAttachments = &color_attachment;
+        color_attachment.view = target_view;
+
+        const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(encoder, &render_pass_desc);
+        defer c.wgpuRenderPassEncoderRelease(render_pass_encoder);
+
+        c.wgpuRenderPassEncoderEnd(render_pass_encoder);
+
+        const command_buffer = wgpu.getCommandBuffer(encoder);
+        wgpu.submitCommand(queue, &.{command_buffer});
+
+        _ = c.wgpuSurfacePresent(surface);
+
+        std.Thread.sleep(1_000_000);
     }
 }

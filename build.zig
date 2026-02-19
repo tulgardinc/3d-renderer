@@ -23,7 +23,8 @@ pub fn build(b: *std.Build) void {
 
     exe.addRPath(b.path("zig-out/bin/"));
 
-    exe.addCSourceFile(.{ .file = b.path("c/sdl3webgpu.c") });
+    exe.addCSourceFile(.{ .file = b.path("c/sdl3webgpu.m") });
+    exe.addCSourceFile(.{ .file = b.path("c/wgpu_init_shim.c") });
 
     exe.linkFramework("Metal");
     exe.linkFramework("QuartzCore");
@@ -31,6 +32,7 @@ pub fn build(b: *std.Build) void {
     exe.linkFramework("AppKit");
     exe.linkFramework("CoreGraphics");
     exe.linkFramework("IOSurface");
+    exe.linkFramework("IOKit");
 
     exe.linkSystemLibrary("c++");
 
