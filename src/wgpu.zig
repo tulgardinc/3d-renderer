@@ -739,11 +739,156 @@ pub const VertexLayout = struct {
 };
 
 pub const PipelineCache = struct {
-    pipelines: std.AutoHashMapUnmanaged(PipelineDescriptor, Entry),
+    pipelines: PipelineMap,
     default_color_format: TextureFormat,
     default_depth_format: TextureFormat,
     shader_manager: *const ShaderManager,
     gpu_context: *const GPUContext,
+
+    const PipelineMap = std.HashMapUnmanaged(
+        PipelineDescriptor,
+        Entry,
+        PipelineMapContext,
+        std.hash_map.default_max_load_percentage,
+    );
+    const PipelineMapContext = struct {
+        pub fn hash(_: @This(), key: PipelineDescriptor) u64 {
+            var h = std.hash.Wyhash.init(0);
+
+            if (key.color_format) |cf| {
+                h.update(&[_]u8{1});
+                h.update(std.mem.asBytes(&cf));
+            } else {
+                h.update(&[_]u8{0});
+            }
+            if (key.depth_format) |df| {
+                h.update(&[_]u8{1});
+                h.update(std.mem.asBytes(&df));
+            } else {
+                h.update(&[_]u8{0});
+            }
+            h.update(std.mem.asBytes(&key.shader));
+            h.update(std.mem.asBytes(&key.vertex_layout_count));
+            for (key.vertex_layouts[0..key.vertex_layout_count]) |vl| {
+                h.update(std.mem.asBytes(&vl.step_mode));
+                h.update(std.mem.asBytes(&vl.array_stride));
+                h.update(std.mem.asBytes(&vl.attribute_count));
+                for (vl.attributes[0..vl.attribute_count]) |attr| {
+                    h.update(std.mem.asBytes(&attr.format));
+                    h.update(std.mem.asBytes(&attr.offset));
+                    h.update(std.mem.asBytes(&attr.shader_location));
+                }
+            }
+            h.update(std.mem.asBytes(&key.primitive_topology));
+            if (key.depth_stencil) |ds| {
+                h.update(&[_]u8{1});
+                h.update(std.mem.asBytes(&ds.depth_write_enabled));
+                h.update(std.mem.asBytes(&ds.depth_compare));
+                if (ds.stencil_front) |sf| {
+                    h.update(&[_]u8{1});
+                    h.update(std.mem.asBytes(&sf.compare));
+                    h.update(std.mem.asBytes(&sf.fail_op));
+                    h.update(std.mem.asBytes(&sf.depth_fail_op));
+                    h.update(std.mem.asBytes(&sf.pass_op));
+                } else {
+                    h.update(&[_]u8{0});
+                }
+                if (ds.stencil_back) |sb| {
+                    h.update(&[_]u8{1});
+                    h.update(std.mem.asBytes(&sb.compare));
+                    h.update(std.mem.asBytes(&sb.fail_op));
+                    h.update(std.mem.asBytes(&sb.depth_fail_op));
+                    h.update(std.mem.asBytes(&sb.pass_op));
+                } else {
+                    h.update(&[_]u8{0});
+                }
+                h.update(std.mem.asBytes(&ds.stencil_read_mask));
+                h.update(std.mem.asBytes(&ds.stencil_write_mask));
+                h.update(std.mem.asBytes(&ds.depth_bias));
+                h.update(std.mem.asBytes(&ds.depth_bias_slope_scale));
+                h.update(std.mem.asBytes(&ds.depth_bias_clamp));
+            } else {
+                h.update(&[_]u8{0});
+            }
+            if (key.blend) |b| {
+                h.update(&[_]u8{1});
+                h.update(std.mem.asBytes(&b.color.operation));
+                h.update(std.mem.asBytes(&b.color.src_factor));
+                h.update(std.mem.asBytes(&b.color.dst_factor));
+                h.update(std.mem.asBytes(&b.alpha.operation));
+                h.update(std.mem.asBytes(&b.alpha.src_factor));
+                h.update(std.mem.asBytes(&b.alpha.dst_factor));
+            } else {
+                h.update(&[_]u8{0});
+            }
+            h.update(std.mem.asBytes(&key.cull_mode));
+            return h.final();
+        }
+        pub fn eql(_: @This(), key1: PipelineDescriptor, key2: PipelineDescriptor) bool {
+            if (key1.color_format != key2.color_format) return false;
+            if (key1.depth_format != key2.depth_format) return false;
+            if (key1.shader != key2.shader) return false;
+            if (key1.vertex_layout_count != key2.vertex_layout_count) return false;
+            for (key1.vertex_layouts[0..key1.vertex_layout_count], key2.vertex_layouts[0..key2.vertex_layout_count]) |vl1, vl2| {
+                if (vl1.step_mode != vl2.step_mode) return false;
+                if (vl1.array_stride != vl2.array_stride) return false;
+                if (vl1.attribute_count != vl2.attribute_count) return false;
+                for (vl1.attributes[0..vl1.attribute_count], vl2.attributes[0..vl2.attribute_count]) |a1, a2| {
+                    if (a1.format != a2.format) return false;
+                    if (a1.offset != a2.offset) return false;
+                    if (a1.shader_location != a2.shader_location) return false;
+                }
+            }
+            if (key1.primitive_topology != key2.primitive_topology) return false;
+            const ds1_present = key1.depth_stencil != null;
+            const ds2_present = key2.depth_stencil != null;
+            if (ds1_present != ds2_present) return false;
+            if (key1.depth_stencil) |ds1| {
+                const ds2 = key2.depth_stencil.?;
+                if (ds1.depth_write_enabled != ds2.depth_write_enabled) return false;
+                if (ds1.depth_compare != ds2.depth_compare) return false;
+                if (ds1.stencil_read_mask != ds2.stencil_read_mask) return false;
+                if (ds1.stencil_write_mask != ds2.stencil_write_mask) return false;
+                if (ds1.depth_bias != ds2.depth_bias) return false;
+                if (@as(u32, @bitCast(ds1.depth_bias_slope_scale)) != @as(u32, @bitCast(ds2.depth_bias_slope_scale))) return false;
+                if (@as(u32, @bitCast(ds1.depth_bias_clamp)) != @as(u32, @bitCast(ds2.depth_bias_clamp))) return false;
+                const sf1_present = ds1.stencil_front != null;
+                const sf2_present = ds2.stencil_front != null;
+                if (sf1_present != sf2_present) return false;
+                if (ds1.stencil_front) |sf1| {
+                    const sf2 = ds2.stencil_front.?;
+                    if (sf1.compare != sf2.compare) return false;
+                    if (sf1.fail_op != sf2.fail_op) return false;
+                    if (sf1.depth_fail_op != sf2.depth_fail_op) return false;
+                    if (sf1.pass_op != sf2.pass_op) return false;
+                }
+                const sb1_present = ds1.stencil_back != null;
+                const sb2_present = ds2.stencil_back != null;
+                if (sb1_present != sb2_present) return false;
+                if (ds1.stencil_back) |sb1| {
+                    const sb2 = ds2.stencil_back.?;
+                    if (sb1.compare != sb2.compare) return false;
+                    if (sb1.fail_op != sb2.fail_op) return false;
+                    if (sb1.depth_fail_op != sb2.depth_fail_op) return false;
+                    if (sb1.pass_op != sb2.pass_op) return false;
+                }
+            }
+            const b1_present = key1.blend != null;
+            const b2_present = key2.blend != null;
+            if (b1_present != b2_present) return false;
+            if (key1.blend) |b1| {
+                const b2 = key2.blend.?;
+                if (b1.color.operation != b2.color.operation) return false;
+                if (b1.color.src_factor != b2.color.src_factor) return false;
+                if (b1.color.dst_factor != b2.color.dst_factor) return false;
+                if (b1.alpha.operation != b2.alpha.operation) return false;
+                if (b1.alpha.src_factor != b2.alpha.src_factor) return false;
+                if (b1.alpha.dst_factor != b2.alpha.dst_factor) return false;
+            }
+            if (key1.cull_mode != key2.cull_mode) return false;
+            return true;
+        }
+    };
 
     pub const Entry = struct {
         pipeline: c.WGPURenderPipeline,

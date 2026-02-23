@@ -78,11 +78,11 @@ pub fn main() !void {
             .vertex_inputs = &.{
                 .{
                     .location = 0,
-                    .format = .f32x3,
+                    .format = .f32x2,
                 },
                 .{
                     .location = 1,
-                    .format = .f32x2,
+                    .format = .f32x3,
                 },
             },
         },
