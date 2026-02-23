@@ -5,9 +5,13 @@ pub const c = @cImport({
     @cInclude("sdl3webgpu.h");
 });
 
-const wgpu = @import("wgpu.zig");
+const w = @import("wgpu.zig");
 
 pub fn main() !void {
+    // get allocator
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
     // Initialize SDL
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         c.SDL_Log("SDL_Init failed: %s", c.SDL_GetError());
@@ -33,34 +37,95 @@ pub fn main() !void {
     var height: i32 = 0;
     _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
 
-    const instance = try wgpu.getInstance();
-    defer c.wgpuInstanceRelease(instance);
+    var instance = try w.GPUInstance.init();
+    defer instance.deinit();
 
-    const surface = c.SDL_GetWGPUSurface(instance, window);
-    defer c.wgpuSurfaceRelease(surface);
+    const surface_raw = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
 
-    const adapter = try wgpu.requestAdapterSync(instance, surface);
-    defer c.wgpuAdapterRelease(adapter);
-    const device = try wgpu.requestDeviceSync(instance, adapter);
-    defer c.wgpuDeviceRelease(device);
+    var gpu_context = try w.GPUContext.initSync(instance.webgpu_instance, surface_raw);
+    defer gpu_context.deinit();
 
-    const queue = c.wgpuDeviceGetQueue(device);
-    defer c.wgpuQueueRelease(queue);
+    var surface = w.Surface.init(
+        surface_raw,
+        &gpu_context,
+        @intCast(width),
+        @intCast(height),
+    );
+    defer surface.deinit();
 
-    // surface config (abstract this)
-    var config = wgpu.z_WGPU_SURFACE_CONFIGURATION_INIT();
-    config.width = @intCast(width);
-    config.height = @intCast(height);
-    config.device = device;
-    var surface_capabilities = wgpu.z_WGPU_SURFACE_CAPABILITIES_INIT();
-    _ = c.wgpuSurfaceGetCapabilities(surface, adapter, &surface_capabilities);
-    config.format = surface_capabilities.formats[0];
-    c.wgpuSurfaceCapabilitiesFreeMembers(surface_capabilities);
-    config.presentMode = c.WGPUPresentMode_Fifo;
-    config.alphaMode = c.WGPUCompositeAlphaMode_Auto;
+    var resources = try w.ResourceManager.init(allocator, &gpu_context);
+    defer resources.deinit(allocator);
 
-    // configure the surface
-    c.wgpuSurfaceConfigure(surface, &config);
+    var shaders = try w.ShaderManager.init(allocator, &gpu_context);
+    defer shaders.deinit(allocator);
+
+    var pipelines = try w.PipelineCache.init(
+        &gpu_context,
+        &shaders,
+        &surface,
+        .depth24_plus,
+    );
+
+    // create the shader
+    const shader_handle = try shaders.createShader(
+        allocator,
+        "./shaders/2DVertexColors.wgsl",
+        "test shader",
+        .{
+            .vertex_entry = "vs",
+            .fragment_entry = "fs",
+            .bind_groups = &.{},
+            .vertex_inputs = &.{
+                .{
+                    .location = 0,
+                    .format = .f32x3,
+                },
+                .{
+                    .location = 1,
+                    .format = .f32x2,
+                },
+            },
+        },
+    );
+
+    const vertices = [_]f32{
+        -0.5, -0.5, 1.0, 0.0, 0.0,
+        0.5,  -0.5, 0.0, 1.0, 0.0,
+        0,    0.5,  0.0, 0.0, 1.0,
+    };
+
+    const vb_handle = try resources.createBuffer(
+        allocator,
+        std.mem.sliceAsBytes(&vertices),
+        "vertex buffer",
+        w.BufferUsage.vertex | w.BufferUsage.copy_dst,
+    );
+
+    var pipeline_desc = w.PipelineCache.PipelineDescriptor{
+        .shader = shader_handle,
+        .vertex_layout_count = 1,
+    };
+    pipeline_desc.vertex_layouts[0] = w.VertexLayout{
+        .step_mode = .vertex,
+        .array_stride = 5 * @sizeOf(f32),
+        .attribute_count = 2,
+    };
+    pipeline_desc.vertex_layouts[0].attributes[0] = .{
+        .shader_location = 0,
+        .offset = 0,
+        .format = .f32x2,
+    };
+    pipeline_desc.vertex_layouts[0].attributes[1] = .{
+        .shader_location = 1,
+        .offset = 2 * @sizeOf(f32),
+        .format = .f32x3,
+    };
+
+    const pipeline_entry = try pipelines.getPipeline(
+        allocator,
+        "2d pipeline",
+        pipeline_desc,
+    );
 
     // Main loop
     var running = true;
@@ -73,35 +138,14 @@ pub fn main() !void {
             }
         }
 
-        const encoder = wgpu.getEncoder(device);
-        defer c.wgpuCommandEncoderRelease(encoder);
+        var frame = try surface.beginFrame();
+        defer frame.deinit();
 
-        // get the texture view
-        const target_view = try wgpu.getNextSurfaceView(surface);
-        defer c.wgpuTextureViewRelease(target_view);
+        var pass = frame.beginRenderPass();
+        defer pass.deinit();
 
-        // render pass
-        // abstract this
-        var render_pass_desc = wgpu.z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
-
-        // color attachement
-        var color_attachment = wgpu.z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
-        color_attachment.loadOp = c.WGPULoadOp_Clear;
-        color_attachment.storeOp = c.WGPUStoreOp_Store;
-        color_attachment.clearValue = c.WGPUColor{ .a = 1.0, .r = 0.8, .g = 0.0, .b = 1.0 };
-        render_pass_desc.colorAttachmentCount = 1;
-        render_pass_desc.colorAttachments = &color_attachment;
-        color_attachment.view = target_view;
-
-        const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(encoder, &render_pass_desc);
-        defer c.wgpuRenderPassEncoderRelease(render_pass_encoder);
-
-        c.wgpuRenderPassEncoderEnd(render_pass_encoder);
-
-        const command_buffer = wgpu.getCommandBuffer(encoder);
-        wgpu.submitCommand(queue, &.{command_buffer});
-
-        _ = c.wgpuSurfacePresent(surface);
+        const render_commands = frame.end();
+        gpu_context.submitCommands(&.{render_commands});
 
         std.Thread.sleep(1_000_000);
     }

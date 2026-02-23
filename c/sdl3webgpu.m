@@ -182,7 +182,6 @@ WGPUSurface SDL_GetWGPUSurface(WGPUInstance instance, SDL_Window *window) {
     return wgpuInstanceCreateSurface(instance, &surfaceDescriptor);
   }
 #else
-  // TODO: See SDL_syswm.h for other possible enum values!
 #error "Unsupported WGPU_TARGET"
 #endif
 }
