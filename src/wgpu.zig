@@ -34,6 +34,10 @@ pub extern fn z_WGPU_SAMPLER_BINDING_LAYOUT_INIT() c.WGPUSamplerBindingLayout;
 pub extern fn z_WGPU_TEXTURE_BINDING_LAYOUT_INIT() c.WGPUTextureBindingLayout;
 pub extern fn z_WGPU_STORAGE_TEXTURE_BINDING_LAYOUT_INIT() c.WGPUStorageTextureBindingLayout;
 pub extern fn z_WGPU_STENCIL_FACE_STATE_INIT() c.WGPUStencilFaceState;
+pub extern fn z_WGPU_BIND_GROUP_DESCRIPTOR_INIT() c.WGPUBindGroupDescriptor;
+pub extern fn z_WGPU_BIND_GROUP_ENTRY_INIT() c.WGPUBindGroupEntry;
+
+const MAX_BIND_GROUP_COUNT = 4;
 
 pub fn wgpuStringToString(sv: *const c.WGPUStringView) []const u8 {
     if (sv.data == null) {
@@ -403,6 +407,10 @@ pub const Surface = struct {
         );
     }
 
+    pub fn present(self: Self) void {
+        _ = c.wgpuSurfacePresent(self.surface);
+    }
+
     pub fn deinit(self: *Self) void {
         c.wgpuSurfaceRelease(self.surface);
     }
@@ -450,7 +458,7 @@ pub const RenderPass = struct {
         var color_attachment = z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
         color_attachment.loadOp = c.WGPULoadOp_Clear;
         color_attachment.storeOp = c.WGPUStoreOp_Store;
-        color_attachment.clearValue = c.WGPUColor{ .a = 1.0, .r = 0.8, .g = 0.0, .b = 1.0 };
+        color_attachment.clearValue = c.WGPUColor{ .a = 1.0, .r = 0.2, .g = 0.2, .b = 0.2 };
         render_pass_desc.colorAttachmentCount = 1;
         render_pass_desc.colorAttachments = &color_attachment;
         color_attachment.view = target_view;
@@ -465,8 +473,11 @@ pub const RenderPass = struct {
         };
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn end(self: *Self) void {
         c.wgpuRenderPassEncoderEnd(self.render_pass);
+    }
+
+    pub fn deinit(self: *Self) void {
         c.wgpuRenderPassEncoderRelease(self.render_pass);
     }
 };
@@ -647,6 +658,10 @@ pub const BufferUsage = struct {
     pub const texel_buffer: c.WGPUBufferUsage = c.WGPUBufferUsage_TexelBuffer;
 };
 
+pub const BufferHandle = enum(u32) { _ };
+pub const TextureHandle = enum(u32) { _ };
+pub const SamplerHandle = enum(u32) { _ };
+
 pub const ResourceManager = struct {
     // TODO: add generational indices for use after free tracking
 
@@ -656,10 +671,6 @@ pub const ResourceManager = struct {
     gpu_context: *const GPUContext,
 
     const Self = @This();
-
-    pub const BufferHandle = enum(u32) { _ };
-    pub const TextureHandle = enum(u32) { _ };
-    pub const SamplerHandle = enum(u32) { _ };
 
     pub fn init(allocator: std.mem.Allocator, gpu_context: *const GPUContext) !Self {
         const INITIAL_CAPACITY = 16;
@@ -696,6 +707,20 @@ pub const ResourceManager = struct {
         if (index > self.buffers.items.len) return null;
 
         return self.buffers.items[index];
+    }
+
+    pub fn getSampler(self: *const Self, handle: SamplerHandle) ?c.WGPUSampler {
+        const index = @intFromEnum(handle);
+        if (index > self.samplers.items.len) return null;
+
+        return self.samplers.items[index];
+    }
+
+    pub fn getTexture(self: *const Self, handle: TextureHandle) ?c.WGPUTexture {
+        const index = @intFromEnum(handle);
+        if (index > self.textures.items.len) return null;
+
+        return self.textures.items[index];
     }
 
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
@@ -892,11 +917,10 @@ pub const PipelineCache = struct {
 
     pub const Entry = struct {
         pipeline: c.WGPURenderPipeline,
-        bind_group_layouts: [MAX_BIND_GROUP_LAYOUT_COUNT]?c.WGPUBindGroupLayout = .{null} ** MAX_BIND_GROUP_LAYOUT_COUNT,
+        bind_group_layouts: [MAX_BIND_GROUP_COUNT]?c.WGPUBindGroupLayout = .{null} ** MAX_BIND_GROUP_COUNT,
         shader: ShaderHandle,
     };
 
-    const MAX_BIND_GROUP_LAYOUT_COUNT = 4;
     const MAX_VERTEX_LAYOUT_COUNT = 8;
 
     pub const PipelineDescriptor = struct {
@@ -1029,7 +1053,7 @@ pub const PipelineCache = struct {
     }
 
     // TODO: Handle compute
-    pub fn getPipeline(self: *Self, allocator: std.mem.Allocator, label: []const u8, descriptor: PipelineDescriptor) !Entry {
+    pub fn getOrCreatePipeline(self: *Self, allocator: std.mem.Allocator, label: []const u8, descriptor: PipelineDescriptor) !Entry {
         if (self.pipelines.get(descriptor)) |pipeline| {
             return pipeline;
         }
@@ -1195,7 +1219,7 @@ pub const PipelineCache = struct {
             .pipeline = pipeline,
             .shader = descriptor.shader,
         };
-        for (0..MAX_BIND_GROUP_LAYOUT_COUNT) |i| {
+        for (0..MAX_BIND_GROUP_COUNT) |i| {
             entry.bind_group_layouts[i] = if (i >= bind_group_layouts.len) null else bind_group_layouts[i];
         }
         try self.pipelines.put(allocator, descriptor, entry);
@@ -1212,5 +1236,152 @@ pub const PipelineCache = struct {
             }
         }
         self.pipelines.deinit(allocator);
+    }
+};
+
+pub const Bindings = struct {
+    bind_groups: BindGroupMap,
+    gpu_context: *const GPUContext,
+    resource_manager: *const ResourceManager,
+
+    const Self = @This();
+
+    pub const BindGroupEntry = struct {
+        binding: u32,
+        resource: union(enum) {
+            buffer: Buffer,
+            sampler: SamplerHandle,
+            texture_view: c.WGPUTextureView,
+        },
+
+        pub const Buffer = struct {
+            handle: BufferHandle,
+            offset: u64 = 0,
+            size: u64 = 0,
+        };
+    };
+
+    pub const BindGroupDescriptor = struct {
+        layout: c.WGPUBindGroupLayout,
+        entry_count: u32,
+        entries: [MAX_BIND_GROUP_COUNT]BindGroupEntry,
+    };
+
+    pub fn init(gpu_context: *const GPUContext, resource_manager: *const ResourceManager) Self {
+        return .{
+            .bind_groups = .empty,
+            .gpu_context = gpu_context,
+            .resource_manager = resource_manager,
+        };
+    }
+
+    pub fn getOrCreateBindingGroup(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        lable: []const u8,
+        descriptor: BindGroupDescriptor,
+    ) !c.WGPUBindGroup {
+        if (self.bind_groups.get(descriptor)) |bg| {
+            return bg;
+        }
+
+        var desc = z_WGPU_BIND_GROUP_DESCRIPTOR_INIT();
+        desc.label = toWGPUString(lable);
+        desc.layout = descriptor.layout;
+        desc.entryCount = descriptor.entry_count;
+
+        var entries = try allocator.alloc(c.WGPUBindGroupEntry, descriptor.entry_count);
+        defer allocator.free(entries);
+        for (0..descriptor.entry_count) |i| {
+            const desc_entry = descriptor.entries[i];
+            var entry = z_WGPU_BIND_GROUP_ENTRY_INIT();
+            entry.binding = desc_entry.binding;
+            switch (desc_entry.resource) {
+                .buffer => |b| {
+                    entry.offset = b.offset;
+                    entry.size = b.size;
+                    entry.buffer = self.resource_manager.getBuffer(b.handle) orelse return error.CouldNotFindBuffer;
+                },
+                .sampler => |s| {
+                    entry.sampler = self.resource_manager.getSampler(s);
+                },
+                .texture_view => |tv| {
+                    entry.textureView = tv;
+                },
+            }
+            entries[i] = entry;
+        }
+
+        desc.entries = entries.ptr;
+
+        const bind_group = c.wgpuDeviceCreateBindGroup(self.gpu_context.device, &desc);
+        try self.bind_groups.put(allocator, descriptor, bind_group);
+    }
+
+    const BindGroupMap = std.HashMapUnmanaged(
+        BindGroupDescriptor,
+        c.WGPUBindGroup,
+        PipelineMapContext,
+        std.hash_map.default_max_load_percentage,
+    );
+    const PipelineMapContext = struct {
+        pub fn hash(_: @This(), key: BindGroupDescriptor) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&key.layout));
+            h.update(std.mem.asBytes(&key.entry_count));
+            for (key.entries[0..key.entry_count]) |entry| {
+                h.update(std.mem.asBytes(&entry.binding));
+                switch (entry.resource) {
+                    .buffer => |buf| {
+                        h.update(&[_]u8{0});
+                        h.update(std.mem.asBytes(&buf.handle));
+                        h.update(std.mem.asBytes(&buf.offset));
+                        h.update(std.mem.asBytes(&buf.size));
+                    },
+                    .sampler => |smp| {
+                        h.update(&[_]u8{1});
+                        h.update(std.mem.asBytes(&smp));
+                    },
+                    .texture_view => |tv| {
+                        h.update(&[_]u8{2});
+                        h.update(std.mem.asBytes(&tv));
+                    },
+                }
+            }
+            return h.final();
+        }
+        pub fn eql(_: @This(), key1: BindGroupDescriptor, key2: BindGroupDescriptor) bool {
+            if (!std.mem.eql(u8, key1.label, key2.label)) return false;
+            if (key1.entry_count != key2.entry_count) return false;
+            for (key1.entries[0..key1.entry_count], key2.entries[0..key2.entry_count]) |e1, e2| {
+                if (e1.binding != e2.binding) return false;
+                if (std.meta.activeTag(e1.resource) != std.meta.activeTag(e2.resource)) return false;
+                switch (e1.resource) {
+                    .buffer => |b1| {
+                        const b2 = e2.resource.buffer;
+                        if (b1.handle != b2.handle) return false;
+                        if (b1.offset != b2.offset) return false;
+                        if (b1.size != b2.size) return false;
+                    },
+                    .sampler => |s1| {
+                        const s2 = e2.resource.sampler;
+                        if (s1 != s2) return false;
+                    },
+                    .texture_view => |t1| {
+                        const t2 = e2.resource.texture_view;
+                        if (t1 != t2) return false;
+                    },
+                }
+            }
+            return true;
+        }
+    };
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        var iter = self.bind_groups.valueIterator();
+        while (iter.next()) |bg| {
+            c.wgpuBindGroupRelease(bg.*);
+        }
+        self.bind_groups.deinit(allocator);
     }
 };

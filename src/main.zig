@@ -65,6 +65,10 @@ pub fn main() !void {
         &surface,
         .depth24_plus,
     );
+    defer pipelines.deinit(allocator);
+
+    var bindings = w.Bindings.init(&gpu_context, &resources);
+    defer bindings.deinit(allocator);
 
     // create the shader
     const shader_handle = try shaders.createShader(
@@ -104,6 +108,7 @@ pub fn main() !void {
     var pipeline_desc = w.PipelineCache.PipelineDescriptor{
         .shader = shader_handle,
         .vertex_layout_count = 1,
+        .depth_stencil = null,
     };
     pipeline_desc.vertex_layouts[0] = w.VertexLayout{
         .step_mode = .vertex,
@@ -121,7 +126,7 @@ pub fn main() !void {
         .format = .f32x3,
     };
 
-    const pipeline_entry = try pipelines.getPipeline(
+    const pipeline_entry = try pipelines.getOrCreatePipeline(
         allocator,
         "2d pipeline",
         pipeline_desc,
@@ -144,8 +149,21 @@ pub fn main() !void {
         var pass = frame.beginRenderPass();
         defer pass.deinit();
 
+        c.wgpuRenderPassEncoderSetPipeline(pass.render_pass, pipeline_entry.pipeline);
+        c.wgpuRenderPassEncoderSetVertexBuffer(
+            pass.render_pass,
+            0,
+            resources.getBuffer(vb_handle).?,
+            0,
+            @sizeOf(f32) * vertices.len,
+        );
+        c.wgpuRenderPassEncoderDraw(pass.render_pass, 3, 1, 0, 0);
+
+        pass.end();
+
         const render_commands = frame.end();
         gpu_context.submitCommands(&.{render_commands});
+        surface.present();
 
         std.Thread.sleep(1_000_000);
     }
