@@ -1,11 +1,12 @@
 const std = @import("std");
 pub const c = @cImport({
-    @cInclude("webgpu/webgpu.h");
     @cInclude("SDL3/SDL.h");
     @cInclude("sdl3webgpu.h");
+    @cInclude("webgpu/webgpu.h");
 });
 
 const w = @import("wgpu.zig");
+const g = @import("gpu-system.zig");
 
 pub fn main() !void {
     // get allocator
@@ -47,19 +48,17 @@ pub fn main() !void {
 
     var surface = w.Surface.init(
         surface_raw,
-        &gpu_context,
-        @intCast(width),
-        @intCast(height),
+        gpu_context.adapter,
     );
     defer surface.deinit();
 
-    var resources = try w.ResourceManager.init(allocator, &gpu_context);
+    var resources = try g.ResourceManager.init(allocator, &gpu_context);
     defer resources.deinit(allocator);
 
-    var shaders = try w.ShaderManager.init(allocator, &gpu_context);
+    var shaders = try g.ShaderManager.init(allocator, &gpu_context);
     defer shaders.deinit(allocator);
 
-    var pipelines = try w.PipelineCache.init(
+    var pipelines = try g.PipelineCache.init(
         &gpu_context,
         &shaders,
         &surface,
@@ -67,7 +66,7 @@ pub fn main() !void {
     );
     defer pipelines.deinit(allocator);
 
-    var bindings = w.Bindings.init(&gpu_context, &resources);
+    var bindings = g.Bindings.init(&gpu_context, &resources);
     defer bindings.deinit(allocator);
 
     // create the shader
@@ -105,12 +104,12 @@ pub fn main() !void {
         w.BufferUsage.vertex | w.BufferUsage.copy_dst,
     );
 
-    var pipeline_desc = w.PipelineCache.PipelineDescriptor{
+    var pipeline_desc: g.PipelineCache.PipelineDescriptor = .{
         .shader = shader_handle,
         .vertex_layout_count = 1,
         .depth_stencil = null,
     };
-    pipeline_desc.vertex_layouts[0] = w.VertexLayout{
+    pipeline_desc.vertex_layouts[0] = .{
         .step_mode = .vertex,
         .array_stride = 5 * @sizeOf(f32),
         .attribute_count = 2,
@@ -157,7 +156,13 @@ pub fn main() !void {
             0,
             @sizeOf(f32) * vertices.len,
         );
-        c.wgpuRenderPassEncoderDraw(pass.render_pass, 3, 1, 0, 0);
+        c.wgpuRenderPassEncoderDraw(
+            pass.render_pass,
+            3,
+            1,
+            0,
+            0,
+        );
 
         pass.end();
 
