@@ -1,5 +1,11 @@
 const std = @import("std");
-pub const c = @import("main.zig").c;
+pub const c = @cImport({
+    @cInclude("SDL3/SDL.h");
+    @cInclude("sdl3webgpu.h");
+    @cInclude("webgpu/webgpu.h");
+});
+
+// ── Shim externs (C macro initializers that Zig can't call directly) ─────────
 
 pub extern fn z_WGPU_DEVICE_DESCRIPTOR_INIT() c.WGPUDeviceDescriptor;
 pub extern fn z_WGPU_REQUEST_ADAPTER_OPTIONS_INIT() c.WGPURequestAdapterOptions;
@@ -37,6 +43,8 @@ pub extern fn z_WGPU_STENCIL_FACE_STATE_INIT() c.WGPUStencilFaceState;
 pub extern fn z_WGPU_BIND_GROUP_DESCRIPTOR_INIT() c.WGPUBindGroupDescriptor;
 pub extern fn z_WGPU_BIND_GROUP_ENTRY_INIT() c.WGPUBindGroupEntry;
 
+// ── String / bool helpers ────────────────────────────────────────────────────
+
 pub fn wgpuStringToString(sv: *const c.WGPUStringView) []const u8 {
     if (sv.data == null) {
         return &.{};
@@ -60,6 +68,8 @@ pub inline fn toWGPUOptBool(val: bool) c.WGPUOptionalBool {
     if (val) return c.WGPU_TRUE;
     return c.WGPU_FALSE;
 }
+
+// ── Sync wrappers (genuinely painful C callback patterns) ────────────────────
 
 pub fn getInstance() !c.WGPUInstance {
     const instance = c.wgpuCreateInstance(&.{});
@@ -167,25 +177,6 @@ pub fn requestDeviceSync(instance: c.WGPUInstance, adapter: c.WGPUAdapter) !c.WG
     };
 }
 
-pub fn getEncoder(device: c.WGPUDevice) c.WGPUCommandEncoder {
-    var desc = z_WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT();
-    desc.label = toWGPUString("command encoder");
-    return c.wgpuDeviceCreateCommandEncoder(device, &desc);
-}
-
-pub fn getCommandBuffer(encoder: c.WGPUCommandEncoder) c.WGPUCommandBuffer {
-    var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
-    desc.label = toWGPUString("command buffer");
-    return c.wgpuCommandEncoderFinish(encoder, &desc);
-}
-
-pub fn submitCommand(queue: c.WGPUQueue, commands: []const c.WGPUCommandBuffer) void {
-    c.wgpuQueueSubmit(queue, commands.len, @ptrCast(commands));
-    for (commands) |command| {
-        c.wgpuCommandBufferRelease(command);
-    }
-}
-
 pub fn getNextSurfaceView(surface: c.WGPUSurface) !c.WGPUTextureView {
     var surface_texture = z_WGPU_SURFACE_TEXTURE_INIT();
     c.wgpuSurfaceGetCurrentTexture(surface, &surface_texture);
@@ -205,43 +196,7 @@ pub fn getNextSurfaceView(surface: c.WGPUSurface) !c.WGPUTextureView {
     return target_view;
 }
 
-pub const PresentMode = enum(c.WGPUPresentMode) {
-    undefined = c.WGPUPresentMode_Undefined,
-    fifo = c.WGPUPresentMode_Fifo,
-    fifo_relaxed = c.WGPUPresentMode_FifoRelaxed,
-    immediate = c.WGPUPresentMode_Immediate,
-    mailbox = c.WGPUPresentMode_Mailbox,
-};
-
-pub const CompositeAlphaMode = enum(c.WGPUCompositeAlphaMode) {
-    auto = c.WGPUCompositeAlphaMode_Auto,
-    @"opaque" = c.WGPUCompositeAlphaMode_Opaque,
-    pre_multiplied = c.WGPUCompositeAlphaMode_Premultiplied,
-    un_pre_multiplied = c.WGPUCompositeAlphaMode_Unpremultiplied,
-    inherit = c.WGPUCompositeAlphaMode_Inherit,
-};
-
-pub fn getSurfaceCapabilities(surface: c.WGPUSurface, adapter: c.WGPUAdapter) c.WGPUSurfaceCapabilities {
-    var surface_capabilities = z_WGPU_SURFACE_CAPABILITIES_INIT();
-    _ = c.wgpuSurfaceGetCapabilities(
-        surface,
-        adapter,
-        &surface_capabilities,
-    );
-    return surface_capabilities;
-}
-
-pub fn configureSurface(surface: c.WGPUSurface, config: SurfaceConfiguration) void {
-    var conf = z_WGPU_SURFACE_CONFIGURATION_INIT();
-    conf.width = config.width;
-    conf.height = config.height;
-    conf.device = config.device;
-    conf.format = @intCast(config.format);
-    conf.presentMode = @intCast(config.present_mode);
-    conf.alphaMode = @intCast(config.alpha_mode);
-
-    c.wgpuSurfaceConfigure(surface, &conf);
-}
+// ── Lifecycle structs ────────────────────────────────────────────────────────
 
 pub const GPUInstance = struct {
     webgpu_instance: c.WGPUInstance,
@@ -274,8 +229,23 @@ pub const GPUContext = struct {
         };
     }
 
-    pub fn submitCommands(self: *Self, commandBuffer: []const c.WGPUCommandBuffer) void {
-        submitCommand(self.queue, commandBuffer);
+    pub fn getEncoder(self: *const Self) c.WGPUCommandEncoder {
+        var desc = z_WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT();
+        desc.label = toWGPUString("command encoder");
+        return c.wgpuDeviceCreateCommandEncoder(self.device, &desc);
+    }
+
+    pub fn getCommandBuffer(_: *const Self, encoder: c.WGPUCommandEncoder) c.WGPUCommandBuffer {
+        var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
+        desc.label = toWGPUString("command buffer");
+        return c.wgpuCommandEncoderFinish(encoder, &desc);
+    }
+
+    pub fn submitCommands(self: *const Self, commands: []const c.WGPUCommandBuffer) void {
+        c.wgpuQueueSubmit(self.queue, commands.len, @ptrCast(commands));
+        for (commands) |command| {
+            c.wgpuCommandBufferRelease(command);
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -285,74 +255,36 @@ pub const GPUContext = struct {
     }
 };
 
-pub const TextureUsage = struct {
-    pub const none: c.WGPUTextureUsage = c.WGPUTextureUsage_None;
-    pub const copy_src: c.WGPUTextureUsage = c.WGPUTextureUsage_CopySrc;
-    pub const copy_dst: c.WGPUTextureUsage = c.WGPUTextureUsage_CopyDst;
-    pub const texture_binding: c.WGPUTextureUsage = c.WGPUTextureUsage_TextureBinding;
-    pub const storage_binding: c.WGPUTextureUsage = c.WGPUTextureUsage_StorageBinding;
-    pub const render_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_RenderAttachment;
-    pub const transient_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_TransientAttachment;
-    pub const storage_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_StorageAttachment;
-};
-
-pub const SurfaceCapabilities = struct {
-    usages: u64,
-    formats: [8]TextureFormat,
-    format_count: usize,
-    present_modes: [8]PresentMode,
-    present_mode_count: usize,
-    alpha_modes: [8]CompositeAlphaMode,
-    alpha_mode_count: usize,
-};
-
-pub const SurfaceConfiguration = struct {
-    width: u32,
-    height: u32,
-    device: c.WGPUDevice,
-    present_mode: ?PresentMode = null,
-    alpha_mode: CompositeAlphaMode,
-    format: ?TextureFormat = null,
-};
-
 pub const Surface = struct {
     surface: c.WGPUSurface,
-    capabilities: SurfaceCapabilities,
+    format: TextureFormat,
 
     const Self = @This();
 
     pub fn init(surface: c.WGPUSurface, adapter: c.WGPUAdapter) Self {
-        const capabilities = getSurfaceCapabilities(surface, adapter);
-        var caps: SurfaceCapabilities = undefined;
-        caps.usages = capabilities.usages;
-        caps.format_count = capabilities.formatCount;
-        caps.present_mode_count = capabilities.presentModeCount;
-        caps.alpha_mode_count = capabilities.alphaModeCount;
-        for (0..capabilities.formatCount) |i| caps.formats[i] = @enumFromInt(capabilities.formats[i]);
-        for (0..capabilities.presentModeCount) |i| caps.present_modes[i] = @enumFromInt(capabilities.presentModes[i]);
-        for (0..capabilities.alphaModeCount) |i| caps.alpha_modes[i] = @enumFromInt(capabilities.alphaModes[i]);
+        var capabilities = z_WGPU_SURFACE_CAPABILITIES_INIT();
+        _ = c.wgpuSurfaceGetCapabilities(surface, adapter, &capabilities);
 
         return .{
             .surface = surface,
-            .capabilities = caps,
+            .format = @enumFromInt(capabilities.formats[0]),
         };
     }
 
-    pub fn configure(self: *Self, config: SurfaceConfiguration) void {
-        var conf = config;
-        if (conf.format == null) conf.format = self.capabilities.formats[0];
-        if (conf.present_mode == null) conf.format = self.capabilities.present_modes[0];
-        configureSurface(self.surface, conf);
+    pub fn configure(self: *Self, device: c.WGPUDevice, width: u32, height: u32) void {
+        var conf = z_WGPU_SURFACE_CONFIGURATION_INIT();
+        conf.width = width;
+        conf.height = height;
+        conf.device = device;
+        conf.format = @intFromEnum(self.format);
+        c.wgpuSurfaceConfigure(self.surface, &conf);
     }
 
-    pub fn beginFrame(self: Self) !Frame {
-        return try Frame.init(
-            self.gpu_context.device,
-            try getNextSurfaceView(self.surface),
-        );
+    pub fn getCurrentView(self: *const Self) !c.WGPUTextureView {
+        return try getNextSurfaceView(self.surface);
     }
 
-    pub fn present(self: Self) !void {
+    pub fn present(self: *const Self) !void {
         if (c.wgpuSurfacePresent(self.surface) == c.WGPUStatus_Error) {
             return error.FailedToPresent;
         }
@@ -369,22 +301,17 @@ pub const Frame = struct {
 
     const Self = @This();
 
-    pub fn init(
-        device: c.WGPUDevice,
-        view: c.WGPUTextureView,
-    ) !Self {
+    pub fn init(gpu_context: *const GPUContext, surface: *const Surface) !Self {
         return .{
-            .encoder = getEncoder(device),
-            .target_view = view,
+            .encoder = gpu_context.getEncoder(),
+            .target_view = try surface.getCurrentView(),
         };
     }
 
-    pub fn beginRenderPass(self: *Self) RenderPass {
-        return RenderPass.init(self.encoder, self.target_view);
-    }
-
     pub fn end(self: *Self) c.WGPUCommandBuffer {
-        return getCommandBuffer(self.encoder);
+        var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
+        desc.label = toWGPUString("command buffer");
+        return c.wgpuCommandEncoderFinish(self.encoder, &desc);
     }
 
     pub fn deinit(self: *Self) void {
@@ -393,125 +320,38 @@ pub const Frame = struct {
     }
 };
 
+// ── Enums (type-safe Zig mirrors of C integer constants) ─────────────────────
+
+pub const PresentMode = enum(c.WGPUPresentMode) {
+    undefined = c.WGPUPresentMode_Undefined,
+    fifo = c.WGPUPresentMode_Fifo,
+    fifo_relaxed = c.WGPUPresentMode_FifoRelaxed,
+    immediate = c.WGPUPresentMode_Immediate,
+    mailbox = c.WGPUPresentMode_Mailbox,
+};
+
+pub const CompositeAlphaMode = enum(c.WGPUCompositeAlphaMode) {
+    auto = c.WGPUCompositeAlphaMode_Auto,
+    @"opaque" = c.WGPUCompositeAlphaMode_Opaque,
+    pre_multiplied = c.WGPUCompositeAlphaMode_Premultiplied,
+    un_pre_multiplied = c.WGPUCompositeAlphaMode_Unpremultiplied,
+    inherit = c.WGPUCompositeAlphaMode_Inherit,
+};
+
 pub const Color = struct { r: f32 = 0.0, g: f32 = 0.0, b: f32 = 0.0, a: f32 = 1.0 };
+
 pub const LoadOp = enum(c.WGPULoadOp) {
     undefined = c.WGPULoadOp_Undefined,
     load = c.WGPULoadOp_Load,
     clear = c.WGPULoadOp_Clear,
     expand_resolve_texture = c.WGPULoadOp_ExpandResolveTexture,
 };
+
 pub const StoreOp = enum(c.WGPUStoreOp) {
     undefined = c.WGPUStoreOp_Undefined,
     store = c.WGPUStoreOp_Store,
     discard = c.WGPUStoreOp_Discard,
     force32 = c.WGPUStoreOp_Force32,
-};
-
-pub const ColorAttachment = struct {
-    clear_value: Color = .{ .r = 0.2, .g = 0.2, .b = 0.2, .a = 1.0 },
-    load_op: LoadOp = .clear,
-    store_op: StoreOp = .store,
-};
-
-pub const DepthStencilAttachment = struct {
-    depth_clear_value: f32 = 1.0,
-    depth_load_op: LoadOp = .clear,
-    depth_store_op: StoreOp = .store,
-};
-
-pub const RenderPassDescriptor = struct {
-    color_attachments: ?[]const ColorAttachment = &.{.{}},
-    depth_stencil_attachment: ?DepthStencilAttachment = null,
-};
-
-pub const RenderPass = struct {
-    render_pass: c.WGPURenderPassEncoder,
-
-    const Self = @This();
-
-    pub fn init(
-        encoder: c.WGPUCommandEncoder,
-        target_view: c.WGPUTextureView,
-        label: []const u8,
-        descriptor: RenderPassDescriptor,
-    ) Self {
-        var render_pass_desc = z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
-        render_pass_desc.label = toWGPUString(label);
-
-        // color attachement
-        var color_attachment = z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
-        color_attachment.view = target_view;
-        if (descriptor.color_attachments) |attachments| {
-            for (attachments) |att| {
-                color_attachment.loadOp = @intFromEnum(att.load_op);
-                color_attachment.storeOp = @intFromEnum(att.store_op);
-                color_attachment.clearValue = c.WGPUColor{ .r = att.clear_value.r, .g = att.clear_value.g, .b = att.clear_value.b, .a = att.clear_value.a };
-            }
-        }
-        render_pass_desc.colorAttachmentCount = 1;
-        render_pass_desc.colorAttachments = &color_attachment;
-
-        const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(
-            encoder,
-            &render_pass_desc,
-        );
-
-        return .{
-            .render_pass = render_pass_encoder,
-        };
-    }
-
-    pub fn end(self: *Self) void {
-        c.wgpuRenderPassEncoderEnd(self.render_pass);
-    }
-
-    pub fn deinit(self: *Self) void {
-        c.wgpuRenderPassEncoderRelease(self.render_pass);
-    }
-};
-
-pub const BindingType = union(enum) {
-    buffer: BufferBT,
-    sampler: SamplerBT,
-    texture: TextureBindingInfo,
-    storage_texture: StorageTextureBindingInfo,
-
-    const BufferBT = enum(c.WGPUBufferBindingType) { uniform = c.WGPUBufferBindingType_Uniform, storage = c.WGPUBufferBindingType_Storage, read_only_storage = c.WGPUBufferBindingType_ReadOnlyStorage };
-    const SamplerBT = enum(c.WGPUSamplerBindingType) { filtering = c.WGPUSamplerBindingType_Filtering, non_filtering = c.WGPUSamplerBindingType_NonFiltering, comparison = c.WGPUSamplerBindingType_Comparison };
-    const TextureSampleBT = enum(c.WGPUTextureSampleType) { float = c.WGPUTextureSampleType_Float, unfilterable_float = c.WGPUTextureSampleType_UnfilterableFloat, depth = c.WGPUTextureSampleType_Depth, sint = c.WGPUTextureSampleType_Sint, uint = c.WGPUTextureSampleType_Uint };
-    const StorageTextureAccess = enum(c.WGPUStorageTextureAccess) {
-        write_only = c.WGPUStorageTextureAccess_WriteOnly,
-        read_only = c.WGPUStorageTextureAccess_ReadOnly,
-        read_write = c.WGPUStorageTextureAccess_ReadWrite,
-    };
-    const TextureViewDimension = enum(c.WGPUTextureViewDimension) { @"1d" = c.WGPUTextureViewDimension_1D, @"2d" = c.WGPUTextureViewDimension_2D, @"2d_array" = c.WGPUTextureViewDimension_2DArray, cube = c.WGPUTextureViewDimension_Cube, cube_array = c.WGPUTextureViewDimension_CubeArray, @"3d" = c.WGPUTextureViewDimension_3D };
-    const TextureBindingInfo = struct {
-        sample_type: TextureSampleBT,
-        view_dimension: TextureViewDimension,
-        multi_sampled: bool,
-    };
-    const StorageTextureBindingInfo = struct {
-        access: StorageTextureAccess,
-        format: TextureFormat,
-        view_dimension: TextureViewDimension,
-    };
-};
-
-pub const ShaderStage = struct {
-    pub const vertex = c.WGPUShaderStage_Vertex;
-    pub const fragment = c.WGPUShaderStage_Fragment;
-    pub const compute = c.WGPUShaderStage_Compute;
-};
-
-pub const VertexInput = struct {
-    location: u32,
-    format: VertexFormat,
-};
-
-pub const BindEntry = struct {
-    binding: u32,
-    type: BindingType,
-    visibility: c.WGPUShaderStage,
 };
 
 pub const TextureFormat = enum(c.WGPUTextureFormat) {
@@ -670,6 +510,65 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
     i32x4 = c.WGPUVertexFormat_Sint32x4,
     unorm10_10_10_2 = c.WGPUVertexFormat_Unorm10_10_10_2,
     unorm8x4bgra = c.WGPUVertexFormat_Unorm8x4BGRA,
+
+    pub const ComponentType = enum { u8, i8, u16, i16, f16, f32, u32, i32 };
+    pub const CompositionType = enum { scalar, vec2, vec3, vec4 };
+
+    pub fn getFormComponents(component_type: []const u8, composition_type: []const u8) @This() {
+        const ct = std.meta.stringToEnum(ComponentType, component_type) orelse @panic("unknown component type");
+        const comp = std.meta.stringToEnum(CompositionType, composition_type) orelse @panic("unknown composition type");
+
+        return switch (ct) {
+            .u8 => switch (comp) {
+                .scalar => .u8,
+                .vec2 => .u8x2,
+                .vec3 => @panic("no u8x3 vertex format"),
+                .vec4 => .u8x4,
+            },
+            .i8 => switch (comp) {
+                .scalar => .i8,
+                .vec2 => .i8x2,
+                .vec3 => @panic("no i8x3 vertex format"),
+                .vec4 => .i8x4,
+            },
+            .u16 => switch (comp) {
+                .scalar => .u16,
+                .vec2 => .u16x2,
+                .vec3 => @panic("no u16x3 vertex format"),
+                .vec4 => .u16x4,
+            },
+            .i16 => switch (comp) {
+                .scalar => .i16,
+                .vec2 => .i16x2,
+                .vec3 => @panic("no i16x3 vertex format"),
+                .vec4 => .i16x4,
+            },
+            .f16 => switch (comp) {
+                .scalar => .f16,
+                .vec2 => .f16x2,
+                .vec3 => @panic("no f16x3 vertex format"),
+                .vec4 => .f16x4,
+            },
+            .f32 => switch (comp) {
+                .scalar => .f32,
+                .vec2 => .f32x2,
+                .vec3 => .f32x3,
+                .vec4 => .f32x4,
+            },
+            .u32 => switch (comp) {
+                .scalar => .u32,
+                .vec2 => .u32x2,
+                .vec3 => .u32x3,
+                .vec4 => .u32x4,
+            },
+            .i32 => switch (comp) {
+                .scalar => .i32,
+                .vec2 => .i32x2,
+                .vec3 => .i32x3,
+                .vec4 => .i32x4,
+            },
+        };
+    }
 };
 
 pub const PrimitiveTopology = enum(c.WGPUPrimitiveTopology) {
@@ -742,6 +641,19 @@ pub const CullMode = enum(c.WGPUCullMode) {
     back = c.WGPUCullMode_Back,
 };
 
+// ── Bitmask namespaces (need bitwise OR, can't be enums) ─────────────────────
+
+pub const TextureUsage = struct {
+    pub const none: c.WGPUTextureUsage = c.WGPUTextureUsage_None;
+    pub const copy_src: c.WGPUTextureUsage = c.WGPUTextureUsage_CopySrc;
+    pub const copy_dst: c.WGPUTextureUsage = c.WGPUTextureUsage_CopyDst;
+    pub const texture_binding: c.WGPUTextureUsage = c.WGPUTextureUsage_TextureBinding;
+    pub const storage_binding: c.WGPUTextureUsage = c.WGPUTextureUsage_StorageBinding;
+    pub const render_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_RenderAttachment;
+    pub const transient_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_TransientAttachment;
+    pub const storage_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_StorageAttachment;
+};
+
 pub const BufferUsage = struct {
     pub const map_read: c.WGPUBufferUsage = c.WGPUBufferUsage_MapRead;
     pub const map_write: c.WGPUBufferUsage = c.WGPUBufferUsage_MapWrite;
@@ -756,49 +668,48 @@ pub const BufferUsage = struct {
     pub const texel_buffer: c.WGPUBufferUsage = c.WGPUBufferUsage_TexelBuffer;
 };
 
-pub const PipelineDescriptor = struct {
-    color_format: ?w.TextureFormat = null,
-    depth_format: ?w.TextureFormat = null,
-    shader: ShaderHandle,
-    vertex_layout_count: u32,
-    vertex_layouts: [MAX_VERTEX_LAYOUT_COUNT]VertexLayout = std.mem.zeroes([MAX_VERTEX_LAYOUT_COUNT]VertexLayout),
-    primitive_topology: w.PrimitiveTopology = .triangle_list,
-    depth_stencil: ?DepthStencilState = .{
-        .depth_write_enabled = true,
-        .depth_compare = .less,
-    },
-    blend: ?BlendState = null,
-    cull_mode: w.CullMode = .back,
+pub const ShaderStage = struct {
+    pub const vertex = c.WGPUShaderStage_Vertex;
+    pub const fragment = c.WGPUShaderStage_Fragment;
+    pub const compute = c.WGPUShaderStage_Compute;
 };
 
-pub const StencilFaceState = struct {
-    compare: w.CompareFunction,
-    fail_op: w.StencilOperation,
-    depth_fail_op: w.StencilOperation,
-    pass_op: w.StencilOperation,
+// ── Binding type (tagged union, used in shader metadata) ─────────────────────
+
+pub const BindingType = union(enum) {
+    buffer: BufferBT,
+    sampler: SamplerBT,
+    texture: TextureBindingInfo,
+    storage_texture: StorageTextureBindingInfo,
+
+    const BufferBT = enum(c.WGPUBufferBindingType) { uniform = c.WGPUBufferBindingType_Uniform, storage = c.WGPUBufferBindingType_Storage, read_only_storage = c.WGPUBufferBindingType_ReadOnlyStorage };
+    const SamplerBT = enum(c.WGPUSamplerBindingType) { filtering = c.WGPUSamplerBindingType_Filtering, non_filtering = c.WGPUSamplerBindingType_NonFiltering, comparison = c.WGPUSamplerBindingType_Comparison };
+    const TextureSampleBT = enum(c.WGPUTextureSampleType) { float = c.WGPUTextureSampleType_Float, unfilterable_float = c.WGPUTextureSampleType_UnfilterableFloat, depth = c.WGPUTextureSampleType_Depth, sint = c.WGPUTextureSampleType_Sint, uint = c.WGPUTextureSampleType_Uint };
+    const StorageTextureAccess = enum(c.WGPUStorageTextureAccess) {
+        write_only = c.WGPUStorageTextureAccess_WriteOnly,
+        read_only = c.WGPUStorageTextureAccess_ReadOnly,
+        read_write = c.WGPUStorageTextureAccess_ReadWrite,
+    };
+    const TextureViewDimension = enum(c.WGPUTextureViewDimension) { @"1d" = c.WGPUTextureViewDimension_1D, @"2d" = c.WGPUTextureViewDimension_2D, @"2d_array" = c.WGPUTextureViewDimension_2DArray, cube = c.WGPUTextureViewDimension_Cube, cube_array = c.WGPUTextureViewDimension_CubeArray, @"3d" = c.WGPUTextureViewDimension_3D };
+    const TextureBindingInfo = struct {
+        sample_type: TextureSampleBT,
+        view_dimension: TextureViewDimension,
+        multi_sampled: bool,
+    };
+    const StorageTextureBindingInfo = struct {
+        access: StorageTextureAccess,
+        format: TextureFormat,
+        view_dimension: TextureViewDimension,
+    };
 };
 
-pub const DepthStencilState = struct {
-    depth_write_enabled: bool,
-    depth_compare: w.CompareFunction,
-    stencil_front: ?StencilFaceState = null,
-    stencil_back: ?StencilFaceState = null,
-    stencil_read_mask: u32 = 0xFFFFFFFF,
-    stencil_write_mask: u32 = 0xFFFFFFFF,
-    depth_bias: i32 = 0,
-
-    // ERROR causing problem here
-    depth_bias_slope_scale: f32 = 0,
-    depth_bias_clamp: f32 = 0,
+pub const VertexInput = struct {
+    location: u32,
+    format: VertexFormat,
 };
 
-pub const BlendComponent = struct {
-    operation: w.BlendOperation,
-    src_factor: w.BlendFactor,
-    dst_factor: w.BlendFactor,
-};
-
-pub const BlendState = struct {
-    color: BlendComponent,
-    alpha: BlendComponent,
+pub const BindEntry = struct {
+    binding: u32,
+    type: BindingType,
+    visibility: c.WGPUShaderStage,
 };

@@ -1,12 +1,7 @@
 const std = @import("std");
-pub const c = @cImport({
-    @cInclude("SDL3/SDL.h");
-    @cInclude("sdl3webgpu.h");
-    @cInclude("webgpu/webgpu.h");
-});
-
-const w = @import("wgpu.zig");
-const g = @import("gpu-system.zig");
+const gpu = @import("gpu.zig");
+const gs = @import("gpu-system.zig");
+const c = gpu.c;
 
 pub fn main() !void {
     // get allocator
@@ -38,27 +33,29 @@ pub fn main() !void {
     var height: i32 = 0;
     _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
 
-    var instance = try w.GPUInstance.init();
+    var instance = try gpu.GPUInstance.init();
     defer instance.deinit();
 
     const surface_raw = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
 
-    var gpu_context = try w.GPUContext.initSync(instance.webgpu_instance, surface_raw);
+    var gpu_context = try gpu.GPUContext.initSync(instance.webgpu_instance, surface_raw);
     defer gpu_context.deinit();
 
-    var surface = w.Surface.init(
+    var surface = gpu.Surface.init(
         surface_raw,
         gpu_context.adapter,
     );
     defer surface.deinit();
 
-    var resources = try g.ResourceManager.init(allocator, &gpu_context);
+    surface.configure(gpu_context.device, @intCast(width), @intCast(height));
+
+    var resources = try gs.ResourceManager.init(allocator, &gpu_context);
     defer resources.deinit(allocator);
 
-    var shaders = try g.ShaderManager.init(allocator, &gpu_context);
+    var shaders = try gs.ShaderManager.init(allocator, &gpu_context);
     defer shaders.deinit(allocator);
 
-    var pipelines = try g.PipelineCache.init(
+    var pipelines = gs.PipelineCache.init(
         &gpu_context,
         &shaders,
         &surface,
@@ -66,29 +63,14 @@ pub fn main() !void {
     );
     defer pipelines.deinit(allocator);
 
-    var bindings = g.Bindings.init(&gpu_context, &resources);
+    var bindings = gs.Bindings.init(&gpu_context, &resources);
     defer bindings.deinit(allocator);
 
     // create the shader
     const shader_handle = try shaders.createShader(
         allocator,
-        "./shaders/2DVertexColors.wgsl",
+        "shaders/2DVertexColors.wgsl",
         "test shader",
-        .{
-            .vertex_entry = "vs",
-            .fragment_entry = "fs",
-            .bind_groups = &.{},
-            .vertex_inputs = &.{
-                .{
-                    .location = 0,
-                    .format = .f32x2,
-                },
-                .{
-                    .location = 1,
-                    .format = .f32x3,
-                },
-            },
-        },
     );
 
     const vertices = [_]f32{
@@ -101,10 +83,10 @@ pub fn main() !void {
         allocator,
         std.mem.sliceAsBytes(&vertices),
         "vertex buffer",
-        w.BufferUsage.vertex | w.BufferUsage.copy_dst,
+        gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
-    var pipeline_desc: g.PipelineCache.PipelineDescriptor = .{
+    var pipeline_desc: gs.PipelineDescriptor = .{
         .shader = shader_handle,
         .vertex_layout_count = 1,
         .depth_stencil = null,
@@ -142,10 +124,10 @@ pub fn main() !void {
             }
         }
 
-        var frame = try surface.beginFrame();
+        var frame = try gpu.Frame.init(&gpu_context, &surface);
         defer frame.deinit();
 
-        var pass = frame.beginRenderPass();
+        var pass = gs.RenderPass.init(frame.encoder, frame.target_view, .{});
         defer pass.deinit();
 
         c.wgpuRenderPassEncoderSetPipeline(pass.render_pass, pipeline_entry.pipeline);
@@ -168,7 +150,7 @@ pub fn main() !void {
 
         const render_commands = frame.end();
         gpu_context.submitCommands(&.{render_commands});
-        surface.present();
+        try surface.present();
 
         std.Thread.sleep(1_000_000);
     }
