@@ -178,9 +178,12 @@ pub const ShaderManager = struct {
         fragment_entry: []const u8,
         bind_groups: ?[]const []const gpu.BindEntry = null,
         vertex_inputs: []const gpu.VertexInput,
-        allocator: std.mem.Allocator,
+        arena_allocator: std.heap.ArenaAllocator,
 
         pub fn fromShadeSource(allocator: std.mem.Allocator, source_path: []const u8) !@This() {
+            var arena_allocator = std.heap.ArenaAllocator.init(allocator);
+            const arena = arena_allocator.allocator();
+
             var child = std.process.Child.init(&.{ "../lib/macos/tint_info", source_path, "--json" }, allocator);
             child.stdout_behavior = .Pipe;
             _ = try child.spawn();
@@ -202,17 +205,17 @@ pub const ShaderManager = struct {
             defer metadata_json.deinit();
 
             var metadata: Metadata = undefined;
-            metadata.allocator = allocator;
+            metadata.arena_allocator = arena_allocator;
             metadata.bind_groups = null;
 
             for (metadata_json.value.entry_points) |ep| {
                 if (std.mem.eql(u8, ep.stage, "vertex")) {
-                    const name = try allocator.alloc(u8, ep.name.len);
+                    const name = try arena.alloc(u8, ep.name.len);
                     @memcpy(name, ep.name);
                     metadata.vertex_entry = name;
 
                     if (ep.input_variables.len > 0) {
-                        var vertex_inputs = try allocator.alloc(gpu.VertexInput, ep.input_variables.len);
+                        var vertex_inputs = try arena.alloc(gpu.VertexInput, ep.input_variables.len);
                         for (ep.input_variables, 0..) |iv, i| {
                             vertex_inputs[i] = .{
                                 .location = @intCast(iv.location),
@@ -238,7 +241,7 @@ pub const ShaderManager = struct {
                     //     metadata.vertex_inputs = vertex_inputs;
                     // }
                 } else if (std.mem.eql(u8, ep.stage, "fragment")) {
-                    const name = try allocator.alloc(u8, ep.name.len);
+                    const name = try arena.alloc(u8, ep.name.len);
                     @memcpy(name, ep.name);
                     metadata.fragment_entry = name;
                 } else {
@@ -250,12 +253,7 @@ pub const ShaderManager = struct {
         }
 
         pub fn deinit(self: *@This()) void {
-            self.allocator.free(self.vertex_inputs);
-            self.allocator.free(self.vertex_entry);
-            self.allocator.free(self.fragment_entry);
-            if (self.bind_groups) |bg| {
-                self.allocator.free(bg);
-            }
+            self.arena_allocator.deinit();
         }
     };
 
