@@ -644,54 +644,8 @@ pub const PipelineCache = struct {
         var desc = gpu.z_WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT();
         desc.label = gpu.toWGPUString(label);
 
-        var bind_group_layouts: ?[]c.WGPUBindGroupLayout = null;
-
-        if (shader.metadata.bind_groups) |bind_groups| {
-            var layout_desc = gpu.z_WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT();
-            bind_group_layouts = try temp.alloc(c.WGPUBindGroupLayout, bind_groups.len);
-            layout_desc.bindGroupLayoutCount = bind_groups.len;
-            for (0..bind_groups.len) |g_index| {
-                const bind_group_entries = bind_groups[g_index];
-                var bind_group_desc = gpu.z_WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT();
-                var entries = try temp.alloc(c.WGPUBindGroupLayoutEntry, bind_group_entries.len);
-                bind_group_desc.entryCount = bind_group_entries.len;
-
-                for (0..bind_group_entries.len) |e_index| {
-                    const entry = bind_group_entries[e_index];
-                    var layout_entry = gpu.z_WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT();
-                    layout_entry.binding = entry.binding;
-                    layout_entry.visibility = entry.visibility;
-                    switch (entry.type) {
-                        .buffer => |buf| {
-                            var buffer_layout = gpu.z_WGPU_BUFFER_BINDING_LAYOUT_INIT();
-                            buffer_layout.type = @intFromEnum(buf);
-                            layout_entry.buffer = buffer_layout;
-                        },
-                        .sampler => |smp| {
-                            var sampler_layout = gpu.z_WGPU_SAMPLER_BINDING_LAYOUT_INIT();
-                            sampler_layout.type = @intFromEnum(smp);
-                            layout_entry.sampler = sampler_layout;
-                        },
-                        .texture => |txt| {
-                            layout_entry.texture.sampleType = @intFromEnum(txt.sample_type);
-                            layout_entry.texture.viewDimension = @intFromEnum(txt.view_dimension);
-                            layout_entry.texture.multisampled = gpu.toWGPUBool(txt.multi_sampled);
-                        },
-                        .storage_texture => |stx| {
-                            var strg_texture_layout = gpu.z_WGPU_STORAGE_TEXTURE_BINDING_LAYOUT_INIT();
-                            strg_texture_layout.access = @intFromEnum(stx.access);
-                            strg_texture_layout.format = @intFromEnum(stx.format);
-                            strg_texture_layout.viewDimension = @intFromEnum(stx.view_dimension);
-                            layout_entry.storageTexture = strg_texture_layout;
-                        },
-                    }
-                    entries[e_index] = layout_entry;
-                }
-                bind_group_desc.entries = entries.ptr;
-                bind_group_layouts.?[g_index] = c.wgpuDeviceCreateBindGroupLayout(self.gpu_context.device, &bind_group_desc);
-            }
-            layout_desc.bindGroupLayouts = bind_group_layouts.?.ptr;
-            desc.layout = c.wgpuDeviceCreatePipelineLayout(self.gpu_context.device, &layout_desc);
+        if (shader.metadata.bind_groups) |bgs| {
+            var bind_group_layouts: ?[]c.WGPUBindGroupLayout = null;
         }
 
         if (shader.metadata.vertex_entry) |vertex_entry| {
@@ -798,7 +752,6 @@ pub const PipelineCache = struct {
         desc.multisample = multisample_state;
 
         const pipeline = c.wgpuDeviceCreateRenderPipeline(self.gpu_context.device, &desc);
-        std.debug.print("{any}\n", .{pipeline});
 
         var entry = Entry{
             .pipeline = pipeline,
@@ -827,7 +780,111 @@ pub const PipelineCache = struct {
     }
 };
 
-// ──  ─────────────────────────────────────────────────────────────────
+// ── Bind Group Layout Cache ────────────────────────────────────────────────────────────
+
+pub const BindGroupLayoutCache = struct {
+    bind_group_layouts: BindGroupLayoutMap,
+    shader_manager: *const ShaderManager,
+
+    const Self = @This();
+
+    const BindGroupLayoutMap = std.HashMapUnmanaged(
+        []const gpu.BindEntry,
+        c.WGPUBindGroupLayout,
+        BindGroupLayoutMapContext,
+        std.hash_map.default_max_load_percentage,
+    );
+
+    pub const BindGroupLayoutMapContext = struct {
+        pub fn hash(_: @This(), key: []const gpu.BindEntry) u64 {
+            var h = std.hash.Wyhash.init(0);
+            for (key) |entry| {
+                h.update(std.mem.asBytes(&entry.binding));
+                h.update(std.mem.asBytes(&entry.visibility));
+                const tag = std.meta.activeTag(entry.type);
+                h.update(std.mem.asBytes(&tag));
+                switch (entry.type) {
+                    .buffer => |b| h.update(std.mem.asBytes(&b)),
+                    .sampler => |s| h.update(std.mem.asBytes(&s)),
+                    .texture => |t| h.update(std.mem.asBytes(&t)),
+                    .storage_texture => |st| h.update(std.mem.asBytes(&st)),
+                }
+            }
+            return h.final();
+        }
+
+        pub fn eql(_: @This(), key1: []const gpu.BindEntry, key2: []const gpu.BindEntry) bool {
+            if (key1.len != key2.len) return false;
+            for (key1, key2) |e1, e2| {
+                if (e1.binding != e2.binding) return false;
+                if (e1.visibility != e2.visibility) return false;
+                if (std.meta.activeTag(e1.type) != std.meta.activeTag(e2.type)) return false;
+                switch (e1.type) {
+                    .buffer => |b1| if (b1 != e2.type.buffer) return false,
+                    .sampler => |s1| if (s1 != e2.type.sampler) return false,
+                    .texture => |t1| if (!std.meta.eql(t1, e2.type.texture)) return false,
+                    .storage_texture => |st1| if (!std.meta.eql(st1, e2.type.storage_texture)) return false,
+                }
+            }
+            return true;
+        }
+    };
+
+    pub fn getOrCreateBindGroupLayout(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        entries: []const gpu.BindEntry,
+    ) !c.WGPUBindGroupLayout {
+        if (self.bind_group_layouts.get(entries)) |layout| {
+            return layout;
+        }
+
+        var desc = gpu.z_WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT();
+        desc.entryCount = entries.len;
+
+        var layout_entries = try allocator.alloc(c.WGPUBindGroupLayoutEntry, entries.len);
+        defer allocator.free(layout_entries);
+
+        for (entries, 0..) |entry, i| {
+            var layout_entry = gpu.z_WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT();
+            layout_entry.binding = entry.binding;
+            layout_entry.visibility = entry.visibility;
+            switch (entry.type) {
+                .buffer => |buf| {
+                    var buffer_layout = gpu.z_WGPU_BUFFER_BINDING_LAYOUT_INIT();
+                    buffer_layout.type = @intFromEnum(buf);
+                    layout_entry.buffer = buffer_layout;
+                },
+                .sampler => |smp| {
+                    var sampler_layout = gpu.z_WGPU_SAMPLER_BINDING_LAYOUT_INIT();
+                    sampler_layout.type = @intFromEnum(smp);
+                    layout_entry.sampler = sampler_layout;
+                },
+                .texture => |txt| {
+                    layout_entry.texture.sampleType = @intFromEnum(txt.sample_type);
+                    layout_entry.texture.viewDimension = @intFromEnum(txt.view_dimension);
+                    layout_entry.texture.multisampled = gpu.toWGPUBool(txt.multi_sampled);
+                },
+                .storage_texture => |stx| {
+                    var strg_texture_layout = gpu.z_WGPU_STORAGE_TEXTURE_BINDING_LAYOUT_INIT();
+                    strg_texture_layout.access = @intFromEnum(stx.access);
+                    strg_texture_layout.format = @intFromEnum(stx.format);
+                    strg_texture_layout.viewDimension = @intFromEnum(stx.view_dimension);
+                    layout_entry.storageTexture = strg_texture_layout;
+                },
+            }
+            layout_entries[i] = layout_entry;
+        }
+
+        desc.entries = layout_entries.ptr;
+
+        const layout = c.wgpuDeviceCreateBindGroupLayout(self.shader_manager.gpu_context.device, &desc);
+        try self.bind_group_layouts.put(allocator, entries, layout);
+        return layout;
+    }
+};
+
+// ── Bind Group Cache ─────────────────────────────────────────────────────────────────
 pub const BindGroupEntry = struct {
     binding: u32,
     resource: union(enum) {
@@ -843,7 +900,7 @@ pub const BindGroupEntry = struct {
     };
 };
 
-pub const Bindings = struct {
+pub const BindGroupCache = struct {
     bind_groups: BindGroupMap,
     gpu_context: *const gpu.GPUContext,
     resource_manager: *const ResourceManager,

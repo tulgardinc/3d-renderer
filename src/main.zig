@@ -64,7 +64,7 @@ pub fn main() !void {
     );
     defer pipelines.deinit(allocator);
 
-    var bindings = gs.Bindings.init(&gpu_context, &resources);
+    var bindings = gs.BindGroupCache.init(&gpu_context, &resources);
     defer bindings.deinit(allocator);
 
     // create the shader
