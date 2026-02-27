@@ -1,6 +1,7 @@
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const gs = @import("gpu-system.zig");
+const build_options = @import("build_options");
 const c = gpu.c;
 
 pub fn main() !void {
@@ -69,7 +70,7 @@ pub fn main() !void {
     // create the shader
     const shader_handle = try shaders.createShader(
         allocator,
-        "shaders/2DVertexColors.wgsl",
+        build_options.shaders_dir ++ "/2DVertexColors.wgsl",
         "test shader",
     );
 
@@ -84,6 +85,14 @@ pub fn main() !void {
         std.mem.sliceAsBytes(&vertices),
         "vertex buffer",
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
+    );
+
+    var uniform = [_]f32{0};
+    const uniform_handle = try resources.createBuffer(
+        allocator,
+        std.mem.sliceAsBytes(&uniform),
+        "uniform",
+        gpu.BufferUsage.uniform | gpu.BufferUsage.copy_dst,
     );
 
     var pipeline_desc: gs.PipelineDescriptor = .{
@@ -107,10 +116,35 @@ pub fn main() !void {
         .format = .f32x3,
     };
 
+    const start_time = std.time.milliTimestamp();
+
     const pipeline_entry = try pipelines.getOrCreatePipeline(
         allocator,
         "2d pipeline",
         pipeline_desc,
+    );
+
+    const bind_group = try bindings.getOrCreateBindingGroup(
+        allocator,
+        "uniform",
+        .{
+            .entry_count = 1,
+            .entries = blk: {
+                var entries: [4]gs.BindGroupEntry = undefined;
+                entries[0] = .{
+                    .binding = 0,
+                    .resource = .{
+                        .buffer = .{
+                            .handle = uniform_handle,
+                            .offset = 0,
+                            .size = @sizeOf(f32),
+                        },
+                    },
+                };
+                break :blk entries;
+            },
+            .layout = pipeline_entry.bind_group_layouts[0].?,
+        },
     );
 
     // Main loop
@@ -124,10 +158,21 @@ pub fn main() !void {
             }
         }
 
+        uniform[0] = @as(f32, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
+        try resources.updateBuffer(uniform_handle, std.mem.sliceAsBytes(&uniform));
+
         var frame = try gpu.Frame.init(&gpu_context, &surface);
         defer frame.deinit();
 
-        var pass = gs.RenderPass.init(frame.encoder, frame.target_view, .{});
+        var pass = gs.RenderPass.init(
+            frame.encoder,
+            frame.target_view,
+            .{
+                .color_attachment = .{
+                    .clear_value = .{ .a = 1.0, .r = 0.1, .g = 0.1, .b = 0.1 },
+                },
+            },
+        );
         defer pass.deinit();
 
         c.wgpuRenderPassEncoderSetPipeline(pass.render_pass, pipeline_entry.pipeline);
@@ -137,6 +182,13 @@ pub fn main() !void {
             resources.getBuffer(vb_handle).?,
             0,
             @sizeOf(f32) * vertices.len,
+        );
+        c.wgpuRenderPassEncoderSetBindGroup(
+            pass.render_pass,
+            0,
+            bind_group,
+            0,
+            null,
         );
         c.wgpuRenderPassEncoderDraw(
             pass.render_pass,

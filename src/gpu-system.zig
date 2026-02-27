@@ -1,5 +1,6 @@
 const std = @import("std");
 const gpu = @import("gpu.zig");
+const build_options = @import("build_options");
 const c = gpu.c;
 
 // ── Handle types ─────────────────────────────────────────────────────────────
@@ -156,13 +157,14 @@ pub const ShaderManager = struct {
     shaders: std.ArrayList(Shader),
     gpu_context: *const gpu.GPUContext,
 
-    pub const ShaderMetadataJson = struct {
-        entry_points: []EntryPointEntry,
+    pub const ShaderReflectionJSON = struct {
+        entry_points: []const EntryPointEntry,
 
         pub const EntryPointEntry = struct {
             name: []const u8,
             stage: []const u8,
-            input_variables: []InputVariableEntry,
+            input_variables: []const InputVariableEntry,
+            bindings: []const BindingEntry,
         };
 
         pub const InputVariableEntry = struct {
@@ -171,20 +173,44 @@ pub const ShaderManager = struct {
             component_type: []const u8,
             composition_type: []const u8,
         };
+
+        pub const BindingEntry = struct {
+            binding: usize,
+            group: usize,
+            size: usize,
+            resource_type: []const u8,
+
+            // Todo support smapler and Texture
+
+        };
     };
 
     pub const Metadata = struct {
-        vertex_entry: []const u8,
-        fragment_entry: []const u8,
+        vertex_entry: ?[]const u8 = null,
+        fragment_entry: ?[]const u8 = null,
         bind_groups: ?[]const []const gpu.BindEntry = null,
-        vertex_inputs: []const gpu.VertexInput,
+        vertex_inputs: ?[]const gpu.VertexInput = &.{},
         arena_allocator: std.heap.ArenaAllocator,
+
+        pub fn getBindingType(resource_type: []const u8) !gpu.BindingType {
+            const map = std.StaticStringMap(gpu.BindingType).initComptime(.{
+                .{
+                    "UniformBuffer", gpu.BindingType{
+                        .buffer = .uniform,
+                    },
+                },
+                // TODO rest (add as needed)
+            });
+
+            return map.get(resource_type) orelse error.BindingTypeNotImplemented;
+        }
 
         pub fn fromShadeSource(allocator: std.mem.Allocator, source_path: []const u8) !@This() {
             var arena_allocator = std.heap.ArenaAllocator.init(allocator);
+            errdefer arena_allocator.deinit();
             const arena = arena_allocator.allocator();
 
-            var child = std.process.Child.init(&.{ "../lib/macos/tint_info", source_path, "--json" }, allocator);
+            var child = std.process.Child.init(&.{ build_options.tint_path, source_path, "--json" }, allocator);
             child.stdout_behavior = .Pipe;
             _ = try child.spawn();
 
@@ -196,19 +222,42 @@ pub const ShaderManager = struct {
 
             _ = try child.wait();
 
-            const metadata_json: std.json.Parsed(ShaderMetadataJson) = try std.json.parseFromSlice(
-                ShaderMetadataJson,
+            const reflection_json: std.json.Parsed(ShaderReflectionJSON) = try std.json.parseFromSlice(
+                ShaderReflectionJSON,
                 allocator,
                 json_buffer[0..read_bytes],
                 .{ .ignore_unknown_fields = true },
             );
-            defer metadata_json.deinit();
+            defer reflection_json.deinit();
 
-            var metadata: Metadata = undefined;
-            metadata.arena_allocator = arena_allocator;
-            metadata.bind_groups = null;
+            var metadata: Metadata = .{ .arena_allocator = arena_allocator };
 
-            for (metadata_json.value.entry_points) |ep| {
+            var bind_groups: [MAX_BIND_GROUP_COUNT]?std.ArrayListUnmanaged(gpu.BindEntry) = .{null} ** MAX_BIND_GROUP_COUNT;
+            var max_bind_group_index: ?usize = null;
+
+            for (reflection_json.value.entry_points) |ep| {
+                if (ep.bindings.len > 0) {
+                    for (ep.bindings) |be| {
+                        max_bind_group_index = @max(be.group, max_bind_group_index orelse 0);
+                        var list_p = blk: {
+                            if (bind_groups[be.group]) |*ls| {
+                                break :blk ls;
+                            } else {
+                                bind_groups[be.group] = try .initCapacity(arena, 4);
+                                break :blk &bind_groups[be.group].?;
+                            }
+                        };
+                        try list_p.append(
+                            arena,
+                            .{
+                                .binding = @intCast(be.binding),
+                                .visibility = gpu.ShaderStage.vertex | gpu.ShaderStage.fragment,
+                                .type = try getBindingType(be.resource_type),
+                            },
+                        );
+                    }
+                }
+
                 if (std.mem.eql(u8, ep.stage, "vertex")) {
                     const name = try arena.alloc(u8, ep.name.len);
                     @memcpy(name, ep.name);
@@ -227,19 +276,6 @@ pub const ShaderManager = struct {
                         }
                         metadata.vertex_inputs = vertex_inputs;
                     }
-
-                    // TODO: Support bind groups
-                    //
-                    // if (metadata.bind_groups.len > 0) {
-                    //     var vertex_inputs = try allocator.alloc(gpu.BindingType, metadata.vertex_inputs);
-                    //     for (ep.input_variables, 0..) |iv, i| {
-                    //         vertex_inputs[i] = .{
-                    //             .location = iv.location,
-                    //             .format = gpu.VertexFormat.getFormComponents(iv.component_type, iv.composition_type),
-                    //         };
-                    //     }
-                    //     metadata.vertex_inputs = vertex_inputs;
-                    // }
                 } else if (std.mem.eql(u8, ep.stage, "fragment")) {
                     const name = try arena.alloc(u8, ep.name.len);
                     @memcpy(name, ep.name);
@@ -247,6 +283,16 @@ pub const ShaderManager = struct {
                 } else {
                     return error.FragmentAndVertexOnly;
                 }
+            }
+
+            if (max_bind_group_index) |mbi| {
+                const bind_group_count = mbi + 1;
+                var bgs = try arena.alloc([]const gpu.BindEntry, bind_group_count);
+                for (0..bind_group_count) |i| {
+                    bgs[i] = try bind_groups[i].?.toOwnedSlice(arena);
+                }
+
+                metadata.bind_groups = bgs;
             }
 
             return metadata;
@@ -359,6 +405,11 @@ pub const ResourceManager = struct {
         c.wgpuQueueWriteBuffer(self.gpu_context.queue, buffer, 0, contents.ptr, contents.len);
 
         return @enumFromInt(self.buffers.items.len - 1);
+    }
+
+    pub fn updateBuffer(self: *Self, buffer_handle: BufferHandle, contents: []const u8) !void {
+        const buffer = self.getBuffer(buffer_handle) orelse return error.FailedToFindBuffer;
+        c.wgpuQueueWriteBuffer(self.gpu_context.queue, buffer, 0, contents.ptr, contents.len);
     }
 
     pub fn getBuffer(self: *const Self, handle: BufferHandle) ?c.WGPUBuffer {
@@ -586,7 +637,7 @@ pub const PipelineCache = struct {
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const alloc = arena.allocator();
+        const temp = arena.allocator();
 
         const shader = self.shader_manager.getShader(descriptor.shader) orelse return error.CouldNotFindShader;
 
@@ -597,21 +648,20 @@ pub const PipelineCache = struct {
 
         if (shader.metadata.bind_groups) |bind_groups| {
             var layout_desc = gpu.z_WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT();
-            bind_group_layouts = try alloc.alloc(c.WGPUBindGroupLayout, bind_groups.len);
-            layout_desc.label = gpu.toWGPUString(label);
+            bind_group_layouts = try temp.alloc(c.WGPUBindGroupLayout, bind_groups.len);
             layout_desc.bindGroupLayoutCount = bind_groups.len;
             for (0..bind_groups.len) |g_index| {
+                const bind_group_entries = bind_groups[g_index];
                 var bind_group_desc = gpu.z_WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT();
-                const entry_count = bind_groups[g_index].len;
-                var entries = try alloc.alloc(c.WGPUBindGroupLayoutEntry, entry_count);
-                bind_group_desc.entryCount = entry_count;
+                var entries = try temp.alloc(c.WGPUBindGroupLayoutEntry, bind_group_entries.len);
+                bind_group_desc.entryCount = bind_group_entries.len;
 
-                for (0..entry_count) |e_index| {
-                    const binding = bind_groups[g_index][e_index];
+                for (0..bind_group_entries.len) |e_index| {
+                    const entry = bind_group_entries[e_index];
                     var layout_entry = gpu.z_WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT();
-                    layout_entry.binding = binding.binding;
-                    layout_entry.visibility = binding.visibility;
-                    switch (binding.type) {
+                    layout_entry.binding = entry.binding;
+                    layout_entry.visibility = entry.visibility;
+                    switch (entry.type) {
                         .buffer => |buf| {
                             var buffer_layout = gpu.z_WGPU_BUFFER_BINDING_LAYOUT_INIT();
                             buffer_layout.type = @intFromEnum(buf);
@@ -644,68 +694,72 @@ pub const PipelineCache = struct {
             desc.layout = c.wgpuDeviceCreatePipelineLayout(self.gpu_context.device, &layout_desc);
         }
 
-        var vertex_state = gpu.z_WGPU_VERTEX_STATE_INIT();
-        vertex_state.module = shader.module;
-        vertex_state.entryPoint = gpu.toWGPUString(shader.metadata.vertex_entry);
+        if (shader.metadata.vertex_entry) |vertex_entry| {
+            var vertex_state = gpu.z_WGPU_VERTEX_STATE_INIT();
+            vertex_state.module = shader.module;
+            vertex_state.entryPoint = gpu.toWGPUString(vertex_entry);
 
-        const buffers = try alloc.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layout_count);
-
-        for (0..descriptor.vertex_layout_count) |li| {
-            const vertex_layout = descriptor.vertex_layouts[li];
-            buffers[li] = gpu.z_WGPU_VERTEX_BUFFER_LAYOUT_INIT();
-            buffers[li].stepMode = @intFromEnum(vertex_layout.step_mode);
-            buffers[li].arrayStride = vertex_layout.array_stride;
-            buffers[li].attributeCount = vertex_layout.attribute_count;
-            var attributes = try alloc.alloc(c.WGPUVertexAttribute, vertex_layout.attribute_count);
-            for (0..vertex_layout.attribute_count) |ai| {
-                const attribute = vertex_layout.attributes[ai];
-                attributes[ai] = gpu.z_WGPU_VERTEX_ATTRIBUTE_INIT();
-                attributes[ai].offset = attribute.offset;
-                attributes[ai].format = @intFromEnum(attribute.format);
-                attributes[ai].shaderLocation = attribute.shader_location;
+            const buffers = try temp.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layout_count);
+            for (0..descriptor.vertex_layout_count) |li| {
+                const vertex_layout = descriptor.vertex_layouts[li];
+                buffers[li] = gpu.z_WGPU_VERTEX_BUFFER_LAYOUT_INIT();
+                buffers[li].stepMode = @intFromEnum(vertex_layout.step_mode);
+                buffers[li].arrayStride = vertex_layout.array_stride;
+                buffers[li].attributeCount = vertex_layout.attribute_count;
+                var attributes = try temp.alloc(c.WGPUVertexAttribute, vertex_layout.attribute_count);
+                for (0..vertex_layout.attribute_count) |ai| {
+                    const attribute = vertex_layout.attributes[ai];
+                    attributes[ai] = gpu.z_WGPU_VERTEX_ATTRIBUTE_INIT();
+                    attributes[ai].offset = attribute.offset;
+                    attributes[ai].format = @intFromEnum(attribute.format);
+                    attributes[ai].shaderLocation = attribute.shader_location;
+                }
+                buffers[li].attributes = attributes.ptr;
             }
-            buffers[li].attributes = attributes.ptr;
-        }
 
-        vertex_state.bufferCount = descriptor.vertex_layout_count;
-        vertex_state.buffers = buffers.ptr;
+            vertex_state.bufferCount = descriptor.vertex_layout_count;
+            vertex_state.buffers = buffers.ptr;
+
+            desc.vertex = vertex_state;
+        }
 
         // TODO handle constants
-        desc.vertex = vertex_state;
 
         // TODO multi target rendering
-        var fragment_state = gpu.z_WGPU_FRAGMENT_STATE_INIT();
-        fragment_state.module = shader.module;
-        fragment_state.entryPoint = gpu.toWGPUString(shader.metadata.fragment_entry);
-        fragment_state.targetCount = 1;
+        if (shader.metadata.fragment_entry) |fragment_entry| {
+            var fragment_state = gpu.z_WGPU_FRAGMENT_STATE_INIT();
+            fragment_state.module = shader.module;
+            fragment_state.entryPoint = gpu.toWGPUString(fragment_entry);
+            fragment_state.targetCount = 1;
 
-        var target_state = gpu.z_WGPU_COLOR_TARGET_STATE_INIT();
-        if (descriptor.color_format) |cd| {
-            target_state.format = @intFromEnum(cd);
-        } else {
-            target_state.format = @intFromEnum(self.default_color_format);
+            var target_state = gpu.z_WGPU_COLOR_TARGET_STATE_INIT();
+            if (descriptor.color_format) |cd| {
+                target_state.format = @intFromEnum(cd);
+            } else {
+                target_state.format = @intFromEnum(self.default_color_format);
+            }
+
+            var blend_state = gpu.z_WGPU_BLEND_STATE_INIT();
+            if (descriptor.blend) |b| {
+                var alpha = gpu.z_WGPU_BLEND_COMPONENT_INIT();
+                alpha.srcFactor = @intFromEnum(b.alpha.src_factor);
+                alpha.dstFactor = @intFromEnum(b.alpha.dst_factor);
+                alpha.operation = @intFromEnum(b.alpha.operation);
+                blend_state.alpha = alpha;
+                var color = gpu.z_WGPU_BLEND_COMPONENT_INIT();
+                color.srcFactor = @intFromEnum(b.color.src_factor);
+                color.dstFactor = @intFromEnum(b.color.dst_factor);
+                color.operation = @intFromEnum(b.color.operation);
+                blend_state.color = color;
+                target_state.blend = &blend_state;
+            }
+
+            // TODO MAYBE expose this
+            target_state.writeMask = c.WGPUColorWriteMask_All;
+
+            fragment_state.targets = &target_state;
+            desc.fragment = &fragment_state;
         }
-
-        var blend_state = gpu.z_WGPU_BLEND_STATE_INIT();
-        if (descriptor.blend) |b| {
-            var alpha = gpu.z_WGPU_BLEND_COMPONENT_INIT();
-            alpha.srcFactor = @intFromEnum(b.alpha.src_factor);
-            alpha.dstFactor = @intFromEnum(b.alpha.dst_factor);
-            alpha.operation = @intFromEnum(b.alpha.operation);
-            blend_state.alpha = alpha;
-            var color = gpu.z_WGPU_BLEND_COMPONENT_INIT();
-            color.srcFactor = @intFromEnum(b.color.src_factor);
-            color.dstFactor = @intFromEnum(b.color.dst_factor);
-            color.operation = @intFromEnum(b.color.operation);
-            blend_state.color = color;
-            target_state.blend = &blend_state;
-        }
-
-        // TODO MAYBE expose this
-        target_state.writeMask = c.WGPUColorWriteMask_All;
-
-        fragment_state.targets = &target_state;
-        desc.fragment = &fragment_state;
 
         // TODO consider covering other fields
         var primitive_state = gpu.z_WGPU_PRIMITIVE_STATE_INIT();
@@ -744,6 +798,7 @@ pub const PipelineCache = struct {
         desc.multisample = multisample_state;
 
         const pipeline = c.wgpuDeviceCreateRenderPipeline(self.gpu_context.device, &desc);
+        std.debug.print("{any}\n", .{pipeline});
 
         var entry = Entry{
             .pipeline = pipeline,
@@ -751,7 +806,7 @@ pub const PipelineCache = struct {
         };
 
         if (bind_group_layouts) |bgl| {
-            for (0..MAX_BIND_GROUP_COUNT, 0..bgl.len) |i, _| {
+            for (0..bgl.len) |i| {
                 entry.bind_group_layouts[i] = bgl[i];
             }
         }
@@ -772,7 +827,21 @@ pub const PipelineCache = struct {
     }
 };
 
-// ── Bindings ─────────────────────────────────────────────────────────────────
+// ──  ─────────────────────────────────────────────────────────────────
+pub const BindGroupEntry = struct {
+    binding: u32,
+    resource: union(enum) {
+        buffer: Buffer,
+        sampler: SamplerHandle,
+        texture_view: c.WGPUTextureView,
+    },
+
+    pub const Buffer = struct {
+        handle: BufferHandle,
+        offset: u64 = 0,
+        size: u64 = 0,
+    };
+};
 
 pub const Bindings = struct {
     bind_groups: BindGroupMap,
@@ -780,21 +849,6 @@ pub const Bindings = struct {
     resource_manager: *const ResourceManager,
 
     const Self = @This();
-
-    pub const BindGroupEntry = struct {
-        binding: u32,
-        resource: union(enum) {
-            buffer: Buffer,
-            sampler: SamplerHandle,
-            texture_view: c.WGPUTextureView,
-        },
-
-        pub const Buffer = struct {
-            handle: BufferHandle,
-            offset: u64 = 0,
-            size: u64 = 0,
-        };
-    };
 
     pub const BindGroupDescriptor = struct {
         layout: c.WGPUBindGroupLayout,
@@ -838,7 +892,7 @@ pub const Bindings = struct {
                     entry.buffer = self.resource_manager.getBuffer(b.handle) orelse return error.CouldNotFindBuffer;
                 },
                 .sampler => |s| {
-                    entry.sampler = self.resource_manager.getSampler(s);
+                    entry.sampler = self.resource_manager.getSampler(s) orelse return error.CouldNotFindSampler;
                 },
                 .texture_view => |tv| {
                     entry.textureView = tv;
@@ -921,5 +975,3 @@ pub const Bindings = struct {
         self.bind_groups.deinit(allocator);
     }
 };
-
-// -----------Shader Compilation------------------------------
