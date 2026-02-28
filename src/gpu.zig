@@ -676,7 +676,14 @@ pub const ShaderStage = struct {
 
 // ── Binding type (tagged union, used in shader metadata) ─────────────────────
 
-pub const BindingType = union(enum) {
+pub const BindingResourceTypes = enum {
+    buffer,
+    sampler,
+    texture,
+    storage_texture,
+};
+
+pub const BindingType = union(BindingResourceTypes) {
     buffer: BufferBT,
     sampler: SamplerBT,
     texture: TextureBindingInfo,
@@ -708,8 +715,9 @@ pub const VertexInput = struct {
     format: VertexFormat,
 };
 
-pub const BindEntry = struct {
+pub const BindGroupLayoutEntry = struct {
     binding: u32,
     type: BindingType,
-    visibility: c.WGPUShaderStage,
+    // DO NOT CHANGE FOR NOW
+    visibility: c.WGPUShaderStage = ShaderStage.fragment | ShaderStage.vertex,
 };

@@ -56,16 +56,19 @@ pub fn main() !void {
     var shaders = try gs.ShaderManager.init(allocator, &gpu_context);
     defer shaders.deinit(allocator);
 
+    var bind_group_layouts = gs.BindGroupLayoutCache.init(&shaders);
+
     var pipelines = gs.PipelineCache.init(
         &gpu_context,
         &shaders,
+        &bind_group_layouts,
         &surface,
         .depth24_plus,
     );
     defer pipelines.deinit(allocator);
 
-    var bindings = gs.BindGroupCache.init(&gpu_context, &resources);
-    defer bindings.deinit(allocator);
+    var bind_groups = gs.BindGroupCache.init(&gpu_context, &resources);
+    defer bind_groups.deinit(allocator);
 
     // create the shader
     const shader_handle = try shaders.createShader(
@@ -124,29 +127,6 @@ pub fn main() !void {
         pipeline_desc,
     );
 
-    const bind_group = try bindings.getOrCreateBindingGroup(
-        allocator,
-        "uniform",
-        .{
-            .entry_count = 1,
-            .entries = blk: {
-                var entries: [4]gs.BindGroupEntry = undefined;
-                entries[0] = .{
-                    .binding = 0,
-                    .resource = .{
-                        .buffer = .{
-                            .handle = uniform_handle,
-                            .offset = 0,
-                            .size = @sizeOf(f32),
-                        },
-                    },
-                };
-                break :blk entries;
-            },
-            .layout = pipeline_entry.bind_group_layouts[0].?,
-        },
-    );
-
     // Main loop
     var running = true;
     while (running) {
@@ -167,6 +147,9 @@ pub fn main() !void {
         var pass = gs.RenderPass.init(
             frame.encoder,
             frame.target_view,
+            &bind_group_layouts,
+            &bind_groups,
+            &shaders,
             .{
                 .color_attachment = .{
                     .clear_value = .{ .a = 1.0, .r = 0.1, .g = 0.1, .b = 0.1 },
@@ -179,16 +162,22 @@ pub fn main() !void {
         c.wgpuRenderPassEncoderSetVertexBuffer(
             pass.render_pass,
             0,
-            resources.getBuffer(vb_handle).?,
+            resources.getBuffer(vb_handle).?.ptr,
             0,
             @sizeOf(f32) * vertices.len,
         );
-        c.wgpuRenderPassEncoderSetBindGroup(
-            pass.render_pass,
+        try pass.bindGroup(
+            allocator,
             0,
-            bind_group,
-            0,
-            null,
+            shader_handle,
+            &.{
+                .{
+                    .binding = 0,
+                    .resource = .{ .buffer = .{
+                        .handle = uniform_handle,
+                    } },
+                },
+            },
         );
         c.wgpuRenderPassEncoderDraw(
             pass.render_pass,
