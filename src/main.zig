@@ -113,25 +113,27 @@ pub fn main() !void {
 
     // Create pipeline
 
-    var pipeline_desc: gs.PipelineDescriptor = .{
+    const pipeline_desc: gs.PipelineDescriptor = .{
         .shader_module = shader.module,
-        .vertex_layout_count = 1,
         .depth_stencil = null,
-    };
-    pipeline_desc.vertex_layouts[0] = .{
-        .step_mode = .vertex,
-        .array_stride = 5 * @sizeOf(f32),
-        .attribute_count = 2,
-    };
-    pipeline_desc.vertex_layouts[0].attributes[0] = .{
-        .shader_location = 0,
-        .offset = 0,
-        .format = .f32x2,
-    };
-    pipeline_desc.vertex_layouts[0].attributes[1] = .{
-        .shader_location = 1,
-        .offset = 2 * @sizeOf(f32),
-        .format = .f32x3,
+        .vertex_layouts = &.{
+            .{
+                .step_mode = .vertex,
+                .array_stride = 5 * @sizeOf(f32),
+                .attributes = &.{
+                    .{
+                        .shader_location = 0,
+                        .offset = 0,
+                        .format = .f32x2,
+                    },
+                    .{
+                        .shader_location = 1,
+                        .offset = 2 * @sizeOf(f32),
+                        .format = .f32x3,
+                    },
+                },
+            },
+        },
     };
 
     const pipeline_entry = try pipelines.getOrCreatePipeline(

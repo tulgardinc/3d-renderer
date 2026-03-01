@@ -159,43 +159,7 @@ pub const BlendState = struct {
     alpha: BlendComponent,
 };
 
-pub const VertexLayout = struct {
-    step_mode: StepMode,
-    array_stride: u64,
-    attribute_count: u32,
-    attributes: [MAX_ATTRIBUTES]VertexAttribute = std.mem.zeroes([MAX_ATTRIBUTES]VertexAttribute),
-
-    const MAX_ATTRIBUTES = 16;
-
-    pub const VertexAttribute = struct {
-        format: gpu.VertexFormat = .u8,
-        offset: u64 = 0,
-        shader_location: u32 = 0,
-    };
-
-    pub const StepMode = enum(c.WGPUVertexStepMode) {
-        undefined = c.WGPUVertexStepMode_Undefined,
-        vertex = c.WGPUVertexStepMode_Vertex,
-        instance = c.WGPUVertexStepMode_Instance,
-    };
-};
-
 const MAX_VERTEX_LAYOUT_COUNT = 8;
-
-pub const PipelineDescriptor = struct {
-    color_format: ?gpu.TextureFormat = null,
-    depth_format: ?gpu.TextureFormat = null,
-    shader_module: c.WGPUShaderModule,
-    vertex_layout_count: u32,
-    vertex_layouts: [MAX_VERTEX_LAYOUT_COUNT]VertexLayout = std.mem.zeroes([MAX_VERTEX_LAYOUT_COUNT]VertexLayout),
-    primitive_topology: gpu.PrimitiveTopology = .triangle_list,
-    depth_stencil: ?DepthStencilState = .{
-        .depth_write_enabled = true,
-        .depth_compare = .less,
-    },
-    blend: ?BlendState = null,
-    cull_mode: gpu.CullMode = .back,
-};
 
 pub const ShaderManager = struct {
     shaders: std.ArrayList(Shader),
@@ -524,6 +488,40 @@ pub const ResourceManager = struct {
     }
 };
 
+pub const VertexLayout = struct {
+    step_mode: StepMode,
+    array_stride: u64,
+    attributes: []const VertexAttribute,
+
+    const MAX_ATTRIBUTES = 16;
+
+    pub const VertexAttribute = struct {
+        format: gpu.VertexFormat = .u8,
+        offset: u64 = 0,
+        shader_location: u32 = 0,
+    };
+
+    pub const StepMode = enum(c.WGPUVertexStepMode) {
+        undefined = c.WGPUVertexStepMode_Undefined,
+        vertex = c.WGPUVertexStepMode_Vertex,
+        instance = c.WGPUVertexStepMode_Instance,
+    };
+};
+
+pub const PipelineDescriptor = struct {
+    color_format: ?gpu.TextureFormat = null,
+    depth_format: ?gpu.TextureFormat = null,
+    shader_module: c.WGPUShaderModule,
+    vertex_layouts: []const VertexLayout = &.{},
+    primitive_topology: gpu.PrimitiveTopology = .triangle_list,
+    depth_stencil: ?DepthStencilState = .{
+        .depth_write_enabled = true,
+        .depth_compare = .less,
+    },
+    blend: ?BlendState = null,
+    cull_mode: gpu.CullMode = .back,
+};
+
 pub const PipelineCache = struct {
     pipelines: PipelineMap,
     device: c.WGPUDevice,
@@ -557,12 +555,10 @@ pub const PipelineCache = struct {
                 h.update(&[_]u8{0});
             }
             h.update(std.mem.asBytes(&key.shader_module));
-            h.update(std.mem.asBytes(&key.vertex_layout_count));
-            for (key.vertex_layouts[0..key.vertex_layout_count]) |vl| {
+            for (key.vertex_layouts) |vl| {
                 h.update(std.mem.asBytes(&vl.step_mode));
                 h.update(std.mem.asBytes(&vl.array_stride));
-                h.update(std.mem.asBytes(&vl.attribute_count));
-                for (vl.attributes[0..vl.attribute_count]) |attr| {
+                for (vl.attributes) |attr| {
                     h.update(std.mem.asBytes(&attr.format));
                     h.update(std.mem.asBytes(&attr.offset));
                     h.update(std.mem.asBytes(&attr.shader_location));
@@ -617,12 +613,11 @@ pub const PipelineCache = struct {
             if (key1.color_format != key2.color_format) return false;
             if (key1.depth_format != key2.depth_format) return false;
             if (key1.shader_module != key2.shader_module) return false;
-            if (key1.vertex_layout_count != key2.vertex_layout_count) return false;
-            for (key1.vertex_layouts[0..key1.vertex_layout_count], key2.vertex_layouts[0..key2.vertex_layout_count]) |vl1, vl2| {
+            if (key1.vertex_layouts.len != key2.vertex_layouts.len) return false;
+            for (key1.vertex_layouts, key2.vertex_layouts) |vl1, vl2| {
                 if (vl1.step_mode != vl2.step_mode) return false;
                 if (vl1.array_stride != vl2.array_stride) return false;
-                if (vl1.attribute_count != vl2.attribute_count) return false;
-                for (vl1.attributes[0..vl1.attribute_count], vl2.attributes[0..vl2.attribute_count]) |a1, a2| {
+                for (vl1.attributes, vl2.attributes) |a1, a2| {
                     if (a1.format != a2.format) return false;
                     if (a1.offset != a2.offset) return false;
                     if (a1.shader_location != a2.shader_location) return false;
@@ -732,15 +727,14 @@ pub const PipelineCache = struct {
             vertex_state.module = descriptor.shader_module;
             vertex_state.entryPoint = gpu.toWGPUString(ve);
 
-            const buffers = try temp.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layout_count);
-            for (0..descriptor.vertex_layout_count) |li| {
-                const vertex_layout = descriptor.vertex_layouts[li];
+            const buffers = try temp.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layouts.len);
+            for (descriptor.vertex_layouts, 0..) |vertex_layout, li| {
                 buffers[li] = gpu.z_WGPU_VERTEX_BUFFER_LAYOUT_INIT();
                 buffers[li].stepMode = @intFromEnum(vertex_layout.step_mode);
                 buffers[li].arrayStride = vertex_layout.array_stride;
-                buffers[li].attributeCount = vertex_layout.attribute_count;
-                var attributes = try temp.alloc(c.WGPUVertexAttribute, vertex_layout.attribute_count);
-                for (0..vertex_layout.attribute_count) |ai| {
+                buffers[li].attributeCount = vertex_layout.attributes.len;
+                var attributes = try temp.alloc(c.WGPUVertexAttribute, vertex_layout.attributes.len);
+                for (0..vertex_layout.attributes.len) |ai| {
                     const attribute = vertex_layout.attributes[ai];
                     attributes[ai] = gpu.z_WGPU_VERTEX_ATTRIBUTE_INIT();
                     attributes[ai].offset = attribute.offset;
@@ -750,7 +744,7 @@ pub const PipelineCache = struct {
                 buffers[li].attributes = attributes.ptr;
             }
 
-            vertex_state.bufferCount = descriptor.vertex_layout_count;
+            vertex_state.bufferCount = descriptor.vertex_layouts.len;
             vertex_state.buffers = buffers.ptr;
 
             desc.vertex = vertex_state;
