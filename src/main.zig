@@ -179,6 +179,7 @@ pub fn main() !void {
                 },
             },
         );
+
         c.wgpuRenderPassEncoderDraw(
             pass.render_pass,
             3,

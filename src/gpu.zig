@@ -153,6 +153,28 @@ pub fn requestDeviceSync(instance: c.WGPUInstance, adapter: c.WGPUAdapter) !c.WG
             data_p.done = true;
         }
     };
+
+    const uncapturedErrorCallback = struct {
+        pub fn func(
+            _: ?*const c.WGPUDevice,
+            error_type: c.WGPUErrorType,
+            message: c.WGPUStringView,
+            _: ?*anyopaque,
+            _: ?*anyopaque,
+        ) callconv(.c) void {
+            std.debug.panic("[WebGPU uncaptured] {s}: {s}", .{
+                switch (error_type) {
+                    c.WGPUErrorType_Validation => "Validation",
+                    c.WGPUErrorType_OutOfMemory => "OOM",
+                    c.WGPUErrorType_Internal => "Internal",
+                    c.WGPUErrorType_Unknown => "Unknown",
+                    else => "???",
+                },
+                wgpuStringToString(&message),
+            });
+        }
+    }.func;
+
     var cb_data: CallbackData = .{};
     const cb = CallbackData.func;
 
@@ -162,7 +184,12 @@ pub fn requestDeviceSync(instance: c.WGPUInstance, adapter: c.WGPUAdapter) !c.WG
         .userdata1 = @ptrCast(@alignCast(&cb_data)),
     };
 
-    _ = c.wgpuAdapterRequestDevice(adapter, &z_WGPU_DEVICE_DESCRIPTOR_INIT(), cb_info);
+    var device_desc = z_WGPU_DEVICE_DESCRIPTOR_INIT();
+    device_desc.uncapturedErrorCallbackInfo = .{
+        .callback = &uncapturedErrorCallback,
+    };
+
+    _ = c.wgpuAdapterRequestDevice(adapter, &device_desc, cb_info);
 
     c.wgpuInstanceProcessEvents(instance);
 

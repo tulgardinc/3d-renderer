@@ -3,6 +3,10 @@ const gpu = @import("gpu.zig");
 const build_options = @import("build_options");
 const c = gpu.c;
 
+// TODO: Make the modules decoupled (user responsibility to feed content into each call)
+// TOOD: Make sure that we have a way to error out and nicely give debug infromation
+// whenever a magenta screen would show up. This should be zero cost at production builds.
+
 // ── Handle types ─────────────────────────────────────────────────────────────
 
 pub const ShaderHandle = enum(u32) { _ };
