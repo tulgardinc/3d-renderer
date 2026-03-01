@@ -42,40 +42,42 @@ pub fn main() !void {
     var gpu_context = try gpu.GPUContext.initSync(instance.webgpu_instance, surface_raw);
     defer gpu_context.deinit();
 
-    var surface = gpu.Surface.init(
-        surface_raw,
-        gpu_context.adapter,
-    );
+    var surface = gpu.Surface.init(surface_raw, gpu_context.adapter);
     defer surface.deinit();
 
     surface.configure(gpu_context.device, @intCast(width), @intCast(height));
 
-    var resources = try gs.ResourceManager.init(allocator, &gpu_context);
+    // Initialize modules
+
+    var resources = try gs.ResourceManager.init(allocator, gpu_context.device, gpu_context.queue);
     defer resources.deinit(allocator);
 
-    var shaders = try gs.ShaderManager.init(allocator, &gpu_context);
+    var shaders = try gs.ShaderManager.init(allocator, gpu_context.device);
     defer shaders.deinit(allocator);
 
-    var bind_group_layouts = gs.BindGroupLayoutCache.init(&shaders);
+    var bind_group_layout_cache = gs.BindGroupLayoutCache.init(gpu_context.device);
+    defer bind_group_layout_cache.deinit();
+
+    var bind_group_cache = gs.BindGroupCache.init(gpu_context.device);
+    defer bind_group_cache.deinit(allocator);
 
     var pipelines = gs.PipelineCache.init(
-        &gpu_context,
-        &shaders,
-        &bind_group_layouts,
-        &surface,
+        gpu_context.device,
+        surface.format,
         .depth24_plus,
     );
     defer pipelines.deinit(allocator);
 
-    var bind_groups = gs.BindGroupCache.init(&gpu_context, &resources);
-    defer bind_groups.deinit(allocator);
+    // Create shader
 
-    // create the shader
     const shader_handle = try shaders.createShader(
         allocator,
         build_options.shaders_dir ++ "/2DVertexColors.wgsl",
         "test shader",
     );
+    const shader = shaders.getShader(shader_handle).?;
+
+    // Create Buffers
 
     const vertices = [_]f32{
         -0.5, -0.5, 1.0, 0.0, 0.0,
@@ -98,8 +100,21 @@ pub fn main() !void {
         gpu.BufferUsage.uniform | gpu.BufferUsage.copy_dst,
     );
 
+    // ── Resolve bind group layouts from shader metadata ───────────────────────
+
+    var bg_layout_buf: [gs.MAX_BIND_GROUP_COUNT]c.WGPUBindGroupLayout = undefined;
+    var bg_layouts: ?[]const c.WGPUBindGroupLayout = null;
+    if (shader.metadata.bind_group_layouts) |bgs| {
+        for (bgs, 0..) |entries, i| {
+            bg_layout_buf[i] = try bind_group_layout_cache.getOrCreateBindGroupLayout(allocator, entries);
+        }
+        bg_layouts = bg_layout_buf[0..bgs.len];
+    }
+
+    // Create pipeline
+
     var pipeline_desc: gs.PipelineDescriptor = .{
-        .shader = shader_handle,
+        .shader_module = shader.module,
         .vertex_layout_count = 1,
         .depth_stencil = null,
     };
@@ -119,18 +134,19 @@ pub fn main() !void {
         .format = .f32x3,
     };
 
-    const start_time = std.time.milliTimestamp();
-
     const pipeline_entry = try pipelines.getOrCreatePipeline(
         allocator,
         "2d pipeline",
         pipeline_desc,
+        shader.metadata.vertex_entry,
+        shader.metadata.fragment_entry,
+        bg_layouts,
     );
 
-    // Main loop
+    const start_time = std.time.milliTimestamp();
+
     var running = true;
     while (running) {
-        // Handle events
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             if (event.type == c.SDL_EVENT_QUIT) {
@@ -147,8 +163,8 @@ pub fn main() !void {
         var pass = gs.RenderPass.init(
             frame.encoder,
             frame.target_view,
-            &bind_group_layouts,
-            &bind_groups,
+            &bind_group_layout_cache,
+            &bind_group_cache,
             &shaders,
             .{
                 .color_attachment = .{
@@ -158,36 +174,21 @@ pub fn main() !void {
         );
         defer pass.deinit();
 
-        c.wgpuRenderPassEncoderSetPipeline(pass.render_pass, pipeline_entry.pipeline);
-        c.wgpuRenderPassEncoderSetVertexBuffer(
-            pass.render_pass,
-            0,
-            resources.getBuffer(vb_handle).?.ptr,
-            0,
-            @sizeOf(f32) * vertices.len,
-        );
-        try pass.bindGroup(
-            allocator,
-            0,
-            shader_handle,
-            &.{
-                .{
-                    .binding = 0,
-                    .resource = .{ .buffer = .{
-                        .handle = uniform_handle,
-                    } },
-                },
+        const vb = resources.getBuffer(vb_handle).?;
+        const ub = resources.getBuffer(uniform_handle).?;
+
+        pass.setPipeline(pipeline_entry.pipeline);
+        pass.setVertexBuffer(0, vb.ptr, 0, @sizeOf(f32) * vertices.len);
+        try pass.bindGroup(allocator, 0, shader_handle, &.{
+            .{
+                .binding = 0,
+                .resource = .{ .buffer = .{
+                    .buffer = ub.ptr,
+                    .size = ub.byte_size,
+                } },
             },
-        );
-
-        c.wgpuRenderPassEncoderDraw(
-            pass.render_pass,
-            3,
-            1,
-            0,
-            0,
-        );
-
+        });
+        pass.draw(3, 1, 0, 0);
         pass.end();
 
         const render_commands = frame.end();

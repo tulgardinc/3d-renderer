@@ -3,12 +3,6 @@ const gpu = @import("gpu.zig");
 const build_options = @import("build_options");
 const c = gpu.c;
 
-// TODO: Make the modules decoupled (user responsibility to feed content into each call)
-// TOOD: Make sure that we have a way to error out and nicely give debug infromation
-// whenever a magenta screen would show up. This should be zero cost at production builds.
-
-// ── Handle types ─────────────────────────────────────────────────────────────
-
 pub const ShaderHandle = enum(u32) { _ };
 pub const BufferHandle = enum(u32) { _ };
 pub const TextureHandle = enum(u32) { _ };
@@ -16,9 +10,7 @@ pub const TextureViewHandle = enum(u32) { _ };
 pub const SamplerHandle = enum(u32) { _ };
 pub const BindGroupHandle = enum(u32) { _ };
 
-const MAX_BIND_GROUP_COUNT = 4;
-
-// ── Render pass config (Layer 2 owns these — they configure the pass) ────────
+pub const MAX_BIND_GROUP_COUNT = 4;
 
 pub const Color = gpu.Color;
 
@@ -39,8 +31,6 @@ pub const RenderPassConfig = struct {
     depth_stencil_attachment: ?DepthStencilAttachment = null,
     label: []const u8 = "render pass",
 };
-
-// ── RenderPass (Layer 2 — configured via RenderPassConfig) ───────────────────
 
 pub const RenderPass = struct {
     render_pass: c.WGPURenderPassEncoder,
@@ -74,10 +64,7 @@ pub const RenderPass = struct {
         desc.colorAttachmentCount = 1;
         desc.colorAttachments = &color_attachment;
 
-        const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(
-            encoder,
-            &desc,
-        );
+        const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(encoder, &desc);
 
         return .{
             .render_pass = render_pass_encoder,
@@ -87,36 +74,50 @@ pub const RenderPass = struct {
         };
     }
 
+    pub fn setPipeline(self: *Self, pipeline: c.WGPURenderPipeline) void {
+        c.wgpuRenderPassEncoderSetPipeline(self.render_pass, pipeline);
+    }
+
+    pub fn setVertexBuffer(self: *Self, slot: u32, buffer: c.WGPUBuffer, offset: u64, size: u64) void {
+        c.wgpuRenderPassEncoderSetVertexBuffer(self.render_pass, slot, buffer, offset, size);
+    }
+
+    pub fn setBindGroup(self: *Self, group_index: u32, bind_group: c.WGPUBindGroup) void {
+        c.wgpuRenderPassEncoderSetBindGroup(self.render_pass, group_index, bind_group, 0, null);
+    }
+
+    /// Convenience: looks up the layout from shader metadata, resolves the bind group,
+    /// and calls setBindGroup. The caller provides pre-resolved raw WebGPU resources.
     pub fn bindGroup(
         self: *Self,
         allocator: std.mem.Allocator,
         group_index: u32,
         shader_handle: ShaderHandle,
-        bind_group_entries: []const BindGroupEntry,
+        entries: []const BindGroupEntry,
     ) !void {
-        const shader = self.shader_manager.getShader(shader_handle) orelse return error.ShaderNotFound;
-        const bind_group_layouts = shader.metadata.bind_group_layouts orelse return error.ShaderHasNoBindGroups;
-
-        const layout = try self.bind_group_layout_cache.getOrCreateBindGroupLayout(
-            allocator,
-            bind_group_layouts[group_index],
-        );
-
-        // TODO work with slice not array for entries
-        const group_descriptor: BindGroupCache.BindGroupDescriptor = .{
-            .layout = layout,
-            .entries = bind_group_entries,
+        const shader = self.shader_manager.getShader(shader_handle) orelse {
+            std.log.err("RenderPass.bindGroup: shader handle {d} not found", .{@intFromEnum(shader_handle)});
+            return error.ShaderNotFound;
         };
+        const bgl = shader.metadata.bind_group_layouts orelse {
+            std.log.err("RenderPass.bindGroup: shader has no bind group layouts", .{});
+            return error.ShaderHasNoBindGroups;
+        };
+        if (group_index >= bgl.len) {
+            std.log.err("RenderPass.bindGroup: group index {d} out of range (shader has {d} groups)", .{ group_index, bgl.len });
+            return error.BindGroupIndexOutOfRange;
+        }
 
-        const group = try self.bind_group_cache.getOrCreateBindingGroup(allocator, group_descriptor);
+        const layout = try self.bind_group_layout_cache.getOrCreateBindGroupLayout(allocator, bgl[group_index]);
+        const bg = try self.bind_group_cache.getOrCreateBindingGroup(allocator, .{
+            .layout = layout,
+            .entries = entries,
+        });
+        self.setBindGroup(group_index, bg);
+    }
 
-        c.wgpuRenderPassEncoderSetBindGroup(
-            self.render_pass,
-            group_index,
-            group,
-            0,
-            null,
-        );
+    pub fn draw(self: *Self, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) void {
+        c.wgpuRenderPassEncoderDraw(self.render_pass, vertex_count, instance_count, first_vertex, first_instance);
     }
 
     pub fn end(self: *Self) void {
@@ -127,8 +128,6 @@ pub const RenderPass = struct {
         c.wgpuRenderPassEncoderRelease(self.render_pass);
     }
 };
-
-// ── Pipeline descriptor types ────────────────────────────────────────────────
 
 pub const StencilFaceState = struct {
     compare: gpu.CompareFunction,
@@ -186,7 +185,7 @@ const MAX_VERTEX_LAYOUT_COUNT = 8;
 pub const PipelineDescriptor = struct {
     color_format: ?gpu.TextureFormat = null,
     depth_format: ?gpu.TextureFormat = null,
-    shader: ShaderHandle,
+    shader_module: c.WGPUShaderModule,
     vertex_layout_count: u32,
     vertex_layouts: [MAX_VERTEX_LAYOUT_COUNT]VertexLayout = std.mem.zeroes([MAX_VERTEX_LAYOUT_COUNT]VertexLayout),
     primitive_topology: gpu.PrimitiveTopology = .triangle_list,
@@ -198,11 +197,9 @@ pub const PipelineDescriptor = struct {
     cull_mode: gpu.CullMode = .back,
 };
 
-// ── ShaderManager ────────────────────────────────────────────────────────────
-
 pub const ShaderManager = struct {
     shaders: std.ArrayList(Shader),
-    gpu_context: *const gpu.GPUContext,
+    device: c.WGPUDevice,
 
     pub const ShaderReflectionJSON = struct {
         entry_points: []const EntryPointEntry,
@@ -359,11 +356,11 @@ pub const ShaderManager = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        gpu_context: *const gpu.GPUContext,
+        device: c.WGPUDevice,
     ) !Self {
         return .{
             .shaders = try .initCapacity(allocator, 8),
-            .gpu_context = gpu_context,
+            .device = device,
         };
     }
 
@@ -386,8 +383,14 @@ pub const ShaderManager = struct {
 
         const metadata = try Metadata.fromShadeSource(allocator, source_path);
 
+        const module = c.wgpuDeviceCreateShaderModule(self.device, &desc);
+        if (module == null) {
+            std.log.err("ShaderManager: wgpuDeviceCreateShaderModule failed for '{s}'", .{label});
+            return error.ShaderModuleCreationFailed;
+        }
+
         try self.shaders.append(allocator, .{
-            .module = c.wgpuDeviceCreateShaderModule(self.gpu_context.device, &desc),
+            .module = module,
             .metadata = metadata,
         });
 
@@ -412,15 +415,14 @@ pub const ShaderManager = struct {
     }
 };
 
-// ── ResourceManager ──────────────────────────────────────────────────────────
-
 pub const ResourceManager = struct {
     // TODO: add generational indices for use after free tracking
 
     buffers: std.ArrayList(BufferEntry),
     textures: std.ArrayList(c.WGPUTexture),
     samplers: std.ArrayList(c.WGPUSampler),
-    gpu_context: *const gpu.GPUContext,
+    device: c.WGPUDevice,
+    queue: c.WGPUQueue,
 
     const Self = @This();
 
@@ -429,13 +431,14 @@ pub const ResourceManager = struct {
         byte_size: usize,
     };
 
-    pub fn init(allocator: std.mem.Allocator, gpu_context: *const gpu.GPUContext) !Self {
+    pub fn init(allocator: std.mem.Allocator, device: c.WGPUDevice, queue: c.WGPUQueue) !Self {
         const INITIAL_CAPACITY = 16;
         return .{
             .buffers = try .initCapacity(allocator, INITIAL_CAPACITY),
             .textures = try .initCapacity(allocator, INITIAL_CAPACITY),
             .samplers = try .initCapacity(allocator, INITIAL_CAPACITY),
-            .gpu_context = gpu_context,
+            .device = device,
+            .queue = queue,
         };
     }
 
@@ -451,21 +454,25 @@ pub const ResourceManager = struct {
         desc.size = contents.len;
         desc.usage = @bitCast(usage);
 
-        const buffer = c.wgpuDeviceCreateBuffer(self.gpu_context.device, &desc);
+        const buffer = c.wgpuDeviceCreateBuffer(self.device, &desc);
+        if (buffer == null) {
+            std.log.err("ResourceManager: wgpuDeviceCreateBuffer failed for '{s}'", .{label});
+            return error.BufferCreationFailed;
+        }
         const buffer_entry: BufferEntry = .{
             .ptr = buffer,
             .byte_size = contents.len,
         };
         try self.buffers.append(allocator, buffer_entry);
 
-        c.wgpuQueueWriteBuffer(self.gpu_context.queue, buffer, 0, contents.ptr, contents.len);
+        c.wgpuQueueWriteBuffer(self.queue, buffer, 0, contents.ptr, contents.len);
 
         return @enumFromInt(self.buffers.items.len - 1);
     }
 
     pub fn updateBuffer(self: *Self, buffer_handle: BufferHandle, contents: []const u8) !void {
         const buffer_entry = self.getBuffer(buffer_handle) orelse return error.FailedToFindBuffer;
-        c.wgpuQueueWriteBuffer(self.gpu_context.queue, buffer_entry.ptr, 0, contents.ptr, contents.len);
+        c.wgpuQueueWriteBuffer(self.queue, buffer_entry.ptr, 0, contents.ptr, contents.len);
     }
 
     pub fn getBuffer(self: *const Self, handle: BufferHandle) ?BufferEntry {
@@ -517,19 +524,14 @@ pub const ResourceManager = struct {
     }
 };
 
-// ── PipelineCache ────────────────────────────────────────────────────────────
-
 pub const PipelineCache = struct {
     pipelines: PipelineMap,
+    device: c.WGPUDevice,
     default_color_format: gpu.TextureFormat,
     default_depth_format: gpu.TextureFormat,
-    shader_manager: *const ShaderManager,
-    bind_group_layout_cache: *BindGroupLayoutCache,
-    gpu_context: *const gpu.GPUContext,
 
-    const PipelineEntry = struct {
+    pub const PipelineEntry = struct {
         pipeline: c.WGPURenderPipeline,
-        shader: ShaderHandle,
     };
 
     const PipelineMap = std.HashMapUnmanaged(
@@ -554,7 +556,7 @@ pub const PipelineCache = struct {
             } else {
                 h.update(&[_]u8{0});
             }
-            h.update(std.mem.asBytes(&key.shader));
+            h.update(std.mem.asBytes(&key.shader_module));
             h.update(std.mem.asBytes(&key.vertex_layout_count));
             for (key.vertex_layouts[0..key.vertex_layout_count]) |vl| {
                 h.update(std.mem.asBytes(&vl.step_mode));
@@ -614,7 +616,7 @@ pub const PipelineCache = struct {
         pub fn eql(_: @This(), key1: PipelineDescriptor, key2: PipelineDescriptor) bool {
             if (key1.color_format != key2.color_format) return false;
             if (key1.depth_format != key2.depth_format) return false;
-            if (key1.shader != key2.shader) return false;
+            if (key1.shader_module != key2.shader_module) return false;
             if (key1.vertex_layout_count != key2.vertex_layout_count) return false;
             for (key1.vertex_layouts[0..key1.vertex_layout_count], key2.vertex_layouts[0..key2.vertex_layout_count]) |vl1, vl2| {
                 if (vl1.step_mode != vl2.step_mode) return false;
@@ -680,18 +682,14 @@ pub const PipelineCache = struct {
     const Self = @This();
 
     pub fn init(
-        gpu_context: *const gpu.GPUContext,
-        shader_manager: *const ShaderManager,
-        bind_group_layout_cache: *BindGroupLayoutCache,
-        surface: *const gpu.Surface,
+        device: c.WGPUDevice,
+        default_color_format: gpu.TextureFormat,
         default_depth_format: gpu.TextureFormat,
     ) Self {
         return .{
             .pipelines = .{},
-            .gpu_context = gpu_context,
-            .shader_manager = shader_manager,
-            .bind_group_layout_cache = bind_group_layout_cache,
-            .default_color_format = surface.format,
+            .device = device,
+            .default_color_format = default_color_format,
             .default_depth_format = default_depth_format,
         };
     }
@@ -702,6 +700,9 @@ pub const PipelineCache = struct {
         allocator: std.mem.Allocator,
         label: []const u8,
         descriptor: PipelineDescriptor,
+        vertex_entry: ?[]const u8,
+        fragment_entry: ?[]const u8,
+        bind_group_layouts: ?[]const c.WGPUBindGroupLayout,
     ) !PipelineEntry {
         if (self.pipelines.get(descriptor)) |pipeline| {
             return pipeline;
@@ -711,27 +712,25 @@ pub const PipelineCache = struct {
         defer arena.deinit();
         const temp = arena.allocator();
 
-        const shader = self.shader_manager.getShader(descriptor.shader) orelse return error.CouldNotFindShader;
-
         var desc = gpu.z_WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT();
         desc.label = gpu.toWGPUString(label);
 
-        if (shader.metadata.bind_group_layouts) |bgs| {
+        if (bind_group_layouts) |bgls| {
             var pipeline_layout_desc = gpu.z_WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT();
-            var bind_group_layouts = try temp.alloc(c.WGPUBindGroupLayout, bgs.len);
-            for (bgs, 0..) |bg_entries, i| {
-                bind_group_layouts[i] = try self.bind_group_layout_cache.getOrCreateBindGroupLayout(allocator, bg_entries);
+            pipeline_layout_desc.bindGroupLayoutCount = bgls.len;
+            pipeline_layout_desc.bindGroupLayouts = bgls.ptr;
+            const layout = c.wgpuDeviceCreatePipelineLayout(self.device, &pipeline_layout_desc);
+            if (layout == null) {
+                std.log.err("PipelineCache: wgpuDeviceCreatePipelineLayout failed for '{s}'", .{label});
+                return error.PipelineLayoutCreationFailed;
             }
-            pipeline_layout_desc.bindGroupLayoutCount = bind_group_layouts.len;
-            pipeline_layout_desc.bindGroupLayouts = bind_group_layouts.ptr;
-            const layout = c.wgpuDeviceCreatePipelineLayout(self.gpu_context.device, &pipeline_layout_desc);
             desc.layout = layout;
         }
 
-        if (shader.metadata.vertex_entry) |vertex_entry| {
+        if (vertex_entry) |ve| {
             var vertex_state = gpu.z_WGPU_VERTEX_STATE_INIT();
-            vertex_state.module = shader.module;
-            vertex_state.entryPoint = gpu.toWGPUString(vertex_entry);
+            vertex_state.module = descriptor.shader_module;
+            vertex_state.entryPoint = gpu.toWGPUString(ve);
 
             const buffers = try temp.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layout_count);
             for (0..descriptor.vertex_layout_count) |li| {
@@ -760,10 +759,10 @@ pub const PipelineCache = struct {
         // TODO handle constants
 
         // TODO multi target rendering
-        if (shader.metadata.fragment_entry) |fragment_entry| {
+        if (fragment_entry) |fe| {
             var fragment_state = gpu.z_WGPU_FRAGMENT_STATE_INIT();
-            fragment_state.module = shader.module;
-            fragment_state.entryPoint = gpu.toWGPUString(fragment_entry);
+            fragment_state.module = descriptor.shader_module;
+            fragment_state.entryPoint = gpu.toWGPUString(fe);
             fragment_state.targetCount = 1;
 
             var target_state = gpu.z_WGPU_COLOR_TARGET_STATE_INIT();
@@ -831,11 +830,14 @@ pub const PipelineCache = struct {
         const multisample_state = gpu.z_WGPU_MULTISAMPLE_STATE_INIT();
         desc.multisample = multisample_state;
 
-        const pipeline = c.wgpuDeviceCreateRenderPipeline(self.gpu_context.device, &desc);
+        const pipeline = c.wgpuDeviceCreateRenderPipeline(self.device, &desc);
+        if (pipeline == null) {
+            std.log.err("PipelineCache: wgpuDeviceCreateRenderPipeline failed for '{s}'", .{label});
+            return error.PipelineCreationFailed;
+        }
 
         const entry: PipelineEntry = .{
             .pipeline = pipeline,
-            .shader = descriptor.shader,
         };
 
         try self.pipelines.put(allocator, descriptor, entry);
@@ -856,7 +858,7 @@ pub const PipelineCache = struct {
 
 pub const BindGroupLayoutCache = struct {
     bind_group_layouts: BindGroupLayoutMap,
-    shader_manager: *const ShaderManager,
+    device: c.WGPUDevice,
 
     const Self = @This();
 
@@ -902,10 +904,10 @@ pub const BindGroupLayoutCache = struct {
         }
     };
 
-    pub fn init(shader_manager: *const ShaderManager) Self {
+    pub fn init(device: c.WGPUDevice) Self {
         return .{
             .bind_group_layouts = .empty,
-            .shader_manager = shader_manager,
+            .device = device,
         };
     }
 
@@ -957,42 +959,41 @@ pub const BindGroupLayoutCache = struct {
 
         desc.entries = layout_entries.ptr;
 
-        const layout = c.wgpuDeviceCreateBindGroupLayout(self.shader_manager.gpu_context.device, &desc);
+        const layout = c.wgpuDeviceCreateBindGroupLayout(self.device, &desc);
+        if (layout == null) {
+            std.log.err("BindGroupLayoutCache: wgpuDeviceCreateBindGroupLayout failed", .{});
+            return error.BindGroupLayoutCreationFailed;
+        }
         try self.bind_group_layouts.put(allocator, entries, layout);
         return layout;
     }
+
+    pub fn deinit(self: *Self) void {
+        var iter = self.bind_group_layouts.valueIterator();
+        while (iter.next()) |layout| {
+            c.wgpuBindGroupLayoutRelease(layout.*);
+        }
+    }
 };
-
-// ── Bind Group Cache ─────────────────────────────────────────────────────────────────
-
-// TODO: Bind groups should be cached by all resource properties.
-// Bind group layouts should be cached by type and position
 
 pub const BindGroupEntry = struct {
     binding: u32,
     resource: union(enum) {
         buffer: BufferEntry,
-        sampler: SamplerHandle,
-        // We will not have a handle for texture views (rather TextureHandle + descriptor)
-        texture_view: TextureViewHandle,
+        sampler: c.WGPUSampler,
+        texture_view: c.WGPUTextureView,
     },
 
     pub const BufferEntry = struct {
-        handle: BufferHandle,
-        size: ?usize = null,
-        offset: usize = 0,
-    };
-
-    pub const TextureViewEntry = struct {
-        handle: TextureHandle,
-        // TODO populate this
+        buffer: c.WGPUBuffer,
+        size: u64,
+        offset: u64 = 0,
     };
 };
 
 pub const BindGroupCache = struct {
     bind_groups: BindGroupMap,
-    gpu_context: *const gpu.GPUContext,
-    resource_manager: *const ResourceManager,
+    device: c.WGPUDevice,
 
     const Self = @This();
 
@@ -1001,11 +1002,10 @@ pub const BindGroupCache = struct {
         entries: []const BindGroupEntry,
     };
 
-    pub fn init(gpu_context: *const gpu.GPUContext, resource_manager: *const ResourceManager) Self {
+    pub fn init(device: c.WGPUDevice) Self {
         return .{
             .bind_groups = .empty,
-            .gpu_context = gpu_context,
-            .resource_manager = resource_manager,
+            .device = device,
         };
     }
 
@@ -1030,16 +1030,15 @@ pub const BindGroupCache = struct {
             entry.binding = desc_entry.binding;
             switch (desc_entry.resource) {
                 .buffer => |b| {
-                    const buffer = self.resource_manager.getBuffer(b.handle) orelse return error.CouldNotFindBuffer;
+                    entry.buffer = b.buffer;
                     entry.offset = b.offset;
-                    entry.size = b.size orelse buffer.byte_size;
-                    entry.buffer = buffer.ptr;
+                    entry.size = b.size;
                 },
                 .sampler => |s| {
-                    entry.sampler = self.resource_manager.getSampler(s) orelse return error.CouldNotFindSampler;
+                    entry.sampler = s;
                 },
                 .texture_view => |tv| {
-                    entry.textureView = self.resource_manager.getTextureView(tv, .{}) orelse return error.CouldNotFindTextureView;
+                    entry.textureView = tv;
                 },
             }
             entries[i] = entry;
@@ -1047,7 +1046,11 @@ pub const BindGroupCache = struct {
 
         desc.entries = entries.ptr;
 
-        const bind_group = c.wgpuDeviceCreateBindGroup(self.gpu_context.device, &desc);
+        const bind_group = c.wgpuDeviceCreateBindGroup(self.device, &desc);
+        if (bind_group == null) {
+            std.log.err("BindGroupCache: wgpuDeviceCreateBindGroup failed", .{});
+            return error.BindGroupCreationFailed;
+        }
         try self.bind_groups.put(allocator, descriptor, bind_group);
         return bind_group;
     }
@@ -1067,7 +1070,7 @@ pub const BindGroupCache = struct {
                 switch (entry.resource) {
                     .buffer => |buf| {
                         h.update(&[_]u8{0});
-                        h.update(std.mem.asBytes(&buf.handle));
+                        h.update(std.mem.asBytes(&buf.buffer));
                         h.update(std.mem.asBytes(&buf.offset));
                         h.update(std.mem.asBytes(&buf.size));
                     },
@@ -1092,17 +1095,15 @@ pub const BindGroupCache = struct {
                 switch (e1.resource) {
                     .buffer => |b1| {
                         const b2 = e2.resource.buffer;
-                        if (b1.handle != b2.handle) return false;
+                        if (b1.buffer != b2.buffer) return false;
                         if (b1.offset != b2.offset) return false;
                         if (b1.size != b2.size) return false;
                     },
                     .sampler => |s1| {
-                        const s2 = e2.resource.sampler;
-                        if (s1 != s2) return false;
+                        if (s1 != e2.resource.sampler) return false;
                     },
                     .texture_view => |t1| {
-                        const t2 = e2.resource.texture_view;
-                        if (t1 != t2) return false;
+                        if (t1 != e2.resource.texture_view) return false;
                     },
                 }
             }
