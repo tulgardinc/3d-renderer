@@ -255,6 +255,9 @@ pub const ShaderManager = struct {
                                 break :blk &bind_groups[be.group].?;
                             }
                         };
+                        for (bind_groups[be.group].?.items) |tbe| {
+                            if (tbe.binding == be.binding) continue;
+                        }
                         try list_p.append(
                             arena,
                             .{
