@@ -49,7 +49,7 @@ pub fn main() !void {
 
     // Initialize modules
 
-    var resources = try gs.ResourceManager.init(allocator, gpu_context.device, gpu_context.queue);
+    var resources = try gs.AssetManager.init(allocator, gpu_context.device, gpu_context.queue);
     defer resources.deinit(allocator);
 
     var shaders = try gs.ShaderManager.init(allocator, gpu_context.device);
@@ -85,16 +85,19 @@ pub fn main() !void {
         0,    0.5,  0.0, 0.0, 1.0,
     };
 
-    const vb_handle = try resources.createBuffer(
-        allocator,
+    const vertex_buffer = try gpu.createBuffer(
+        gpu_context.device,
+        gpu_context.queue,
         std.mem.sliceAsBytes(&vertices),
         "vertex buffer",
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
     var uniform = [_]f32{0};
-    const uniform_handle = try resources.createBuffer(
-        allocator,
+    const uniform_byte_size = @sizeOf(f32) * 1;
+    const uniform_buffer = try gpu.createBuffer(
+        gpu_context.device,
+        gpu_context.queue,
         std.mem.sliceAsBytes(&uniform),
         "uniform",
         gpu.BufferUsage.uniform | gpu.BufferUsage.copy_dst,
@@ -157,7 +160,8 @@ pub fn main() !void {
         }
 
         uniform[0] = @as(f32, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
-        try resources.updateBuffer(uniform_handle, std.mem.sliceAsBytes(&uniform));
+        const slice = std.mem.sliceAsBytes(&uniform);
+        c.wgpuQueueWriteBuffer(gpu_context.queue, uniform_buffer, 0, slice.ptr, slice.len);
 
         var frame = try gpu.Frame.init(&gpu_context, &surface);
         defer frame.deinit();
@@ -176,17 +180,14 @@ pub fn main() !void {
         );
         defer pass.deinit();
 
-        const vb = resources.getBuffer(vb_handle).?;
-        const ub = resources.getBuffer(uniform_handle).?;
-
         pass.setPipeline(pipeline_entry.pipeline);
-        pass.setVertexBuffer(0, vb.ptr, 0, @sizeOf(f32) * vertices.len);
+        pass.setVertexBuffer(0, vertex_buffer, 0, @sizeOf(f32) * vertices.len);
         try pass.bindGroup(allocator, 0, shader_handle, &.{
             .{
                 .binding = 0,
                 .resource = .{ .buffer = .{
-                    .buffer = ub.ptr,
-                    .size = ub.byte_size,
+                    .buffer = uniform_buffer,
+                    .size = uniform_byte_size,
                 } },
             },
         });

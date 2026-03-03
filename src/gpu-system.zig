@@ -4,7 +4,6 @@ const build_options = @import("build_options");
 const c = gpu.c;
 
 pub const ShaderHandle = enum(u32) { _ };
-pub const BufferHandle = enum(u32) { _ };
 pub const TextureHandle = enum(u32) { _ };
 pub const TextureViewHandle = enum(u32) { _ };
 pub const SamplerHandle = enum(u32) { _ };
@@ -382,10 +381,7 @@ pub const ShaderManager = struct {
     }
 };
 
-pub const ResourceManager = struct {
-    // TODO: add generational indices for use after free tracking
-
-    buffers: std.ArrayList(BufferEntry),
+pub const AssetManager = struct {
     textures: std.ArrayList(c.WGPUTexture),
     samplers: std.ArrayList(c.WGPUSampler),
     device: c.WGPUDevice,
@@ -401,52 +397,11 @@ pub const ResourceManager = struct {
     pub fn init(allocator: std.mem.Allocator, device: c.WGPUDevice, queue: c.WGPUQueue) !Self {
         const INITIAL_CAPACITY = 16;
         return .{
-            .buffers = try .initCapacity(allocator, INITIAL_CAPACITY),
             .textures = try .initCapacity(allocator, INITIAL_CAPACITY),
             .samplers = try .initCapacity(allocator, INITIAL_CAPACITY),
             .device = device,
             .queue = queue,
         };
-    }
-
-    pub fn createBuffer(
-        self: *Self,
-        allocator: std.mem.Allocator,
-        contents: []const u8,
-        label: []const u8,
-        usage: c.WGPUBufferUsage,
-    ) !BufferHandle {
-        var desc = gpu.z_WGPU_BUFFER_DESCRIPTOR_INIT();
-        desc.label = gpu.toWGPUString(label);
-        desc.size = contents.len;
-        desc.usage = @bitCast(usage);
-
-        const buffer = c.wgpuDeviceCreateBuffer(self.device, &desc);
-        if (buffer == null) {
-            std.log.err("ResourceManager: wgpuDeviceCreateBuffer failed for '{s}'", .{label});
-            return error.BufferCreationFailed;
-        }
-        const buffer_entry: BufferEntry = .{
-            .ptr = buffer,
-            .byte_size = contents.len,
-        };
-        try self.buffers.append(allocator, buffer_entry);
-
-        c.wgpuQueueWriteBuffer(self.queue, buffer, 0, contents.ptr, contents.len);
-
-        return @enumFromInt(self.buffers.items.len - 1);
-    }
-
-    pub fn updateBuffer(self: *Self, buffer_handle: BufferHandle, contents: []const u8) !void {
-        const buffer_entry = self.getBuffer(buffer_handle) orelse return error.FailedToFindBuffer;
-        c.wgpuQueueWriteBuffer(self.queue, buffer_entry.ptr, 0, contents.ptr, contents.len);
-    }
-
-    pub fn getBuffer(self: *const Self, handle: BufferHandle) ?BufferEntry {
-        const index = @intFromEnum(handle);
-        if (index >= self.buffers.items.len) return null;
-
-        return self.buffers.items[index];
     }
 
     pub fn getSampler(self: *const Self, handle: SamplerHandle) ?c.WGPUSampler {
@@ -473,10 +428,6 @@ pub const ResourceManager = struct {
     }
 
     pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-        for (self.buffers.items) |item| {
-            c.wgpuBufferRelease(item.ptr);
-        }
-
         for (self.textures.items) |item| {
             c.wgpuTextureRelease(item);
         }
@@ -485,7 +436,6 @@ pub const ResourceManager = struct {
             c.wgpuSamplerRelease(item);
         }
 
-        self.buffers.deinit(allocator);
         self.textures.deinit(allocator);
         self.samplers.deinit(allocator);
     }
@@ -850,8 +800,6 @@ pub const PipelineCache = struct {
         self.pipelines.deinit(allocator);
     }
 };
-
-// ── Bind Group Layout Cache ────────────────────────────────────────────────────────────
 
 pub const BindGroupLayoutCache = struct {
     bind_group_layouts: BindGroupLayoutMap,

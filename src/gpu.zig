@@ -347,6 +347,28 @@ pub const Frame = struct {
     }
 };
 
+pub fn createBuffer(
+    device: c.WGPUDevice,
+    queue: c.WGPUQueue,
+    contents: []const u8,
+    label: []const u8,
+    usage: c.WGPUBufferUsage,
+) !c.WGPUBuffer {
+    var desc = z_WGPU_BUFFER_DESCRIPTOR_INIT();
+    desc.label = toWGPUString(label);
+    desc.size = contents.len;
+    desc.usage = @bitCast(usage);
+
+    const buffer = c.wgpuDeviceCreateBuffer(device, &desc);
+    if (buffer == null) {
+        std.log.err("ResourceManager: wgpuDeviceCreateBuffer failed for '{s}'", .{label});
+        return error.BufferCreationFailed;
+    }
+
+    c.wgpuQueueWriteBuffer(queue, buffer, 0, contents.ptr, contents.len);
+    return buffer;
+}
+
 // ── Enums (type-safe Zig mirrors of C integer constants) ─────────────────────
 
 pub const PresentMode = enum(c.WGPUPresentMode) {
