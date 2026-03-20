@@ -160,6 +160,7 @@ pub const BlendState = struct {
 
 const MAX_VERTEX_LAYOUT_COUNT = 8;
 
+// TODO handle multi pass shaders
 pub const ShaderManager = struct {
     shaders: std.ArrayList(Shader),
     device: c.WGPUDevice,
@@ -441,7 +442,7 @@ pub const AssetManager = struct {
     }
 };
 
-pub const VertexLayout = struct {
+pub const VertexBufferLayout = struct {
     step_mode: StepMode,
     array_stride: u64,
     attributes: []const VertexAttribute,
@@ -465,7 +466,7 @@ pub const PipelineDescriptor = struct {
     color_format: ?gpu.TextureFormat = null,
     depth_format: ?gpu.TextureFormat = null,
     shader_module: c.WGPUShaderModule,
-    vertex_layouts: []const VertexLayout = &.{},
+    vertex_layouts: []const VertexBufferLayout = &.{},
     primitive_topology: gpu.PrimitiveTopology = .triangle_list,
     depth_stencil: ?DepthStencilState = .{
         .depth_write_enabled = true,
@@ -1062,5 +1063,111 @@ pub const BindGroupCache = struct {
             c.wgpuBindGroupRelease(bg.*);
         }
         self.bind_groups.deinit(allocator);
+    }
+};
+
+pub const VertexBuffer = struct {
+    buffer: c.WGPUBuffer,
+    array_stride: u64,
+    attributes: []const AttributeInfo,
+
+    const Self = @This();
+
+    pub const AttributeInfo = struct {
+        format: gpu.VertexFormat,
+        attribute_type: AttributeType,
+        offset: u64,
+    };
+
+    pub const AttributeType = enum {
+        POSITION,
+        UV,
+        COLOR,
+    };
+};
+
+pub const Mesh = struct {
+    vertex_buffers: []const VertexBuffer,
+    index_buffer: ?c.WGPUBuffer = null,
+
+    pub fn initOwning(vertex_buffers: []const VertexBuffer, index_buffer: ?c.WGPUBuffer) @This() {
+        return .{
+            .vertex_buffers = vertex_buffers,
+            .index_buffer = index_buffer,
+        };
+    }
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.vertex_buffers) |vb| {
+            c.wgpuBufferRelease(vb.buffer);
+            allocator.free(vb.attributes);
+        }
+        allocator.free(self.vertex_buffers);
+        c.wgpuBufferRelease(self.index_buffer);
+    }
+};
+
+pub const MeshManager = struct {
+    device: c.WGPUDevice,
+    queue: c.WGPUQueue,
+    mesh_map: std.StringHashMapUnmanaged(Mesh),
+
+    const Self = @This();
+
+    pub fn init(device: c.WGPUDevice, queue: c.WGPUQueue) Self() {
+        return .{
+            .device = device,
+            .queue = queue,
+            .mesh_map = .empty(),
+        };
+    }
+
+    const PRIMITIVE_SQUARE_KEY = "primitive:square";
+
+    pub fn getOrCreateSquare(self: *Self, allocator: std.mem.Allocator) !Mesh {
+        if (self.mesh_map.get(PRIMITIVE_SQUARE_KEY)) |square| {
+            return square;
+        }
+
+        const vertices = [_]f32{
+            -0.5, 0.5,
+            -0.5, -0.5,
+            0.5,  -0.5,
+            0.5,  0.5,
+        };
+        const vb = try gpu.createBuffer(
+            self.device,
+            self.queue,
+            std.mem.sliceAsBytes(&vertices),
+            "cube vertices",
+            gpu.BufferUsage.copy_dst | gpu.BufferUsage.vertex,
+        );
+        const indices = [_]u32{
+            0, 1, 2,
+            2, 3, 0,
+        };
+        const ib = try gpu.createBuffer(
+            self.device,
+            self.queue,
+            std.mem.sliceAsBytes(&indices),
+            "cube indices",
+            gpu.BufferUsage.copy_dst | gpu.BufferUsage.index,
+        );
+
+        var vertex_buffers = try allocator.alloc(VertexBuffer, 1);
+        vertex_buffers[0].buffer = vb;
+        vertex_buffers[0].info = .{
+            .array_stride = 0,
+            .attibute_info = .{
+                .format = .f32x2,
+                .offset = @sizeOf(f32) * 2,
+                .attribute_type = .POSITION,
+            },
+        };
+
+        const square = Mesh.initOwning(vertex_buffers, ib);
+
+        try self.mesh_map.put(allocator, PRIMITIVE_SQUARE_KEY, square);
+        return square;
     }
 };

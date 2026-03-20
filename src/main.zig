@@ -3,6 +3,7 @@ const gpu = @import("gpu.zig");
 const gs = @import("gpu-system.zig");
 const build_options = @import("build_options");
 const c = gpu.c;
+const Renderer = @import("renderer.zig");
 
 pub fn main() !void {
     // get allocator
@@ -35,31 +36,8 @@ pub fn main() !void {
     _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
 
     var instance = try gpu.GPUInstance.init();
-    defer instance.deinit();
-
-    const surface_raw = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
-
-    var gpu_context = try gpu.GPUContext.initSync(instance.webgpu_instance, surface_raw);
-    defer gpu_context.deinit();
-
-    var surface = gpu.Surface.init(surface_raw, gpu_context.adapter);
-    defer surface.deinit();
-
-    surface.configure(gpu_context.device, @intCast(width), @intCast(height));
-
-    // Initialize modules
-
-    var resources = try gs.AssetManager.init(allocator, gpu_context.device, gpu_context.queue);
-    defer resources.deinit(allocator);
-
-    var shaders = try gs.ShaderManager.init(allocator, gpu_context.device);
-    defer shaders.deinit(allocator);
-
-    var bind_group_layout_cache = gs.BindGroupLayoutCache.init(gpu_context.device);
-    defer bind_group_layout_cache.deinit();
-
-    var bind_group_cache = gs.BindGroupCache.init(gpu_context.device);
-    defer bind_group_cache.deinit(allocator);
+    const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
+    const renderer = Renderer.initOwning(allocator, instance, surface);
 
     var pipelines = gs.PipelineCache.init(
         gpu_context.device,

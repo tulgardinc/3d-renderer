@@ -369,8 +369,6 @@ pub fn createBuffer(
     return buffer;
 }
 
-// ── Enums (type-safe Zig mirrors of C integer constants) ─────────────────────
-
 pub const PresentMode = enum(c.WGPUPresentMode) {
     undefined = c.WGPUPresentMode_Undefined,
     fifo = c.WGPUPresentMode_Fifo,
@@ -616,6 +614,18 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
                 .vec3 => .i32x3,
                 .vec4 => .i32x4,
             },
+        };
+    }
+
+    pub fn byteSize(self: @This()) u64 {
+        return switch (self) {
+            .undefined => 0,
+            .u8, .i8, .unorm8, .snorm8 => 1,
+            .u8x2, .i8x2, .unorm8x2, .snorm8x2, .u16, .i16, .unorm16, .snorm16, .f16 => 2,
+            .u8x4, .i8x4, .unorm8x4, .snorm8x4, .u16x2, .i16x2, .unorm16x2, .snorm16x2, .f16x2, .u32, .i32, .f32, .unorm10_10_10_2, .unorm8x4bgra => 4,
+            .u16x4, .i16x4, .unorm16x4, .snorm16x4, .f16x4, .f32x2, .u32x2, .i32x2 => 8,
+            .f32x3, .u32x3, .i32x3 => 12,
+            .f32x4, .u32x4, .i32x4 => 16,
         };
     }
 };
