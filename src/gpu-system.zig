@@ -8,6 +8,7 @@ pub const TextureHandle = enum(u32) { _ };
 pub const TextureViewHandle = enum(u32) { _ };
 pub const SamplerHandle = enum(u32) { _ };
 pub const BindGroupHandle = enum(u32) { _ };
+pub const MeshHandle = enum(u32) { _ };
 
 pub const MAX_BIND_GROUP_COUNT = 4;
 
@@ -213,7 +214,7 @@ pub const ShaderManager = struct {
             return map.get(resource_type) orelse error.BindingTypeNotImplemented;
         }
 
-        pub fn fromShadeSource(allocator: std.mem.Allocator, source_path: []const u8) !@This() {
+        pub fn fromShaderSource(allocator: std.mem.Allocator, source_path: []const u8) !@This() {
             var arena_allocator = std.heap.ArenaAllocator.init(allocator);
             errdefer arena_allocator.deinit();
             const arena = arena_allocator.allocator();
@@ -348,7 +349,7 @@ pub const ShaderManager = struct {
 
         desc.nextInChain = &source.chain;
 
-        const metadata = try Metadata.fromShadeSource(allocator, source_path);
+        const metadata = try Metadata.fromShaderSource(allocator, source_path);
 
         const module = c.wgpuDeviceCreateShaderModule(self.device, &desc);
         if (module == null) {
@@ -1084,90 +1085,4 @@ pub const VertexBuffer = struct {
         UV,
         COLOR,
     };
-};
-
-pub const Mesh = struct {
-    vertex_buffers: []const VertexBuffer,
-    index_buffer: ?c.WGPUBuffer = null,
-
-    pub fn initOwning(vertex_buffers: []const VertexBuffer, index_buffer: ?c.WGPUBuffer) @This() {
-        return .{
-            .vertex_buffers = vertex_buffers,
-            .index_buffer = index_buffer,
-        };
-    }
-
-    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        for (self.vertex_buffers) |vb| {
-            c.wgpuBufferRelease(vb.buffer);
-            allocator.free(vb.attributes);
-        }
-        allocator.free(self.vertex_buffers);
-        c.wgpuBufferRelease(self.index_buffer);
-    }
-};
-
-pub const MeshManager = struct {
-    device: c.WGPUDevice,
-    queue: c.WGPUQueue,
-    mesh_map: std.StringHashMapUnmanaged(Mesh),
-
-    const Self = @This();
-
-    pub fn init(device: c.WGPUDevice, queue: c.WGPUQueue) Self() {
-        return .{
-            .device = device,
-            .queue = queue,
-            .mesh_map = .empty(),
-        };
-    }
-
-    const PRIMITIVE_SQUARE_KEY = "primitive:square";
-
-    pub fn getOrCreateSquare(self: *Self, allocator: std.mem.Allocator) !Mesh {
-        if (self.mesh_map.get(PRIMITIVE_SQUARE_KEY)) |square| {
-            return square;
-        }
-
-        const vertices = [_]f32{
-            -0.5, 0.5,
-            -0.5, -0.5,
-            0.5,  -0.5,
-            0.5,  0.5,
-        };
-        const vb = try gpu.createBuffer(
-            self.device,
-            self.queue,
-            std.mem.sliceAsBytes(&vertices),
-            "cube vertices",
-            gpu.BufferUsage.copy_dst | gpu.BufferUsage.vertex,
-        );
-        const indices = [_]u32{
-            0, 1, 2,
-            2, 3, 0,
-        };
-        const ib = try gpu.createBuffer(
-            self.device,
-            self.queue,
-            std.mem.sliceAsBytes(&indices),
-            "cube indices",
-            gpu.BufferUsage.copy_dst | gpu.BufferUsage.index,
-        );
-
-        var vertex_buffers = try allocator.alloc(VertexBuffer, 1);
-        vertex_buffers[0].buffer = vb;
-        vertex_buffers[0].info = .{
-            .array_stride = 0,
-            .attibute_info = .{
-                .format = .f32x2,
-                .offset = @sizeOf(f32) * 2,
-                .attribute_type = .POSITION,
-            },
-        };
-
-        const square = Mesh.initOwning(vertex_buffers, ib);
-
-        try self.mesh_map.put(allocator, PRIMITIVE_SQUARE_KEY, square);
-        return square;
-    }
 };
