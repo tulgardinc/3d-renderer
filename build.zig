@@ -10,6 +10,43 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "tint_path", tint_path);
     options.addOption([]const u8, "shaders_dir", shaders_dir);
 
+    const tree_sitter = b.addLibrary(.{
+        .name = "tree_sitter",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    tree_sitter.addCSourceFiles(.{
+        .files = &.{
+            "third_party/tree-sitter/lib/src/lib.c",
+            "third_party/tree-sitter-wgsl/parser.c",
+            "third_party/tree-sitter-wgsl/scanner.c",
+        },
+    });
+    tree_sitter.addIncludePath(b.path("third_party/tree-sitter/lib/src"));
+    tree_sitter.addIncludePath(b.path("third_party/tree-sitter/lib/include"));
+    tree_sitter.addIncludePath(b.path("include/"));
+    tree_sitter.linkLibC();
+
+    const shader_tool = b.addExecutable(.{
+        .name = "shader_tool",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shader-tool.zig"),
+
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    shader_tool.linkLibrary(tree_sitter);
+    shader_tool.linkLibC();
+    shader_tool.addIncludePath(b.path("third_party/tree-sitter/lib/include"));
+
+    b.installArtifact(shader_tool);
+
     const exe = b.addExecutable(.{
         .name = "renderer",
         .root_module = b.createModule(.{
@@ -44,6 +81,15 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("c++");
 
     b.installArtifact(exe);
+
+    const run_tool_step = b.step("tool", "Run the shader tool");
+
+    const run_tool_cmd = b.addRunArtifact(shader_tool);
+    run_tool_step.dependOn(&run_tool_cmd.step);
+
+    if (b.args) |args| {
+        run_tool_cmd.addArgs(args);
+    }
 
     const install_fw = b.addInstallDirectory(.{
         .source_dir = b.path("lib/sdl3/SDL3.framework/"),
