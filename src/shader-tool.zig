@@ -5,9 +5,25 @@ const c = @cImport({
 
 extern fn tree_sitter_wgsl() *const c.TSLanguage;
 
-const entry_query =
+const vs_query_string =
     \\(function_decl 
-    \\  (attribute [(vertex_attr)(fragment_attr)]) 
+    \\  (attribute (vertex_attr)) 
+    \\  (function_header 
+    \\    (ident (ident_pattern_token) @fn_name)
+    \\    (param_list (param (ident (ident_pattern_token) @par_name) (type_specifier) @type_name))))
+;
+
+const fs_entry_query =
+    \\(function_decl 
+    \\  (attribute (fragment_attr)) 
+    \\  (function_header 
+    \\    (ident (ident_pattern_token) @fn_name)
+    \\    (param_list (param (ident (ident_pattern_token) @par_name) (type_specifier) @type_name))))
+;
+
+const cp_entry_query =
+    \\(function_decl 
+    \\  (attribute (compute_attr)) 
     \\  (function_header 
     \\    (ident (ident_pattern_token) @fn_name)
     \\    (param_list (param (ident (ident_pattern_token) @par_name) (type_specifier) @type_name))))
@@ -100,6 +116,173 @@ const ShaderEntry = struct {
     parameters: []const EntryParameter,
 };
 
+fn nodeText(src: []const u8, node: c.TSNode) []const u8 {
+    const start = c.ts_node_start_byte(node);
+    const end = c.ts_node_end_byte(node);
+    return src[start..end];
+}
+
+fn findChild(node: c.TSNode, node_type: []const u8) ?c.TSNode {
+    const count = c.ts_node_child_count(node);
+    for (0..count) |i| {
+        const child = c.ts_node_child(node, @intCast(i));
+        if (std.mem.eql(u8, std.mem.span(c.ts_node_type(child)), node_type))
+            return child;
+    }
+    return null;
+}
+
+fn parseWGSLType(src: []const u8, type_node: c.TSNode) ?WGSLTypes {
+    const elab = findChild(type_node, "template_elaborated_ident") orelse return null;
+    const ident_node = findChild(elab, "ident") orelse return null;
+    const token = findChild(ident_node, "ident_pattern_token") orelse return null;
+    const base_name = nodeText(src, token);
+
+    // Try scalar
+    if (std.meta.stringToEnum(WGSLScalar, base_name)) |scalar| {
+        return .{ .scalar = scalar };
+    }
+
+    // vec
+    if (base_name.len >= 4 and std.mem.startsWith(u8, base_name, "vec") and
+        base_name[3] >= '2' and base_name[3] <= '4')
+    {
+        const size: u32 = base_name[3] - '0';
+
+        // generic
+        if (findChild(elab, "template_list")) |tmpl| {
+            const inner = findDescendant(tmpl, "ident_pattern_token") orelse return null;
+            const scalar = std.meta.stringToEnum(WGSLScalar, nodeText(src, inner)) orelse return null;
+            return .{ .vec = .{ .size = size, .scalar = scalar } };
+        }
+
+        // alias
+        if (base_name.len == 5) {
+            const scalar: WGSLScalar = switch (base_name[4]) {
+                'f' => .f32,
+                'h' => .f16,
+                'i' => .i32,
+                'u' => .u32,
+                else => return null,
+            };
+            return .{ .vec = .{ .size = size, .scalar = scalar } };
+        }
+
+        return null;
+    }
+
+    // mat
+    if (base_name.len >= 4 and std.mem.startsWith(u8, base_name, "mat") and
+        base_name[3] >= '2' and
+        base_name[3] <= '4' and
+        base_name[4] == 'x' and
+        base_name[5] >= '2' and
+        base_name[5] <= '4')
+    {
+        // generic
+        const rows = base_name[3] - '0';
+        const cols = base_name[5] - '0';
+
+        if (findChild((elab), "template_list")) |tmpl| {
+            const inner = findDescendant(tmpl, "ident_pattern_token") orelse return null;
+            const scalar = std.meta.stringToEnum(WGSLScalar, nodeText(src, inner)) orelse return null;
+            return .{ .mat = .{ .rows = rows, .cols = cols, .scalar = scalar } };
+        }
+
+        // alias
+        if (base_name.len == 7) {
+            const scalar: WGSLScalar = switch (base_name[6]) {
+                'f' => .f32,
+                'h' => .f16,
+                'i' => .i32,
+                'u' => .u32,
+                else => return null,
+            };
+            return .{ .mat = .{ .rows = rows, .cols = cols, .scalar = scalar } };
+        }
+
+        return null;
+    }
+
+    // Unknown type — treat as struct ref
+    return .{ .struct_ref = base_name };
+}
+
+pub fn captureNameFromId(query: ?*c.TSQuery, index: u32) []const u8 {
+    var length: u32 = 0;
+    const name_ptr = c.ts_query_capture_name_for_id(query, index, &length);
+    return name_ptr[0..length];
+}
+
+pub fn findDescendant(node: c.TSNode, node_type: []const u8) ?c.TSNode {
+    const count = c.ts_node_child_count(node);
+    for (0..count) |i| {
+        const child = c.ts_node_child(node, @intCast(i));
+        if (std.mem.eql(u8, std.mem.span(c.ts_node_type(child)), node_type))
+            return child;
+        if (findDescendant(child, node_type)) |found| return found;
+    }
+    return null;
+}
+
+pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) !void {
+    var error_offset: u32 = 0;
+    var error_type = c.TSQueryErrorNone;
+
+    inline for (std.meta.fields(EntryTypes)) |enum_field| {
+        const entry_type: EntryTypes = @enumFromInt(enum_field.value);
+        const query_string = comptime switch (entry_type) {
+            .vertex => vs_query_string,
+            .fragment => fs_entry_query,
+            .compute => cp_entry_query,
+        };
+
+        const query = c.ts_query_new(
+            tree_sitter_wgsl(),
+            query_string,
+            query_string.len,
+            &error_offset,
+            @ptrCast(&error_type),
+        );
+        defer c.ts_query_delete(query);
+
+        if (query == null) {
+            std.debug.print("error at: {s}\n", .{query_string[error_offset..]});
+            return error.BadVertexQuery;
+        }
+
+        c.ts_query_cursor_exec(cursor, query, root);
+
+        var match: c.TSQueryMatch = undefined;
+        var capture_index: u32 = 0;
+
+        var shader_entry: ShaderEntry = undefined;
+        shader_entry.type = entry_type;
+
+        var parameters: std.ArrayList(EntryParameter) = .empty;
+
+        while (c.ts_query_cursor_next_capture(cursor, &match, &capture_index)) {
+            const cap = match.captures[capture_index];
+            const start = c.ts_node_start_byte(cap.node);
+            const end = c.ts_node_end_byte(cap.node);
+            const name = captureNameFromId(query, capture_index);
+            if (std.mem.eql(u8, name, "fn_name")) {
+                shader_entry.name = src[start..end];
+            } else if (std.mem.eql(u8, name, "par_name")) {
+                try parameters.append(arena, .{ .name = src[start..end] });
+            } else if (std.mem.eql(u8, name, "type_name")) {
+                if (parseWGSLType(src, cap.node)) |wgsl_type| {
+                    parameters.items[parameters.items.len - 1].type = wgsl_type;
+                } else {
+                    std.debug.print("unknown type: {s}\n", .{src[start..end]});
+                }
+            }
+        }
+
+        shader_entry.parameters = parameters;
+    }
+}
+
 pub fn main() !void {
     const parser = c.ts_parser_new();
     _ = c.ts_parser_set_language(parser, tree_sitter_wgsl());
@@ -112,35 +295,10 @@ pub fn main() !void {
     // const str = c.ts_node_string(root);
     // std.debug.print("{s}\n", .{str});
 
-    var error_offset: u32 = 0;
-    var error_type = c.TSQueryErrorNone;
-
-    const query = c.ts_query_new(
-        tree_sitter_wgsl(),
-        entry_query,
-        entry_query.len,
-        &error_offset,
-        @ptrCast(&error_type),
-    );
-
-    if (query == null) {
-        std.debug.print("error at: {s}\n", .{entry_query[error_offset..]});
-        return error.Error;
-    }
-
     const cursor = c.ts_query_cursor_new();
+    defer c.ts_query_cursor_delete(cursor);
 
-    c.ts_query_cursor_exec(cursor, query, root);
-
-    var match: c.TSQueryMatch = undefined;
-    while (c.ts_query_cursor_next_match(cursor, &match)) {
-        const captures = match.captures[0..match.capture_count];
-        for (captures) |cap| {
-            const start = c.ts_node_start_byte(cap.node);
-            const end = c.ts_node_end_byte(cap.node);
-            std.debug.print("{}: {s}\n", .{ match.id, src[start..end] });
-        }
-    }
+    try getEntryFunctions(src, root, cursor);
 }
 
 // (translation_unit (struct_decl (ident (ident_pattern_token)) (struct_body_decl (struct_member (attribute (loc
