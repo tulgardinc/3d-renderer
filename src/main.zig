@@ -35,9 +35,10 @@ pub fn main() !void {
     var height: i32 = 0;
     _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
 
-    var instance = try gpu.GPUInstance.init();
-    const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
-    const renderer = Renderer.initOwning(allocator, instance, surface);
+    // var instance = try gpu.GPUInstance.init();
+    // const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
+
+    const renderer = Renderer.initOwning(allocator, window);
 
     var pipelines = gs.PipelineCache.init(
         gpu_context.device,
