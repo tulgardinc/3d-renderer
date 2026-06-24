@@ -10,7 +10,7 @@ const vs_query_string =
     \\  (attribute (vertex_attr)) 
     \\  (function_header 
     \\    (ident (ident_pattern_token) @fn_name)
-    \\    (param_list (param (ident (ident_pattern_token) @par_name) (type_specifier) @type_name))))
+    \\    (param_list) @params))
 ;
 
 const fs_entry_query =
@@ -18,7 +18,7 @@ const fs_entry_query =
     \\  (attribute (fragment_attr)) 
     \\  (function_header 
     \\    (ident (ident_pattern_token) @fn_name)
-    \\    (param_list (param (ident (ident_pattern_token) @par_name) (type_specifier) @type_name))))
+    \\    (param_list) @params))
 ;
 
 const cp_entry_query =
@@ -26,11 +26,8 @@ const cp_entry_query =
     \\  (attribute (compute_attr)) 
     \\  (function_header 
     \\    (ident (ident_pattern_token) @fn_name)
-    \\    (param_list (param (ident (ident_pattern_token) @par_name) (type_specifier) @type_name))))
+    \\    (param_list) @params))
 ;
-
-// \\    (param_list (param (ident (ident_pattern_token)) (type_specifier (template_elaborated_ident (ident (ident_pattern_token))))))
-// \\    (template_elaborated_ident (ident (ident_pattern_token))))
 
 const EntryTypes = enum {
     vertex,
@@ -225,9 +222,11 @@ pub fn findDescendant(node: c.TSNode, node_type: []const u8) ?c.TSNode {
     return null;
 }
 
-pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) !void {
+pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) !std.ArrayList(ShaderEntry) {
     var error_offset: u32 = 0;
     var error_type = c.TSQueryErrorNone;
+
+    var entry_functions: std.ArrayList(ShaderEntry) = .{};
 
     inline for (std.meta.fields(EntryTypes)) |enum_field| {
         const entry_type: EntryTypes = @enumFromInt(enum_field.value);
@@ -248,42 +247,51 @@ pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNo
 
         if (query == null) {
             std.debug.print("error at: {s}\n", .{query_string[error_offset..]});
-            return error.BadVertexQuery;
+            return error.BadQuery;
         }
 
         c.ts_query_cursor_exec(cursor, query, root);
 
         var match: c.TSQueryMatch = undefined;
-        var capture_index: u32 = 0;
 
         var shader_entry: ShaderEntry = undefined;
         shader_entry.type = entry_type;
 
-        var parameters: std.ArrayList(EntryParameter) = .empty;
+        while (c.ts_query_cursor_next_match(cursor, &match)) {
+            var name: ?[]const u8 = null;
+            var params: std.ArrayList(EntryParameter) = .empty;
 
-        while (c.ts_query_cursor_next_capture(cursor, &match, &capture_index)) {
-            const cap = match.captures[capture_index];
-            const start = c.ts_node_start_byte(cap.node);
-            const end = c.ts_node_end_byte(cap.node);
-            const name = captureNameFromId(query, capture_index);
-            if (std.mem.eql(u8, name, "fn_name")) {
-                shader_entry.name = src[start..end];
-            } else if (std.mem.eql(u8, name, "par_name")) {
-                try parameters.append(arena, .{ .name = src[start..end] });
-            } else if (std.mem.eql(u8, name, "type_name")) {
-                if (parseWGSLType(src, cap.node)) |wgsl_type| {
-                    parameters.items[parameters.items.len - 1].type = wgsl_type;
-                } else {
-                    std.debug.print("unknown type: {s}\n", .{src[start..end]});
+            for (match.captures[0..match.capture_count]) |cap| {
+                const cap_name = captureNameFromId(query, cap.index);
+                if (std.mem.eql(u8, cap_name, "fn_name")) {
+                    name = nodeText(src, cap.node);
+                } else if (std.mem.eql(u8, cap_name, "params")) {
+                    const count = c.ts_node_named_child_count(cap.node);
+                    for (0..count) |i| {
+                        const param = c.ts_node_named_child(cap.node, @intCast(i));
+                        const ident = findChild(param, "ident") orelse continue;
+                        const token = findChild(ident, "ident_pattern_token") orelse continue;
+                        const type_sp = findChild(param, "type_specifier") orelse continue;
+                        const ty = parseWGSLType(src, type_sp) orelse continue;
+                        try params.append(arena, .{ .name = nodeText(src, token), .type = ty });
+                    }
                 }
             }
-        }
 
-        shader_entry.parameters = parameters;
+            if (name) |n| {
+                try entry_functions.append(arena, .{ .name = n, .parameters = params.items, .type = entry_type });
+            }
+        }
     }
+
+    return entry_functions;
 }
 
 pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     const parser = c.ts_parser_new();
     _ = c.ts_parser_set_language(parser, tree_sitter_wgsl());
     // const src = @embedFile("./shaders/2DVertexColors.wgsl");
@@ -298,100 +306,8 @@ pub fn main() !void {
     const cursor = c.ts_query_cursor_new();
     defer c.ts_query_cursor_delete(cursor);
 
-    try getEntryFunctions(src, root, cursor);
+    const entries = try getEntryFunctions(allocator, src, root, cursor);
+    for (entries.items) |e| {
+        std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
+    }
 }
-
-// (translation_unit (struct_decl (ident (ident_pattern_token)) (struct_body_decl (struct_member (attribute (loc
-// ation_attr (expression (relational_expression (shift_expression (additive_expression (multiplicative_expressi
-// on (unary_expression (singular_expression (primary_expression (literal (int_literal (decimal_int_literal)))))
-// )))))))) (member_ident (ident_pattern_token)) (type_specifier (template_elaborated_ident (ident (ident_patter
-// n_token)) (template_list (template_arg_comma_list (template_arg_expression (expression (relational_expression
-//  (shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_expression (pr
-// imary_expression (template_elaborated_ident (ident (ident_pattern_token))))))))))))))))) (struct_member (attr
-// ibute (location_attr (expression (relational_expression (shift_expression (additive_expression (multiplicativ
-// e_expression (unary_expression (singular_expression (primary_expression (literal (int_literal (decimal_int_li
-// teral))))))))))))) (member_ident (ident_pattern_token)) (type_specifier (template_elaborated_ident (ident (id
-// ent_pattern_token)) (template_list (template_arg_comma_list (template_arg_expression (expression (relational_
-// expression (shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_expr
-// ession (primary_expression (template_elaborated_ident (ident (ident_pattern_token))))))))))))))))))) (struct_
-// decl (ident (ident_pattern_token)) (struct_body_decl (struct_member (attribute (builtin_attr (builtin_value_n
-// ame (ident_pattern_token)))) (member_ident (ident_pattern_token)) (type_specifier (template_elaborated_ident
-// (ident (ident_pattern_token)) (template_list (template_arg_comma_list (template_arg_expression (expression (r
-// elational_expression (shift_expression (additive_expression (multiplicative_expression (unary_expression (sin
-// gular_expression (primary_expression (template_elaborated_ident (ident (ident_pattern_token)))))))))))))))))
-// (struct_member (attribute (location_attr (expression (relational_expression (shift_expression (additive_expre
-// ssion (multiplicative_expression (unary_expression (singular_expression (primary_expression (literal (int_lit
-// eral (decimal_int_literal))))))))))))) (member_ident (ident_pattern_token)) (type_specifier (template_elabora
-// ted_ident (ident (ident_pattern_token)) (template_list (template_arg_comma_list (template_arg_expression (exp
-// ression (relational_expression (shift_expression (additive_expression (multiplicative_expression (unary_expre
-// ssion (singular_expression (primary_expression (template_elaborated_ident (ident (ident_pattern_token))))))))
-// ))))))))))) (struct_decl (ident (ident_pattern_token)) (struct_body_decl (struct_member (member_ident (ident_
-// pattern_token)) (type_specifier (template_elaborated_ident (ident (ident_pattern_token)))))))
-// (global_variabl
-// e_decl (attribute (group_attr (expression (relational_expression (shift_expression (additive_expression (mult
-// iplicative_expression (unary_expression (singular_expression (primary_expression (literal (int_literal (decim
-// al_int_literal))))))))))))) (attribute (binding_attr (expression (relational_expression (shift_expression (ad
-// ditive_expression (multiplicative_expression (unary_expression (singular_expression (primary_expression (lite
-// ral (int_literal (decimal_int_literal))))))))))))) (variable_decl (template_list (template_arg_comma_list (te
-// mplate_arg_expression (expression (relational_expression (shift_expression (additive_expression (multiplicati
-// ve_expression (unary_expression (singular_expression (primary_expression (template_elaborated_ident (ident (i
-// dent_pattern_token)))))))))))))) (optionally_typed_ident (ident (ident_pattern_token)) (type_specifier (templ
-// ate_elaborated_ident (ident (ident_pattern_token)))))))
-// (function_decl (attribute (vertex_attr)) (function_header (ident (ident_pattern_token)) (param_list (param (ident (ident_pattern_token)) (type_specifier (template
-// _elaborated_ident (ident (ident_pattern_token)))))) (template_elaborated_ident (ident (ident_pattern_token)))
-// )
-// (compound_statement (statement (variable_or_value_statement (variable_decl (optionally_typed_ident (ident (
-// ident_pattern_token)) (type_specifier (template_elaborated_ident (ident (ident_pattern_token)))))))) (stateme
-// nt (variable_updating_statement (assignment_statement (lhs_expression (core_lhs_expression (ident (ident_patt
-// ern_token))) (component_or_swizzle_specifier (member_ident (ident_pattern_token)))) (expression (relational_e
-// xpression (shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_expre
-// ssion (primary_expression (call_expression (call_phrase (template_elaborated_ident (ident (ident_pattern_toke
-// n)) (template_list (template_arg_comma_list (template_arg_expression (expression (relational_expression (shif
-// t_expression (additive_expression (multiplicative_expression (unary_expression (singular_expression (primary_
-// expression (template_elaborated_ident (ident (ident_pattern_token))))))))))))))) (argument_expression_list (e
-// xpression_comma_list (expression (relational_expression (shift_expression (additive_expression (multiplicativ
-// e_expression (unary_expression (singular_expression (primary_expression (template_elaborated_ident (ident (id
-// ent_pattern_token)))) (component_or_swizzle_specifier (member_ident (ident_pattern_token)))))))))) (expressio
-// n (relational_expression (shift_expression (additive_expression (multiplicative_expression (unary_expression
-// (singular_expression (primary_expression (literal (float_literal (decimal_float_literal))))))))))) (expressio
-// n (relational_expression (shift_expression (additive_expression (multiplicative_expression (unary_expression
-// (singular_expression (primary_expression (literal (float_literal (decimal_float_literal))))))))))))))))))))))
-// )))) (statement (variable_updating_statement (assignment_statement (lhs_expression (core_lhs_expression (iden
-// t (ident_pattern_token))) (component_or_swizzle_specifier (member_ident (ident_pattern_token)))) (expression
-// (relational_expression (shift_expression (additive_expression (multiplicative_expression (unary_expression (s
-// ingular_expression (primary_expression (template_elaborated_ident (ident (ident_pattern_token)))) (component_
-// or_swizzle_specifier (member_ident (ident_pattern_token))))))))))))) (statement (return_statement (expression
-//  (relational_expression (shift_expression (additive_expression (multiplicative_expression (unary_expression (
-// singular_expression (primary_expression (template_elaborated_ident (ident (ident_pattern_token)))))))))))))))
-//  (function_decl (attribute (fragment_attr)) (function_header (ident (ident_pattern_token)) (param_list (param
-//  (ident (ident_pattern_token)) (type_specifier (template_elaborated_ident (ident (ident_pattern_token)))))) (
-// attribute (location_attr (expression (relational_expression (shift_expression (additive_expression (multiplic
-// ative_expression (unary_expression (singular_expression (primary_expression (literal (int_literal (decimal_in
-// t_literal))))))))))))) (template_elaborated_ident (ident (ident_pattern_token)) (template_list (template_arg_
-// comma_list (template_arg_expression (expression (relational_expression (shift_expression (additive_expression
-//  (multiplicative_expression (unary_expression (singular_expression (primary_expression (template_elaborated_i
-// dent (ident (ident_pattern_token)))))))))))))))) (compound_statement (statement (variable_or_value_statement
-// (optionally_typed_ident (ident (ident_pattern_token))) (expression (relational_expression (shift_expression (
-// additive_expression (multiplicative_expression (multiplicative_expression (unary_expression (singular_express
-// ion (primary_expression (paren_expression (expression (relational_expression (shift_expression (additive_expr
-// ession (additive_expression (multiplicative_expression (unary_expression (singular_expression (primary_expres
-// sion (call_expression (call_phrase (template_elaborated_ident (ident (ident_pattern_token))) (argument_expres
-// sion_list (expression_comma_list (expression (relational_expression (shift_expression (additive_expression (m
-// ultiplicative_expression (unary_expression (singular_expression (primary_expression (template_elaborated_iden
-// t (ident (ident_pattern_token)))) (component_or_swizzle_specifier (member_ident (ident_pattern_token)))))))))
-// )))))))))) (additive_operator) (multiplicative_expression (unary_expression (singular_expression (primary_exp
-// ression (literal (float_literal (decimal_float_literal)))))))))))))))) (multiplicative_operator) (unary_expre
-// ssion (singular_expression (primary_expression (literal (float_literal (decimal_float_literal))))))))))))) (s
-// tatement (return_statement (expression (relational_expression (shift_expression (additive_expression (multipl
-// icative_expression (unary_expression (singular_expression (primary_expression (call_expression (call_phrase (
-// template_elaborated_ident (ident (ident_pattern_token)) (template_list (template_arg_comma_list (template_arg
-// _expression (expression (relational_expression (shift_expression (additive_expression (multiplicative_express
-// ion (unary_expression (singular_expression (primary_expression (template_elaborated_ident (ident (ident_patte
-// rn_token))))))))))))))) (argument_expression_list (expression_comma_list (expression (relational_expression (
-// shift_expression (additive_expression (multiplicative_expression (multiplicative_expression (unary_expression
-//  (singular_expression (primary_expression (template_elaborated_ident (ident (ident_pattern_token)))) (compone
-// nt_or_swizzle_specifier (member_ident (ident_pattern_token)))))) (multiplicative_operator) (unary_expression
-// (singular_expression (primary_expression (template_elaborated_ident (ident (ident_pattern_token))))))))))) (e
-// xpression (relational_expression (shift_expression (additive_expression (multiplicative_expression (unary_exp
-// ression (singular_expression (primary_expression (literal (float_literal (decimal_float_literal))))))))))))))
-// ))))))))))))))

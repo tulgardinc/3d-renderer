@@ -40,30 +40,6 @@ pub fn main() !void {
 
     const renderer = Renderer.initOwning(allocator, window);
 
-    var pipelines = gs.PipelineCache.init(
-        gpu_context.device,
-        surface.format,
-        .depth24_plus,
-    );
-    defer pipelines.deinit(allocator);
-
-    // Create shader
-
-    const shader_handle = try shaders.createShader(
-        allocator,
-        build_options.shaders_dir ++ "/2DVertexColors.wgsl",
-        "test shader",
-    );
-    const shader = shaders.getShader(shader_handle).?;
-
-    // Create Buffers
-
-    const vertices = [_]f32{
-        -0.5, -0.5, 1.0, 0.0, 0.0,
-        0.5,  -0.5, 0.0, 1.0, 0.0,
-        0,    0.5,  0.0, 0.0, 1.0,
-    };
-
     const vertex_buffer = try gpu.createBuffer(
         gpu_context.device,
         gpu_context.queue,
