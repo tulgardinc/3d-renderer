@@ -16,20 +16,20 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
 
-    tree_sitter.addCSourceFiles(.{
+    tree_sitter.root_module.addCSourceFiles(.{
         .files = &.{
             "third_party/tree-sitter/lib/src/lib.c",
             "third_party/tree-sitter-wgsl/parser.c",
             "third_party/tree-sitter-wgsl/scanner.c",
         },
     });
-    tree_sitter.addIncludePath(b.path("third_party/tree-sitter/lib/src"));
-    tree_sitter.addIncludePath(b.path("third_party/tree-sitter/lib/include"));
-    tree_sitter.addIncludePath(b.path("include/"));
-    tree_sitter.linkLibC();
+    tree_sitter.root_module.addIncludePath(b.path("third_party/tree-sitter/lib/src"));
+    tree_sitter.root_module.addIncludePath(b.path("third_party/tree-sitter/lib/include"));
+    tree_sitter.root_module.addIncludePath(b.path("include/"));
 
     const shader_tool = b.addExecutable(.{
         .name = "shader_tool",
@@ -38,12 +38,12 @@ pub fn build(b: *std.Build) void {
 
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
 
-    shader_tool.linkLibrary(tree_sitter);
-    shader_tool.linkLibC();
-    shader_tool.addIncludePath(b.path("third_party/tree-sitter/lib/include"));
+    shader_tool.root_module.linkLibrary(tree_sitter);
+    shader_tool.root_module.addIncludePath(b.path("third_party/tree-sitter/lib/include"));
 
     b.installArtifact(shader_tool);
 
@@ -54,31 +54,30 @@ pub fn build(b: *std.Build) void {
 
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
         }),
     });
     exe.root_module.addOptions("build_options", options);
 
-    exe.linkLibC();
-    exe.addIncludePath(b.path("include/"));
-    exe.addObjectFile(b.path("lib/macos/libwebgpu_dawn.a"));
+    exe.root_module.addIncludePath(b.path("include/"));
+    exe.root_module.addObjectFile(b.path("lib/macos/libwebgpu_dawn.a"));
 
-    exe.addFrameworkPath(b.path("lib/sdl3/"));
-    exe.linkFramework("SDL3");
+    exe.root_module.addFrameworkPath(b.path("lib/sdl3/"));
+    exe.root_module.linkFramework("SDL3", .{});
 
-    exe.addRPath(b.path("zig-out/bin/"));
+    exe.root_module.addRPath(b.path("zig-out/bin/"));
 
-    exe.addCSourceFile(.{ .file = b.path("c/sdl3webgpu.m") });
-    exe.addCSourceFile(.{ .file = b.path("c/wgpu_init_shim.c") });
+    exe.root_module.addCSourceFile(.{ .file = b.path("c/sdl3webgpu.m") });
+    exe.root_module.addCSourceFile(.{ .file = b.path("c/wgpu_init_shim.c") });
 
-    exe.linkFramework("Metal");
-    exe.linkFramework("QuartzCore");
-    exe.linkFramework("Foundation");
-    exe.linkFramework("AppKit");
-    exe.linkFramework("CoreGraphics");
-    exe.linkFramework("IOSurface");
-    exe.linkFramework("IOKit");
-
-    exe.linkSystemLibrary("c++");
+    exe.root_module.linkFramework("Metal", .{});
+    exe.root_module.linkFramework("QuartzCore", .{});
+    exe.root_module.linkFramework("Foundation", .{});
+    exe.root_module.linkFramework("AppKit", .{});
+    exe.root_module.linkFramework("CoreGraphics", .{});
+    exe.root_module.linkFramework("IOSurface", .{});
+    exe.root_module.linkFramework("IOKit", .{});
 
     b.installArtifact(exe);
 

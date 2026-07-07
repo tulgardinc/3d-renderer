@@ -733,7 +733,7 @@ pub const ShaderStage = struct {
     pub const compute = c.WGPUShaderStage_Compute;
 };
 
-// ── Binding type (tagged union, used in shader metadata) ─────────────────────
+// Binding type
 
 pub const BindingResourceTypes = enum {
     buffer,
@@ -743,20 +743,41 @@ pub const BindingResourceTypes = enum {
 };
 
 pub const BindingType = union(BindingResourceTypes) {
-    buffer: BufferBT,
-    sampler: SamplerBT,
+    buffer: BufferBindingInfo,
     texture: TextureBindingInfo,
     storage_texture: StorageTextureBindingInfo,
+    sampler: SamplerBT,
 
-    const BufferBT = enum(c.WGPUBufferBindingType) { uniform = c.WGPUBufferBindingType_Uniform, storage = c.WGPUBufferBindingType_Storage, read_only_storage = c.WGPUBufferBindingType_ReadOnlyStorage };
-    const SamplerBT = enum(c.WGPUSamplerBindingType) { filtering = c.WGPUSamplerBindingType_Filtering, non_filtering = c.WGPUSamplerBindingType_NonFiltering, comparison = c.WGPUSamplerBindingType_Comparison };
-    const TextureSampleBT = enum(c.WGPUTextureSampleType) { float = c.WGPUTextureSampleType_Float, unfilterable_float = c.WGPUTextureSampleType_UnfilterableFloat, depth = c.WGPUTextureSampleType_Depth, sint = c.WGPUTextureSampleType_Sint, uint = c.WGPUTextureSampleType_Uint };
+    const BufferBT = enum(c.WGPUBufferBindingType) {
+        uniform = c.WGPUBufferBindingType_Uniform,
+        storage = c.WGPUBufferBindingType_Storage,
+        read_only_storage = c.WGPUBufferBindingType_ReadOnlyStorage,
+    };
+    const SamplerBT = enum(c.WGPUSamplerBindingType) {
+        filtering = c.WGPUSamplerBindingType_Filtering,
+        non_filtering = c.WGPUSamplerBindingType_NonFiltering,
+        comparison = c.WGPUSamplerBindingType_Comparison,
+    };
+    const TextureSampleBT = enum(c.WGPUTextureSampleType) {
+        float = c.WGPUTextureSampleType_Float,
+        unfilterable_float = c.WGPUTextureSampleType_UnfilterableFloat,
+        depth = c.WGPUTextureSampleType_Depth,
+        sint = c.WGPUTextureSampleType_Sint,
+        uint = c.WGPUTextureSampleType_Uint,
+    };
     const StorageTextureAccess = enum(c.WGPUStorageTextureAccess) {
         write_only = c.WGPUStorageTextureAccess_WriteOnly,
         read_only = c.WGPUStorageTextureAccess_ReadOnly,
         read_write = c.WGPUStorageTextureAccess_ReadWrite,
     };
-    const TextureViewDimension = enum(c.WGPUTextureViewDimension) { @"1d" = c.WGPUTextureViewDimension_1D, @"2d" = c.WGPUTextureViewDimension_2D, @"2d_array" = c.WGPUTextureViewDimension_2DArray, cube = c.WGPUTextureViewDimension_Cube, cube_array = c.WGPUTextureViewDimension_CubeArray, @"3d" = c.WGPUTextureViewDimension_3D };
+    const TextureViewDimension = enum(c.WGPUTextureViewDimension) {
+        @"1d" = c.WGPUTextureViewDimension_1D,
+        @"2d" = c.WGPUTextureViewDimension_2D,
+        @"2d_array" = c.WGPUTextureViewDimension_2DArray,
+        cube = c.WGPUTextureViewDimension_Cube,
+        cube_array = c.WGPUTextureViewDimension_CubeArray,
+        @"3d" = c.WGPUTextureViewDimension_3D,
+    };
     const TextureBindingInfo = struct {
         sample_type: TextureSampleBT,
         view_dimension: TextureViewDimension,
@@ -766,6 +787,11 @@ pub const BindingType = union(BindingResourceTypes) {
         access: StorageTextureAccess,
         format: TextureFormat,
         view_dimension: TextureViewDimension,
+    };
+    const BufferBindingInfo = struct {
+        type: BufferBT,
+        has_dynamic_offset: bool,
+        min_binding_size: u64,
     };
 };
 

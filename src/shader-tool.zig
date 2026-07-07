@@ -17,27 +17,22 @@ const fs_entry_query =
     \\(function_decl 
     \\  (attribute (fragment_attr)) 
     \\  (function_header 
-    \\    (ident (ident_pattern_token) @fn_name)
-    \\    (param_list) 
-    \\    (template_elaborated_ident) @ret))
+    \\    (ident (ident_pattern_token) @fn_name)))
 ;
 
 const cp_entry_query =
     \\(function_decl 
     \\  (attribute (compute_attr)) 
     \\  (function_header 
-    \\    (ident (ident_pattern_token) @fn_name)
-    \\    (param_list) @params))
+    \\    (ident (ident_pattern_token) @fn_name)))
 ;
 
 const struct_decl_query =
     \\(struct_decl) @decl
 ;
 
-const binding_decl_query =
-    \\(global_variable_decl
-    \\  (attribute (group_attr))
-    \\  (attribute (binding_attr))) @decl
+const global_var_decl_query =
+    \\(global_variable_decl) @decl
 ;
 
 const EntryTypes = enum {
@@ -58,6 +53,14 @@ const WGSLTextureScalar = enum {
     f32,
     i32,
     u32,
+
+    pub fn getSampleString(t: WGSLTextureScalar) []const u8 {
+        return switch (t) {
+            .f32 => ".float",
+            .i32 => ".sint",
+            .u32 => ".uint",
+        };
+    }
 };
 
 const SampledTextures = enum {
@@ -68,6 +71,18 @@ const SampledTextures = enum {
     texture_cube,
     texture_cube_array,
     texture_multisampled_2d,
+
+    pub fn getString(t: SampledTextures) []const u8 {
+        return switch (t) {
+            .texture_1d => ".@\"1d\"",
+            .texture_2d => ".@\"2d\"",
+            .texture_2d_array => ".@\"2d_array\"",
+            .texture_3d => ".@\"3d\"",
+            .texture_cube => ".cube",
+            .texture_cube_array => ".cube_array",
+            .texture_multisampled_2d => ".@\"2d\"",
+        };
+    }
 };
 
 const DepthTextures = enum {
@@ -76,6 +91,16 @@ const DepthTextures = enum {
     texture_depth_cube,
     texture_depth_cube_array,
     texture_depth_multisampled_2d,
+
+    pub fn getString(t: DepthTextures) []const u8 {
+        return switch (t) {
+            .texture_depth_2d => ".@\"2d\"",
+            .texture_depth_2d_array => ".@\"2d_array\"",
+            .texture_depth_cube => ".cube",
+            .texture_depth_cube_array => ".cube_array",
+            .texture_depth_multisampled_2d => ".@\"2d\"",
+        };
+    }
 };
 
 const StorageTextures = enum {
@@ -83,9 +108,18 @@ const StorageTextures = enum {
     texture_storage_2d,
     texture_storage_2d_array,
     texture_storage_3d,
+
+    pub fn getString(t: StorageTextures) []const u8 {
+        return switch (t) {
+            .texture_storage_1d => ".@\"1d\"",
+            .texture_storage_2d => ".@\"2d\"",
+            .texture_storage_2d_array => ".@\"2d_array\"",
+            .texture_storage_3d => ".@\"3d\"",
+        };
+    }
 };
 
-const WGSLTypes = union(enum) {
+const DataType = union(enum) {
     scalar: WGSLScalar,
     vec: struct {
         size: u32,
@@ -98,27 +132,141 @@ const WGSLTypes = union(enum) {
     },
     array: struct {
         max_size: ?u32,
-        type: *const WGSLTypes,
+        type: *const DataType,
     },
-    texture: TextureType,
-    sampler: SamplerType,
     struct_ref: []const u8,
+
+    pub fn getString(d: DataType, arena: std.mem.Allocator) ![]const u8 {
+        return switch (d) {
+            .scalar => |s| std.enums.tagName(WGSLScalar, s).?,
+            .vec => |v| try std.fmt.allocPrint(arena, "[{any}]{s}", .{ v.size, std.enums.tagName(WGSLScalar, v.scalar).? }),
+            .mat => |m| try std.fmt.allocPrint(arena, "[{any}][{any}]{s}", .{ m.cols, m.rows, std.enums.tagName(WGSLScalar, m.scalar).? }),
+            .array => |a| if (a.max_size) |ms|
+                try std.fmt.allocPrint(arena, "[{any}]{s}", .{ ms, try getString(a.type.*, arena) })
+            else
+                return error.NoString,
+            .struct_ref => |s| s,
+        };
+    }
 };
 
-const ParamOrField = struct {
+const HandleType = union(enum) {
+    texture: TextureType,
+    sampler: SamplerType,
+};
+
+const AddressSpace = enum { uniform, storage, handle };
+
+pub fn alignOfStruct(s: []const u8, struct_map: StructMap) ?u32 {
+    const struct_fields = struct_map.get(s) orelse return null;
+    var max: u32 = 0;
+    for (struct_fields.items) |field| {
+        max = @max(max, alignOf(field.type, .storage, struct_map).?);
+    }
+    return max;
+}
+
+fn alignOf(arena: std.mem.Allocator, data_type: DataType, space: AddressSpace, struct_map: StructMap, struct_layout_map: *StructLayoutMap) !?u32 {
+    return switch (data_type) {
+        .scalar => 4,
+        .vec => |v| if (v.size == 2) 8 else 16,
+        .mat => |m| if (m.rows == 2) 8 else 16,
+        .array => |arr| switch (space) {
+            .uniform => 16,
+            .storage => (try alignOf(arena, arr.type.*, space, struct_map, struct_layout_map)).?,
+            .handle => null,
+        },
+        .struct_ref => |s| switch (space) {
+            .uniform => 16,
+            .storage => (try getStructProperties(
+                arena,
+                s,
+                space,
+                struct_map,
+                struct_layout_map,
+            )).alignment,
+            .handle => null,
+        },
+    };
+}
+
+const StructLayoutEntries = std.ArrayList(
+    struct {
+        name: []const u8,
+        padding_before: u32,
+        offset: u32,
+    },
+);
+
+const StructLayout = struct {
+    size: union(enum) {
+        fixed: u32,
+        runtime: struct { base: u32, array_stride: u32 },
+    },
+    alignment: u32,
+    fields: StructLayoutEntries,
+    padding_after: ?u32 = null,
+};
+
+pub fn computeStorageStructLayout(arena: std.mem.Allocator, s: []const u8, space: AddressSpace, struct_map: StructMap) !StructLayout {
+    const struct_fields = struct_map.get(s) orelse return error.UndefinedStruct;
+    var offset: u32 = 0;
+    var fields: StructLayoutEntries = .empty;
+    for (struct_fields.items) |field| {
+        const alignment = alignOf(field.type, space, struct_map) orelse return error.FailedToGetAlignment;
+        const padding = offset % alignment;
+        const size = sizeOf(field.type, struct_map);
+        try fields.append(arena, .{ .name = field.name, .padding_before = padding, .offset = offset });
+        offset += size;
+    }
+    return .{
+        .size = offset,
+        .alignment = alignOfStruct(s, struct_map) orelse return error.FailedToGetStructAlign,
+        .fields = fields,
+    };
+}
+
+fn sizeOf(arena: std.mem.Allocator, data_type: DataType, space: AddressSpace, struct_map: StructMap, struct_layout_map: *StructLayoutMap) !?u32 {
+    return switch (data_type) {
+        .scalar => 4,
+        .vec => |v| v.size * 4,
+        .mat => |m| m.rows * m.cols * 4,
+        .array => |arr| if (arr.max_size) |max_size| @max(
+            (try alignOf(arena, arr.type.*, space, struct_map, struct_layout_map)).?,
+            (try sizeOf(arena, arr.type.*, space, struct_map, struct_layout_map)).?,
+        ) * max_size else null,
+        .struct_ref => |s| switch ((try getStructProperties(
+            arena,
+            s,
+            space,
+            struct_map,
+            struct_layout_map,
+        )).size) {
+            .fixed => |f| f,
+            .runtime => null,
+        },
+    };
+}
+
+const VarWithAttributes = struct {
     name: []const u8,
-    type: WGSLTypes,
+    type: DataType,
     location: ?u32,
+};
+
+const VertexInput = struct {
+    name: []const u8,
+    type: DataType,
+    location: u32,
 };
 
 const ShaderEntry = union(EntryTypes) {
     vertex: struct {
         name: []const u8,
-        parameters: []const ParamOrField,
+        parameters: []const VertexInput,
     },
     fragment: struct {
         name: []const u8,
-        ret: WGSLTypes,
     },
     compute: struct {
         name: []const u8,
@@ -143,17 +291,30 @@ const SampleType = enum {
 };
 
 const SamplerType = enum { sampler, sampler_comparison };
+const StorageAccess = enum {
+    write,
+    read,
+    read_write,
+
+    pub fn getString(t: StorageAccess) []const u8 {
+        return switch (t) {
+            .write => ".write_only",
+            .read => ".read_only",
+            .read_write => ".read_write",
+        };
+    }
+};
 
 const TextureType = union(enum) {
     sampled_texture: struct { dim: SampledTextures, scalar: WGSLTextureScalar },
     depth_texture: DepthTextures,
-    storage_texture: struct { dim: StorageTextures, format: TextureFormat, access: enum { write, read, read_write } },
+    storage_texture: struct { dim: StorageTextures, format: TextureFormat, access: StorageAccess },
     external_texture,
 };
 
 const BindingResource = union(enum) {
-    uniform_buffer: struct { type: WGSLTypes },
-    storage_buffer: struct { type: WGSLTypes, access: enum { read, read_write } },
+    uniform_buffer: struct { type: DataType },
+    storage_buffer: struct { type: DataType, access: enum { read, read_write } },
     texture: TextureType,
     sampler: SamplerType,
 };
@@ -229,7 +390,107 @@ fn parseWGSLUint(text: []const u8) !?u32 {
     return try std.fmt.parseInt(u32, s, 0);
 }
 
-fn parseWGSLType(src: []const u8, type_node: c.TSNode) ?WGSLTypes {
+pub fn getBindingResource(arena: std.mem.Allocator, src: []const u8, var_decl: c.TSNode) !?BindingResource {
+    const var_type_token = findDescendant(var_decl, "type_specifier").?;
+    const elab = findChild(var_type_token, "template_elaborated_ident").?;
+    if (findChild(var_decl, "template_list")) |addr_space| {
+        const var_type = (try parseWGSLDataType(arena, src, elab)).?;
+        const args = findChild(addr_space, "template_arg_comma_list").?;
+        const buffer_type_token = c.ts_node_named_child(args, 0);
+        const buffer_type = nodeText(src, buffer_type_token);
+        if (std.mem.eql(u8, buffer_type, "uniform")) {
+            return BindingResource{ .uniform_buffer = .{ .type = var_type } };
+        } else {
+            const access_token = c.ts_node_named_child(args, 1);
+            const access_text = nodeText(src, access_token);
+            return BindingResource{
+                .storage_buffer = .{
+                    .type = var_type,
+                    .access = if (std.mem.eql(u8, access_text, "read")) .read else .read_write,
+                },
+            };
+        }
+    } else {
+        const ident_node = findChild(elab, "ident").?;
+        const token = findChild(ident_node, "ident_pattern_token").?;
+        const base_name = nodeText(src, token);
+        if (std.mem.startsWith(u8, base_name, "texture_")) {
+            if (std.meta.stringToEnum(SampledTextures, base_name)) |tex_dim| {
+                if (findChild((elab), "template_list")) |tmpl| {
+                    const inner = findDescendant(tmpl, "ident_pattern_token").?;
+                    const scalar = std.meta.stringToEnum(WGSLTextureScalar, nodeText(src, inner)).?;
+                    return .{
+                        .texture = .{
+                            .sampled_texture = .{
+                                .dim = tex_dim,
+                                .scalar = scalar,
+                            },
+                        },
+                    };
+                }
+            } else if (std.meta.stringToEnum(DepthTextures, base_name)) |depth_tex| {
+                return .{ .texture = .{ .depth_texture = depth_tex } };
+            }
+
+            return error.Todo;
+
+            // TODO storage textures
+        }
+
+        if (std.mem.startsWith(u8, base_name, "sampler")) {
+            const sampler_type = std.meta.stringToEnum(SamplerType, base_name).?;
+            return .{ .sampler = sampler_type };
+        }
+
+        return error.SomethingIsNotRight;
+    }
+}
+
+pub fn getBindingDeclerations(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) !std.ArrayList(Binding) {
+    var error_offset: u32 = 0;
+    var error_type = c.TSQueryErrorNone;
+
+    var binding_declerations: std.ArrayList(Binding) = .empty;
+
+    const query = c.ts_query_new(
+        tree_sitter_wgsl(),
+        global_var_decl_query,
+        global_var_decl_query.len,
+        &error_offset,
+        @ptrCast(&error_type),
+    );
+    defer c.ts_query_delete(query);
+
+    if (query == null) {
+        std.debug.print("error at: {s}\n", .{global_var_decl_query[error_offset..]});
+        return error.BadQuery;
+    }
+
+    c.ts_query_cursor_exec(cursor, query, root);
+    var match: c.TSQueryMatch = undefined;
+
+    while (c.ts_query_cursor_next_match(cursor, &match)) {
+        for (match.captures[0..match.capture_count]) |cap| {
+            const group = try getGroup(src, cap.node) orelse continue;
+            const binding = try getBinding(src, cap.node) orelse continue;
+            const opt_token = findDescendant(cap.node, "optionally_typed_ident").?;
+            const name_token = findDescendant(opt_token, "ident_pattern_token").?;
+            const name = nodeText(src, name_token);
+            const var_decl = findChild(cap.node, "variable_decl").?;
+            const resource = (try getBindingResource(arena, src, var_decl)).?;
+            try binding_declerations.append(arena, .{
+                .group = group,
+                .binding = binding,
+                .name = name,
+                .resource = resource,
+            });
+        }
+    }
+
+    return binding_declerations;
+}
+
+fn parseWGSLDataType(arena: std.mem.Allocator, src: []const u8, type_node: c.TSNode) !?DataType {
     const ident_node = findChild(type_node, "ident") orelse return null;
     const token = findChild(ident_node, "ident_pattern_token") orelse return null;
     const base_name = nodeText(src, token);
@@ -279,7 +540,7 @@ fn parseWGSLType(src: []const u8, type_node: c.TSNode) ?WGSLTypes {
         const rows = base_name[3] - '0';
         const cols = base_name[5] - '0';
 
-        if (findChild((type_node), "template_list")) |tmpl| {
+        if (findChild(type_node, "template_list")) |tmpl| {
             const inner = findDescendant(tmpl, "ident_pattern_token") orelse return null;
             const scalar = std.meta.stringToEnum(WGSLScalar, nodeText(src, inner)) orelse return null;
             return .{ .mat = .{ .rows = rows, .cols = cols, .scalar = scalar } };
@@ -300,29 +561,32 @@ fn parseWGSLType(src: []const u8, type_node: c.TSNode) ?WGSLTypes {
         return null;
     }
 
-    // texture
-    if (std.mem.startsWith(u8, base_name, "texture_")) {
-        if (std.meta.stringToEnum(SampledTextures, base_name)) |tex_dim| {
-            if (findChild((type_node), "template_list")) |tmpl| {
-                const inner = findDescendant(tmpl, "ident_pattern_token") orelse return null;
-                const scalar = std.meta.stringToEnum(WGSLTextureScalar, nodeText(src, inner)) orelse return null;
-                return .{ .texture = .{
-                    .sampled_texture = .{
-                        .dim = tex_dim,
-                        .scalar = scalar,
-                    },
-                } };
-            }
-        } else if (std.meta.stringToEnum(DepthTextures, base_name)) |depth_tex| {
-            return .{ .texture = .{ .depth_texture = depth_tex } };
+    // array
+    if (std.mem.startsWith(u8, base_name, "array")) {
+        const template_list = findDescendant(type_node, "template_arg_comma_list") orelse return null;
+        const par_count = c.ts_node_named_child_count(template_list);
+        const elem_type_node = c.ts_node_named_child(template_list, 0);
+        const type_inner = findDescendant(elem_type_node, "template_elaborated_ident") orelse return null;
+        const child_type: *DataType = try arena.create(DataType);
+        child_type.* = (try parseWGSLDataType(arena, src, type_inner)).?;
+
+        var max_size: ?u32 = null;
+
+        if (par_count == 2) {
+            const elem_count_node = c.ts_node_named_child(template_list, 1);
+            const count_inner = findDescendant(elem_count_node, "decimal_int_literal") orelse return null;
+            max_size = try std.fmt.parseInt(u8, nodeText(src, count_inner), 0);
         }
 
-        return null;
-
-        // TODO storage textures
+        return .{
+            .array = .{
+                .type = child_type,
+                .max_size = max_size,
+            },
+        };
     }
 
-    // Unknown type — treat as struct ref
+    // unknown type
     return .{ .struct_ref = base_name };
 }
 
@@ -330,6 +594,15 @@ pub fn captureNameFromId(query: ?*c.TSQuery, index: u32) []const u8 {
     var length: u32 = 0;
     const name_ptr = c.ts_query_capture_name_for_id(query, index, &length);
     return name_ptr[0..length];
+}
+
+pub fn capture(match: c.TSQueryMatch, query: ?*c.TSQuery, name: []const u8) ?c.TSNode {
+    for (match.captures[0..match.capture_count]) |cap| {
+        if (std.mem.eql(u8, captureNameFromId(query, cap.index), name)) {
+            return cap.node;
+        }
+    }
+    return null;
 }
 
 pub fn findDescendant(node: c.TSNode, node_type: []const u8) ?c.TSNode {
@@ -343,16 +616,19 @@ pub fn findDescendant(node: c.TSNode, node_type: []const u8) ?c.TSNode {
     return null;
 }
 
+const StructMap = std.StringHashMapUnmanaged(std.ArrayList(VarWithAttributes));
+const StructLayoutMap = std.StringHashMapUnmanaged(StructLayout);
+
 pub fn getStructDeclerations(
     arena: std.mem.Allocator,
     src: []const u8,
     root: c.TSNode,
     cursor: ?*c.TSQueryCursor,
-) !std.StringHashMapUnmanaged(std.ArrayList(ParamOrField)) {
+) !StructMap {
     var error_offset: u32 = 0;
     var error_type = c.TSQueryErrorNone;
 
-    var struct_declerations: std.StringHashMapUnmanaged(std.ArrayList(ParamOrField)) = .empty;
+    var struct_declerations: StructMap = .empty;
 
     const query = c.ts_query_new(
         tree_sitter_wgsl(),
@@ -375,7 +651,7 @@ pub fn getStructDeclerations(
         for (match.captures[0..match.capture_count]) |cap| {
             const name_node = findChild(cap.node, "ident") orelse continue;
             const name = nodeText(src, name_node);
-            var fields: std.ArrayList(ParamOrField) = .empty;
+            var fields: std.ArrayList(VarWithAttributes) = .empty;
             const body_node = findChild(cap.node, "struct_body_decl") orelse continue;
             const field_count = c.ts_node_named_child_count(body_node);
             for (0..field_count) |i| {
@@ -384,7 +660,7 @@ pub fn getStructDeclerations(
                 const ident_token = findChild(field_token, "member_ident") orelse continue;
                 const field_name = nodeText(src, ident_token);
                 const elab_token = findDescendant(field_token, "template_elaborated_ident") orelse continue;
-                const field_type = parseWGSLType(src, elab_token) orelse continue;
+                const field_type = try parseWGSLDataType(arena, src, elab_token) orelse continue;
                 try fields.append(arena, .{
                     .name = field_name,
                     .location = field_location,
@@ -399,118 +675,42 @@ pub fn getStructDeclerations(
     return struct_declerations;
 }
 
-pub fn getBindingResource(src: []const u8, var_decl: c.TSNode) ?BindingResource {
-    const var_type_token = findDescendant(var_decl, "type_specifier") orelse return null;
-    const elab = findChild(var_type_token, "template_elaborated_ident") orelse return null;
-    const var_type = parseWGSLType(src, elab) orelse return null;
-    if (findChild(var_decl, "template_list")) |addr_space| {
-        const args = findChild(addr_space, "template_arg_comma_list") orelse return null;
-        const buffer_type_token = c.ts_node_named_child(args, 0);
-        const buffer_type = nodeText(src, buffer_type_token);
-        if (std.mem.eql(u8, buffer_type, "uniform")) {
-            return BindingResource{ .uniform_buffer = .{ .type = var_type } };
-        } else {
-            const access_token = c.ts_node_named_child(args, 1);
-            const access_text = nodeText(src, access_token);
-            return BindingResource{
-                .storage_buffer = .{
-                    .type = var_type,
-                    .access = if (std.mem.eql(u8, access_text, "read")) .read else .read_write,
-                },
-            };
-        }
-    } else {
-        switch (var_type) {
-            .sampler => |smp| {
-                return BindingResource{ .sampler = smp };
-            },
-            .texture => |tex| {
-                return BindingResource{ .texture = tex };
-            },
-            else => return null,
-        }
-    }
-}
-
-pub fn getBindingDeclerations(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) !std.ArrayList(Binding) {
-    var error_offset: u32 = 0;
-    var error_type = c.TSQueryErrorNone;
-
-    var binding_declerations: std.ArrayList(Binding) = .empty;
-
-    const query = c.ts_query_new(
-        tree_sitter_wgsl(),
-        binding_decl_query,
-        binding_decl_query.len,
-        &error_offset,
-        @ptrCast(&error_type),
-    );
-    defer c.ts_query_delete(query);
-
-    if (query == null) {
-        std.debug.print("error at: {s}\n", .{binding_decl_query[error_offset..]});
-        return error.BadQuery;
-    }
-
-    c.ts_query_cursor_exec(cursor, query, root);
-    var match: c.TSQueryMatch = undefined;
-
-    while (c.ts_query_cursor_next_match(cursor, &match)) {
-        for (match.captures[0..match.capture_count]) |cap| {
-            const group = try getGroup(src, cap.node) orelse continue;
-            const binding = try getBinding(src, cap.node) orelse continue;
-            const opt_token = findDescendant(cap.node, "optionally_typed_ident") orelse continue;
-            const name_token = findDescendant(opt_token, "ident_pattern_token") orelse continue;
-            const name = nodeText(src, name_token);
-            const var_decl = findChild(cap.node, "variable_decl") orelse continue;
-            const resource = getBindingResource(src, var_decl) orelse continue;
-            try binding_declerations.append(arena, .{
-                .group = group,
-                .binding = binding,
-                .name = name,
-                .resource = resource,
+pub fn getVertexInputFromStruct(
+    arena: std.mem.Allocator,
+    struct_map: StructMap,
+    struct_name: []const u8,
+    params: *std.ArrayList(VertexInput),
+) !void {
+    const struct_fields = struct_map.get(struct_name).?;
+    for (struct_fields.items) |field| {
+        if (field.location) |loc| {
+            try params.append(arena, .{
+                .name = field.name,
+                .type = field.type,
+                .location = loc,
             });
+        } else if (field.type == .struct_ref) {
+            try getVertexInputFromStruct(
+                arena,
+                struct_map,
+                field.type.struct_ref,
+                params,
+            );
         }
     }
-
-    return binding_declerations;
 }
 
-// (translation_unit (global_variable_decl
-// (attribute (group_attr (expression (relational_expression (shift_expr
-// ession (additive_expression (multiplicative_expression (unary_expression (singular_expression (primary_expres
-// sion (literal (int_literal (decimal_int_literal)))))))))))))
-// (attribute (binding_attr (expression (relational_expression (shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_exp
-// ression (primary_expression (literal (int_literal (decimal_int_literal)))))))))))))
-// (variable_decl (optionally_typed_ident (ident (ident_pattern_token)) (type_specifier (template_elaborated_ident (ident (ident_pattern_
-// token)) (template_list (template_arg_comma_list (template_arg_expression (expression (relational_expression (
-// shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_expression (prim
-// ary_expression (template_elaborated_ident (ident (ident_pattern_token))))))))))))))))))))
-
-// (translation_unit (global_variable_decl
-// (attribute (group_attr (expression (relational_expression (shift_expr
-// ession (additive_expression (multiplicative_expression (unary_expression (singular_expression (primary_expres
-// sion (literal (int_literal (decimal_int_literal)))))))))))))
-// (attribute (binding_attr (expression (relational
-// _expression (shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_exp
-// ression (primary_expression (literal (int_literal (decimal_int_literal)))))))))))))
-// (variable_decl (template_list (template_arg_comma_list
-// (template_arg_expression (expression (relational_expression (shift_expression (
-// additive_expression (multiplicative_expression (unary_expression (singular_expression (primary_expression (te
-// mplate_elaborated_ident (ident (ident_pattern_token))))))))))))
-// (template_arg_expression (expression (relatio
-// nal_expression (shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_
-// expression (primary_expression (template_elaborated_ident (ident (ident_pattern_token))))))))))))))
-// (optionally_typed_ident (ident (ident_pattern_token)) (type_specifier (template_elaborated_ident (ident (ident_pattern
-// _token)) (template_list (template_arg_comma_list (template_arg_expression (expression (relational_expression
-// (shift_expression (additive_expression (multiplicative_expression (unary_expression (singular_expression (pri
-// mary_expression (template_elaborated_ident (ident (ident_pattern_token))))))))))))))))))))
-
-pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) !std.ArrayList(ShaderEntry) {
+pub fn getEntryFunctions(
+    arena: std.mem.Allocator,
+    src: []const u8,
+    root: c.TSNode,
+    cursor: ?*c.TSQueryCursor,
+    struct_map: StructMap,
+) !std.ArrayList(ShaderEntry) {
     var error_offset: u32 = 0;
     var error_type = c.TSQueryErrorNone;
 
-    var entry_functions: std.ArrayList(ShaderEntry) = .{};
+    var entry_functions: std.ArrayList(ShaderEntry) = .empty;
 
     inline for (std.meta.fields(EntryTypes)) |enum_field| {
         const entry_type: EntryTypes = @enumFromInt(enum_field.value);
@@ -541,28 +741,30 @@ pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNo
             .vertex => {
                 while (c.ts_query_cursor_next_match(cursor, &match)) {
                     var name: ?[]const u8 = null;
-                    var params: std.ArrayList(ParamOrField) = .empty;
+                    var params: std.ArrayList(VertexInput) = .empty;
 
-                    for (match.captures[0..match.capture_count]) |cap| {
-                        const cap_name = captureNameFromId(query, cap.index);
-                        if (std.mem.eql(u8, cap_name, "fn_name")) {
-                            name = nodeText(src, cap.node);
-                        } else if (std.mem.eql(u8, cap_name, "params")) {
-                            const count = c.ts_node_named_child_count(cap.node);
-                            for (0..count) |i| {
-                                const param = c.ts_node_named_child(cap.node, @intCast(i));
-                                const location = try getLocation(src, param);
-                                const ident = findChild(param, "ident") orelse continue;
-                                const token = findChild(ident, "ident_pattern_token") orelse continue;
-                                const type_sp = findChild(param, "type_specifier") orelse continue;
-                                const type_tok = findChild(type_sp, "template_elaborated_ident") orelse continue;
-                                const ty = parseWGSLType(src, type_tok) orelse continue;
-                                try params.append(arena, .{
-                                    .name = nodeText(src, token),
-                                    .type = ty,
-                                    .location = location,
-                                });
-                            }
+                    const name_capture = capture(match, query, "fn_name").?;
+                    name = nodeText(src, name_capture);
+                    const params_capture = capture(match, query, "params").?;
+                    const param_count = c.ts_node_named_child_count(params_capture);
+                    for (0..param_count) |i| {
+                        const param = c.ts_node_named_child(params_capture, @intCast(i));
+                        const ident = findChild(param, "ident").?;
+                        const token = findChild(ident, "ident_pattern_token").?;
+                        const type_sp = findChild(param, "type_specifier").?;
+                        const type_tok = findChild(type_sp, "template_elaborated_ident").?;
+                        const ty = (try parseWGSLDataType(arena, src, type_tok)).?;
+
+                        const location = try getLocation(src, param);
+
+                        if (location) |loc| {
+                            try params.append(arena, .{
+                                .name = nodeText(src, token),
+                                .type = ty,
+                                .location = loc,
+                            });
+                        } else if (ty == .struct_ref) {
+                            try getVertexInputFromStruct(arena, struct_map, ty.struct_ref, &params);
                         }
                     }
 
@@ -578,46 +780,22 @@ pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNo
             },
             .fragment => {
                 while (c.ts_query_cursor_next_match(cursor, &match)) {
-                    var name: ?[]const u8 = null;
-                    var ret_type: WGSLTypes = undefined;
+                    const name_node = capture(match, query, "fn_name").?;
+                    const name = nodeText(src, name_node);
 
-                    for (match.captures[0..match.capture_count]) |cap| {
-                        const cap_name = captureNameFromId(query, cap.index);
-                        if (std.mem.eql(u8, cap_name, "fn_name")) {
-                            name = nodeText(src, cap.node);
-                        } else if (std.mem.eql(u8, cap_name, "ret")) {
-                            ret_type = parseWGSLType(src, cap.node) orelse return error.FailedToParseReturn;
-                        }
-                    }
-
-                    if (name) |n| {
-                        try entry_functions.append(arena, .{
-                            .fragment = .{
-                                .name = n,
-                                .ret = ret_type,
-                            },
-                        });
-                    }
+                    try entry_functions.append(arena, .{
+                        .fragment = .{ .name = name },
+                    });
                 }
             },
             .compute => {
                 while (c.ts_query_cursor_next_match(cursor, &match)) {
-                    var name: ?[]const u8 = null;
+                    const name_node = capture(match, query, "fn_name").?;
+                    const name = nodeText(src, name_node);
 
-                    for (match.captures[0..match.capture_count]) |cap| {
-                        const cap_name = captureNameFromId(query, cap.index);
-                        if (std.mem.eql(u8, cap_name, "fn_name")) {
-                            name = nodeText(src, cap.node);
-                        }
-                    }
-
-                    if (name) |n| {
-                        try entry_functions.append(arena, .{
-                            .compute = .{
-                                .name = n,
-                            },
-                        });
-                    }
+                    try entry_functions.append(arena, .{
+                        .compute = .{ .name = name },
+                    });
                 }
             },
         }
@@ -626,46 +804,343 @@ pub fn getEntryFunctions(arena: std.mem.Allocator, src: []const u8, root: c.TSNo
     return entry_functions;
 }
 
+pub fn getStructProperties(
+    arena: std.mem.Allocator,
+    struct_ref: []const u8,
+    space: AddressSpace,
+    struct_map: StructMap,
+    struct_layout_map: *StructLayoutMap,
+) error{OutOfMemory}!StructLayout {
+    if (struct_layout_map.get(struct_ref)) |layout| return layout;
+
+    const struct_fields = struct_map.get(struct_ref).?;
+    var struct_layout_entries: StructLayoutEntries = .empty;
+    var offset: u32 = 0;
+    var max_alignment: u32 = 0;
+    std.debug.print("struct: {s}\n", .{struct_ref});
+    for (struct_fields.items) |field| {
+        switch (field.type) {
+            .struct_ref => |ref| {
+                const l = try getStructProperties(arena, ref, space, struct_map, struct_layout_map);
+                try struct_layout_map.put(arena, ref, l);
+            },
+            .array => |arr| {
+                var inner_type: DataType = arr.type.*;
+                while (inner_type == .array) {
+                    inner_type = inner_type.array.type.*;
+                }
+                if (inner_type == .struct_ref) {
+                    const l = try getStructProperties(arena, arr.type.struct_ref, space, struct_map, struct_layout_map);
+                    try struct_layout_map.put(arena, arr.type.struct_ref, l);
+                }
+            },
+            else => {},
+        }
+        const alignment = (try alignOf(
+            arena,
+            field.type,
+            space,
+            struct_map,
+            struct_layout_map,
+        )).?;
+        max_alignment = @max(max_alignment, alignment);
+        const address: u32 = @intCast(std.mem.alignForward(usize, offset, alignment));
+        const padding = address - offset;
+        if (field.type == .array and field.type.array.max_size == null) {
+            const base = address;
+            const array_stride = @max(
+                (try sizeOf(arena, field.type.array.type.*, .storage, struct_map, struct_layout_map)).?,
+                alignment,
+            );
+            try struct_layout_entries.append(arena, .{
+                .offset = address,
+                .padding_before = padding,
+                .name = field.name,
+            });
+            return .{
+                .alignment = max_alignment,
+                .size = .{
+                    .runtime = .{ .base = base, .array_stride = array_stride },
+                },
+                .fields = struct_layout_entries,
+            };
+        }
+        try struct_layout_entries.append(arena, .{
+            .offset = address,
+            .padding_before = padding,
+            .name = field.name,
+        });
+        offset = address + (try sizeOf(arena, field.type, space, struct_map, struct_layout_map)).?;
+        std.debug.print("offset: {any}, padding: {any}, name: {s}\n", .{ offset, padding, field.name });
+    }
+    const size: u32 = @intCast(std.mem.alignForward(usize, offset, max_alignment));
+    const last_field_layout = struct_layout_entries.items[struct_layout_entries.items.len - 1];
+    const last_field_decl = struct_fields.items[struct_fields.items.len - 1];
+    const padding_after = size - (last_field_layout.offset + (try sizeOf(
+        arena,
+        last_field_decl.type,
+        space,
+        struct_map,
+        struct_layout_map,
+    )).?);
+    std.debug.print("Stuct size: {}, alignment: {}\n", .{ size, max_alignment });
+    return .{
+        .alignment = max_alignment,
+        .size = .{ .fixed = size },
+        .fields = struct_layout_entries,
+        .padding_after = padding_after,
+    };
+}
+
+pub fn sortByGroup(_: void, a: Binding, b: Binding) bool {
+    return a.group < b.group;
+}
+
+pub fn printStructCode(
+    allocator: std.mem.Allocator,
+    ref: []const u8,
+    struct_map: StructMap,
+    struct_layout_map: StructLayoutMap,
+    w: *std.Io.Writer,
+) !void {
+    const struct_definition = struct_map.get(ref).?;
+    const struct_layout = struct_layout_map.get(ref).?;
+    for (struct_definition.items) |field| {
+        switch (field.type) {
+            .struct_ref => |in_ref| try printStructCode(allocator, in_ref, struct_map, struct_layout_map, w),
+            .array => |arr| {
+                var inner_type: DataType = arr.type.*;
+                while (inner_type == .array) {
+                    inner_type = inner_type.array.type.*;
+                }
+                if (inner_type == .struct_ref) {
+                    try printStructCode(allocator, inner_type.struct_ref, struct_map, struct_layout_map, w);
+                }
+            },
+            else => {},
+        }
+    }
+    try w.print(
+        "const {s} = extern struct {{\n",
+        .{ref},
+    );
+    var padding_count: usize = 0;
+    for (struct_layout.fields.items, 0..) |field, i| {
+        const field_def = struct_definition.items[i];
+        if (field.padding_before > 0) {
+            try w.print("pad_{}: [{any}]u8 = @splat(0),\n", .{ padding_count, field.padding_before });
+            padding_count += 1;
+        }
+        if (field_def.type == .array and field_def.type.array.max_size == null) continue;
+        try w.print(
+            "{s}: {s},\n",
+            .{ field.name, try field_def.type.getString(allocator) },
+        );
+    }
+    if (struct_layout.padding_after) |p| {
+        if (p > 0) {
+            try w.print("pad_{}: [{any}]u8 = @splat(0),\n", .{ padding_count, p });
+        }
+    }
+    try w.print("}};\n\n", .{});
+}
+
 pub fn main() !void {
+    // TODO: Runtime sized arrays are correctly reflected but no array stride output (look into ergonomics)
+
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cwd = std.Io.Dir.cwd();
+
     const parser = c.ts_parser_new();
     _ = c.ts_parser_set_language(parser, tree_sitter_wgsl());
-    const src = @embedFile("./shaders/2DVertexColors.wgsl");
-    // const src =
-    //     \\@vertex
-    //     \\fn vs(in: VertexInput) -> VertexOutput {}
-    // ;
-    const tree = c.ts_parser_parse_string(parser, null, src, src.len);
+    const src = try cwd.readFileAlloc(
+        io,
+        "src/shaders/ParticleSim.wgsl",
+        allocator,
+        .unlimited,
+    );
+    const tree = c.ts_parser_parse_string(parser, null, @ptrCast(src), @intCast(src.len));
 
     const root = c.ts_tree_root_node(tree);
-
-    // const str = c.ts_node_string(root);
-    // std.debug.print("{s}\n", .{str});
 
     const cursor = c.ts_query_cursor_new();
     defer c.ts_query_cursor_delete(cursor);
 
-    const entries = try getEntryFunctions(allocator, src, root, cursor);
-    for (entries.items) |e| {
-        std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
-    }
-
-    const bindings = try getBindingDeclerations(allocator, src, root, cursor);
-    for (bindings.items) |e| {
-        std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
-    }
-
-    const struct_decls = try getStructDeclerations(allocator, src, root, cursor);
-    var iter = struct_decls.iterator();
+    std.debug.print("=== STRUCT DECLERATIONS ===\n", .{});
+    const struct_map = try getStructDeclerations(allocator, src, root, cursor);
+    var iter = struct_map.iterator();
     while (iter.next()) |entry| {
         std.debug.print("{s}\n", .{entry.key_ptr.*});
         for (entry.value_ptr.items) |field| {
             std.debug.print("{f}\n", .{std.json.fmt(field, .{})});
         }
     }
+
+    std.debug.print("=== ENTRY FUNCTIONS ===\n", .{});
+    const entries = try getEntryFunctions(allocator, src, root, cursor, struct_map);
+    for (entries.items) |e| {
+        std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
+    }
+
+    std.debug.print("=== BINDINGS ===\n", .{});
+    const bindings = try getBindingDeclerations(allocator, src, root, cursor);
+    for (bindings.items) |e| {
+        std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
+    }
+
+    var struct_layout_map: StructLayoutMap = .empty;
+    std.debug.print("=== STRUCT LAYOUTS ===\n", .{});
+    for (bindings.items) |b| {
+        switch (b.resource) {
+            .uniform_buffer => |ub| {
+                if (ub.type == .struct_ref) {
+                    const ref = ub.type.struct_ref;
+                    const layout = try getStructProperties(
+                        allocator,
+                        ref,
+                        .uniform,
+                        struct_map,
+                        &struct_layout_map,
+                    );
+                    try struct_layout_map.put(allocator, ref, layout);
+                }
+            },
+            .storage_buffer => |sb| {
+                if (sb.type == .struct_ref) {
+                    const ref = sb.type.struct_ref;
+                    const layout = try getStructProperties(
+                        allocator,
+                        ref,
+                        .uniform,
+                        struct_map,
+                        &struct_layout_map,
+                    );
+                    try struct_layout_map.put(allocator, ref, layout);
+                }
+            },
+            else => {},
+        }
+    }
+
+    std.mem.sort(Binding, bindings.items, {}, sortByGroup);
+
+    const visibility: []const u8 = blk: {
+        for (entries.items) |i| {
+            if (i == .compute) break :blk "gpu.ShaderStage.compute";
+        }
+        break :blk "gpu.ShaderStage.vertex | gpu.ShaderStage.fragment";
+    };
+
+    const write_path = "src/shaders/compiled.zig";
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    const w = &aw.writer;
+    try w.print(
+        \\ const gpu = @import("../gpu.zig");
+        \\
+        \\ const layouts: ?[]const []const gpu.BindGroupLayoutEntry = .{{
+        \\ .{{
+    , .{});
+
+    var group: usize = 0;
+    const final_group = bindings.items[bindings.items.len - 1].group;
+    for (bindings.items) |binding| {
+        if (binding.group != group) {
+            try w.print("}},\n", .{});
+            group = binding.group;
+            if (group != final_group) {
+                try w.print("{{", .{});
+            }
+        }
+        try w.print(
+            ".{{ .binding = {any}, .visibility = {s}, .type = ",
+            .{ binding.binding, visibility },
+        );
+        switch (binding.resource) {
+            .uniform_buffer => |ub| switch (ub.type) {
+                .struct_ref => |ref| try w.print(
+                    ".{{ .buffer = .{{.type = .uniform, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
+                    .{
+                        struct_layout_map.get(ref).?.size.fixed,
+                    },
+                ),
+                else => try w.print(".{{ .buffer = .{{.type = .uniform, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},", .{}),
+            },
+            .storage_buffer => |sb| switch (sb.type) {
+                .struct_ref => |ref| switch (struct_layout_map.get(ref).?.size) {
+                    .fixed => |f| try w.print(
+                        ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
+                        .{ if (sb.access == .read_write) ".storage" else ".read_only_storage", f },
+                    ),
+                    .runtime => try w.print(
+                        ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},",
+                        .{if (sb.access == .read_write) ".storage" else ".read_only_storage"},
+                    ),
+                },
+                else => try w.print(".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},", .{
+                    if (sb.access == .read) ".read_only_storage" else ".storage",
+                    if (try sizeOf(
+                        allocator,
+                        sb.type,
+                        .storage,
+                        struct_map,
+                        &struct_layout_map,
+                    )) |size| size else 0,
+                }),
+            },
+            .sampler => |smp| {
+                const smp_type = if (smp == .sampler) ".filtering" else ".sampler_comparison";
+                try w.print(".{{ .sampler = {s} }} }},", .{smp_type});
+            },
+            .texture => |tex| switch (tex) {
+                .sampled_texture => |smp| {
+                    try w.print(
+                        ".{{ .type = .{{ .texture = .{{ .sample_type = {s}, .view_dimension = {s}, .multi_sampled = {any}  }} }} }} }},",
+                        .{ smp.dim.getString(), smp.scalar.getSampleString(), smp.dim == .texture_multisampled_2d },
+                    );
+                },
+                .depth_texture => |depth| {
+                    try w.print(
+                        ".{{ .type = .{{ .texture = .{{ .sample_type = {s}, .view_dimension = .depth, .multi_sampled = {any}  }} }} }} }},",
+                        .{ depth.getString(), depth == .texture_depth_multisampled_2d },
+                    );
+                },
+                .storage_texture => |strg| {
+                    try w.print(
+                        ".{{ .type = .{{ .storage_texture = .{{ .view_dimension = {s}, .access = {s}, .format = .{s}  }} }} }} }},",
+                        .{
+                            strg.dim.getString(),
+                            strg.access.getString(),
+                            std.enums.tagName(TextureFormat, strg.format).?,
+                        },
+                    );
+                },
+                .external_texture => {},
+            },
+        }
+    }
+    try w.print("}}, }};\n\n", .{});
+
+    for (bindings.items) |binding| {
+        const resource = binding.resource;
+        if (resource == .uniform_buffer or resource == .storage_buffer) {
+            const bind_type = if (resource == .uniform_buffer) resource.uniform_buffer.type else resource.storage_buffer.type;
+            if (bind_type == .struct_ref) {
+                try printStructCode(allocator, bind_type.struct_ref, struct_map, struct_layout_map, w);
+            }
+        }
+    }
+
+    try cwd.writeFile(io, .{
+        .sub_path = write_path,
+        .data = aw.written(),
+    });
 }
 
 pub const TextureFormat = enum {
@@ -779,153 +1254,4 @@ pub const TextureFormat = enum {
     r10x6bg10x6_biplanar422_unorm,
     r10x6bg10x6_biplanar444_unorm,
     external,
-
-    pub fn wgpuName(self: TextureFormat) []const u8 {
-        return switch (self) {
-            .undefined => "c.WGPUTextureFormat_Undefined",
-            .r8_unorm => "c.WGPUTextureFormat_R8Unorm",
-            .r8_snorm => "c.WGPUTextureFormat_R8Snorm",
-            .r8_uint => "c.WGPUTextureFormat_R8Uint",
-            .r8_sint => "c.WGPUTextureFormat_R8Sint",
-            .r16_unorm => "c.WGPUTextureFormat_R16Unorm",
-            .r16_snorm => "c.WGPUTextureFormat_R16Snorm",
-            .r16_uint => "c.WGPUTextureFormat_R16Uint",
-            .r16_sint => "c.WGPUTextureFormat_R16Sint",
-            .r16_float => "c.WGPUTextureFormat_R16Float",
-            .rg8_unorm => "c.WGPUTextureFormat_RG8Unorm",
-            .rg8_snorm => "c.WGPUTextureFormat_RG8Snorm",
-            .rg8_uint => "c.WGPUTextureFormat_RG8Uint",
-            .rg8_sint => "c.WGPUTextureFormat_RG8Sint",
-            .r32_float => "c.WGPUTextureFormat_R32Float",
-            .r32_uint => "c.WGPUTextureFormat_R32Uint",
-            .r32_sint => "c.WGPUTextureFormat_R32Sint",
-            .rg16_unorm => "c.WGPUTextureFormat_RG16Unorm",
-            .rg16_snorm => "c.WGPUTextureFormat_RG16Snorm",
-            .rg16_uint => "c.WGPUTextureFormat_RG16Uint",
-            .rg16_sint => "c.WGPUTextureFormat_RG16Sint",
-            .rg16_float => "c.WGPUTextureFormat_RG16Float",
-            .rgba8_unorm => "c.WGPUTextureFormat_RGBA8Unorm",
-            .rgba8_unorm_srgb => "c.WGPUTextureFormat_RGBA8UnormSrgb",
-            .rgba8_snorm => "c.WGPUTextureFormat_RGBA8Snorm",
-            .rgba8_uint => "c.WGPUTextureFormat_RGBA8Uint",
-            .rgba8_sint => "c.WGPUTextureFormat_RGBA8Sint",
-            .bgra8_unorm => "c.WGPUTextureFormat_BGRA8Unorm",
-            .bgra8_unorm_srgb => "c.WGPUTextureFormat_BGRA8UnormSrgb",
-            .rgb10a2_uint => "c.WGPUTextureFormat_RGB10A2Uint",
-            .rgb10a2_unorm => "c.WGPUTextureFormat_RGB10A2Unorm",
-            .rg11b10_ufloat => "c.WGPUTextureFormat_RG11B10Ufloat",
-            .rgb9e5_ufloat => "c.WGPUTextureFormat_RGB9E5Ufloat",
-            .rg32_float => "c.WGPUTextureFormat_RG32Float",
-            .rg32_uint => "c.WGPUTextureFormat_RG32Uint",
-            .rg32_sint => "c.WGPUTextureFormat_RG32Sint",
-            .rgba16_unorm => "c.WGPUTextureFormat_RGBA16Unorm",
-            .rgba16_snorm => "c.WGPUTextureFormat_RGBA16Snorm",
-            .rgba16_uint => "c.WGPUTextureFormat_RGBA16Uint",
-            .rgba16_sint => "c.WGPUTextureFormat_RGBA16Sint",
-            .rgba16_float => "c.WGPUTextureFormat_RGBA16Float",
-            .rgba32_float => "c.WGPUTextureFormat_RGBA32Float",
-            .rgba32_uint => "c.WGPUTextureFormat_RGBA32Uint",
-            .rgba32_sint => "c.WGPUTextureFormat_RGBA32Sint",
-            .stencil8 => "c.WGPUTextureFormat_Stencil8",
-            .depth16_unorm => "c.WGPUTextureFormat_Depth16Unorm",
-            .depth24_plus => "c.WGPUTextureFormat_Depth24Plus",
-            .depth24_plus_stencil8 => "c.WGPUTextureFormat_Depth24PlusStencil8",
-            .depth32_float => "c.WGPUTextureFormat_Depth32Float",
-            .depth32_float_stencil8 => "c.WGPUTextureFormat_Depth32FloatStencil8",
-            .bc1_rgba_unorm => "c.WGPUTextureFormat_BC1RGBAUnorm",
-            .bc1_rgba_unorm_srgb => "c.WGPUTextureFormat_BC1RGBAUnormSrgb",
-            .bc2_rgba_unorm => "c.WGPUTextureFormat_BC2RGBAUnorm",
-            .bc2_rgba_unorm_srgb => "c.WGPUTextureFormat_BC2RGBAUnormSrgb",
-            .bc3_rgba_unorm => "c.WGPUTextureFormat_BC3RGBAUnorm",
-            .bc3_rgba_unorm_srgb => "c.WGPUTextureFormat_BC3RGBAUnormSrgb",
-            .bc4_r_unorm => "c.WGPUTextureFormat_BC4RUnorm",
-            .bc4_r_snorm => "c.WGPUTextureFormat_BC4RSnorm",
-            .bc5_rg_unorm => "c.WGPUTextureFormat_BC5RGUnorm",
-            .bc5_rg_snorm => "c.WGPUTextureFormat_BC5RGSnorm",
-            .bc6h_rgb_ufloat => "c.WGPUTextureFormat_BC6HRGBUfloat",
-            .bc6h_rgb_float => "c.WGPUTextureFormat_BC6HRGBFloat",
-            .bc7_rgba_unorm => "c.WGPUTextureFormat_BC7RGBAUnorm",
-            .bc7_rgba_unorm_srgb => "c.WGPUTextureFormat_BC7RGBAUnormSrgb",
-            .etc2_rgb8_unorm => "c.WGPUTextureFormat_ETC2RGB8Unorm",
-            .etc2_rgb8_unorm_srgb => "c.WGPUTextureFormat_ETC2RGB8UnormSrgb",
-            .etc2_rgb8a1_unorm => "c.WGPUTextureFormat_ETC2RGB8A1Unorm",
-            .etc2_rgb8a1_unorm_srgb => "c.WGPUTextureFormat_ETC2RGB8A1UnormSrgb",
-            .etc2_rgba8_unorm => "c.WGPUTextureFormat_ETC2RGBA8Unorm",
-            .etc2_rgba8_unorm_srgb => "c.WGPUTextureFormat_ETC2RGBA8UnormSrgb",
-            .eac_r11_unorm => "c.WGPUTextureFormat_EACR11Unorm",
-            .eac_r11_snorm => "c.WGPUTextureFormat_EACR11Snorm",
-            .eac_rg11_unorm => "c.WGPUTextureFormat_EACRG11Unorm",
-            .eac_rg11_snorm => "c.WGPUTextureFormat_EACRG11Snorm",
-            .astc4x4_unorm => "c.WGPUTextureFormat_ASTC4x4Unorm",
-            .astc4x4_unorm_srgb => "c.WGPUTextureFormat_ASTC4x4UnormSrgb",
-            .astc5x4_unorm => "c.WGPUTextureFormat_ASTC5x4Unorm",
-            .astc5x4_unorm_srgb => "c.WGPUTextureFormat_ASTC5x4UnormSrgb",
-            .astc5x5_unorm => "c.WGPUTextureFormat_ASTC5x5Unorm",
-            .astc5x5_unorm_srgb => "c.WGPUTextureFormat_ASTC5x5UnormSrgb",
-            .astc6x5_unorm => "c.WGPUTextureFormat_ASTC6x5Unorm",
-            .astc6x5_unorm_srgb => "c.WGPUTextureFormat_ASTC6x5UnormSrgb",
-            .astc6x6_unorm => "c.WGPUTextureFormat_ASTC6x6Unorm",
-            .astc6x6_unorm_srgb => "c.WGPUTextureFormat_ASTC6x6UnormSrgb",
-            .astc8x5_unorm => "c.WGPUTextureFormat_ASTC8x5Unorm",
-            .astc8x5_unorm_srgb => "c.WGPUTextureFormat_ASTC8x5UnormSrgb",
-            .astc8x6_unorm => "c.WGPUTextureFormat_ASTC8x6Unorm",
-            .astc8x6_unorm_srgb => "c.WGPUTextureFormat_ASTC8x6UnormSrgb",
-            .astc8x8_unorm => "c.WGPUTextureFormat_ASTC8x8Unorm",
-            .astc8x8_unorm_srgb => "c.WGPUTextureFormat_ASTC8x8UnormSrgb",
-            .astc10x5_unorm => "c.WGPUTextureFormat_ASTC10x5Unorm",
-            .astc10x5_unorm_srgb => "c.WGPUTextureFormat_ASTC10x5UnormSrgb",
-            .astc10x6_unorm => "c.WGPUTextureFormat_ASTC10x6Unorm",
-            .astc10x6_unorm_srgb => "c.WGPUTextureFormat_ASTC10x6UnormSrgb",
-            .astc10x8_unorm => "c.WGPUTextureFormat_ASTC10x8Unorm",
-            .astc10x8_unorm_srgb => "c.WGPUTextureFormat_ASTC10x8UnormSrgb",
-            .astc10x10_unorm => "c.WGPUTextureFormat_ASTC10x10Unorm",
-            .astc10x10_unorm_srgb => "c.WGPUTextureFormat_ASTC10x10UnormSrgb",
-            .astc12x10_unorm => "c.WGPUTextureFormat_ASTC12x10Unorm",
-            .astc12x10_unorm_srgb => "c.WGPUTextureFormat_ASTC12x10UnormSrgb",
-            .astc12x12_unorm => "c.WGPUTextureFormat_ASTC12x12Unorm",
-            .astc12x12_unorm_srgb => "c.WGPUTextureFormat_ASTC12x12UnormSrgb",
-            .r8bg8_biplanar420_unorm => "c.WGPUTextureFormat_R8BG8Biplanar420Unorm",
-            .r10x6bg10x6_biplanar420_unorm => "c.WGPUTextureFormat_R10X6BG10X6Biplanar420Unorm",
-            .r8bg8a8_triplanar420_unorm => "c.WGPUTextureFormat_R8BG8A8Triplanar420Unorm",
-            .r8bg8_biplanar422_unorm => "c.WGPUTextureFormat_R8BG8Biplanar422Unorm",
-            .r8bg8_biplanar444_unorm => "c.WGPUTextureFormat_R8BG8Biplanar444Unorm",
-            .r10x6bg10x6_biplanar422_unorm => "c.WGPUTextureFormat_R10X6BG10X6Biplanar422Unorm",
-            .r10x6bg10x6_biplanar444_unorm => "c.WGPUTextureFormat_R10X6BG10X6Biplanar444Unorm",
-            .external => "c.WGPUTextureFormat_External",
-        };
-    }
 };
-
-// // ── sampled textures: dimension (→ ViewDimension), all sample as float ──
-// @group(0) @binding(0)  var t_1d:        texture_1d<f32>;              // sampled_texture{ dim=1d,        sample=float, ms=false }
-// @group(0) @binding(1)  var t_2d:        texture_2d<f32>;              // sampled_texture{ dim=2d,        sample=float, ms=false }
-// @group(0) @binding(2)  var t_2d_arr:    texture_2d_array<f32>;       // sampled_texture{ dim=2d_array,  sample=float, ms=false }
-// @group(0) @binding(3)  var t_3d:        texture_3d<f32>;             // sampled_texture{ dim=3d,         sample=float, ms=false }
-// @group(0) @binding(4)  var t_cube:      texture_cube<f32>;           // sampled_texture{ dim=cube,       sample=float, ms=false }
-// @group(0) @binding(5)  var t_cube_arr:  texture_cube_array<f32>;     // sampled_texture{ dim=cube_array, sample=float, ms=false }
-// @group(0) @binding(6)  var t_ms:        texture_multisampled_2d<f32>;// sampled_texture{ dim=2d,         sample=float, ms=TRUE  }
-//
-// // ── sampled textures: component type (→ SampleType) ──
-// @group(0) @binding(7)  var t_float:     texture_2d<f32>;             // sample=float   (also: unfilterable_float, but not reflectable)
-// @group(0) @binding(8)  var t_sint:      texture_2d<i32>;             // sample=sint
-// @group(0) @binding(9)  var t_uint:      texture_2d<u32>;             // sample=uint
-//
-// // ── depth textures (no <…>; sample is always depth) ──
-// @group(0) @binding(10) var d_2d:        texture_depth_2d;            // sampled_texture{ dim=2d,        sample=depth, ms=false }
-// @group(0) @binding(11) var d_2d_arr:    texture_depth_2d_array;      // sampled_texture{ dim=2d_array,  sample=depth, ms=false }
-// @group(0) @binding(12) var d_cube:      texture_depth_cube;          // sampled_texture{ dim=cube,      sample=depth, ms=false }
-// @group(0) @binding(13) var d_cube_arr:  texture_depth_cube_array;    // sampled_texture{ dim=cube_array,sample=depth, ms=false }
-// @group(0) @binding(14) var d_ms:        texture_depth_multisampled_2d;// sampled_texture{ dim=2d,       sample=depth, ms=TRUE  }
-//
-// // ── storage textures: <format, access> — the part your parser currently drops ──
-// @group(0) @binding(15) var s_1d:        texture_storage_1d<rgba8unorm, write>;        // storage_texture{ dim=1d,       format=rgba8_unorm, access=write }
-// @group(0) @binding(16) var s_2d:        texture_storage_2d<rgba8unorm, write>;        // storage_texture{ dim=2d,       format=rgba8_unorm, access=write }
-// @group(0) @binding(17) var s_2d_arr:    texture_storage_2d_array<r32float, read>;     // storage_texture{ dim=2d_array, format=r32_float,  access=read }
-// @group(0) @binding(18) var s_3d:        texture_storage_3d<rgba16float, read_write>;  // storage_texture{ dim=3d,       format=rgba16_float,access=read_write }
-//
-// // ── external texture (no <…>, no sub-info) ──
-// @group(0) @binding(19) var ext:         texture_external;            // external_texture
-//
-// // ── samplers (the type name carries filtering vs comparison) ──
-// @group(0) @binding(20) var samp:        sampler;                     // sampler{ filtering }   (non-filtering not reflectable)
-// @group(0) @binding(21) var samp_cmp:    sampler_comparison;          // sampler{ comparison }
