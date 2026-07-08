@@ -744,9 +744,9 @@ pub const BindingResourceTypes = enum {
 
 pub const BindingType = union(BindingResourceTypes) {
     buffer: BufferBindingInfo,
+    sampler: SamplerBT,
     texture: TextureBindingInfo,
     storage_texture: StorageTextureBindingInfo,
-    sampler: SamplerBT,
 
     const BufferBT = enum(c.WGPUBufferBindingType) {
         uniform = c.WGPUBufferBindingType_Uniform,
