@@ -157,25 +157,19 @@ const HandleType = union(enum) {
 
 const AddressSpace = enum { uniform, storage, handle };
 
-fn alignOf(arena: std.mem.Allocator, data_type: DataType, space: AddressSpace, struct_map: StructMap, struct_layout_map: *StructLayoutMap) !?u32 {
+fn alignOf(arena: std.mem.Allocator, data_type: DataType, layout_ctx: LayoutCtx) !?u32 {
     return switch (data_type) {
         .scalar => 4,
         .vec => |v| if (v.size == 2) 8 else 16,
         .mat => |m| if (m.rows == 2) 8 else 16,
-        .array => |arr| switch (space) {
+        .array => |arr| switch (layout_ctx.space) {
             .uniform => 16,
-            .storage => (try alignOf(arena, arr.type.*, space, struct_map, struct_layout_map)).?,
+            .storage => (try alignOf(arena, arr.type.*, layout_ctx)).?,
             .handle => null,
         },
-        .struct_ref => |s| switch (space) {
+        .struct_ref => |s| switch (layout_ctx.space) {
             .uniform => 16,
-            .storage => (try getStructProperties(
-                arena,
-                s,
-                space,
-                struct_map,
-                struct_layout_map,
-            )).alignment,
+            .storage => (try getStructProperties(arena, s, layout_ctx)).alignment,
             .handle => null,
         },
     };
@@ -199,22 +193,16 @@ const StructLayout = struct {
     padding_after: ?u32 = null,
 };
 
-fn sizeOf(arena: std.mem.Allocator, data_type: DataType, space: AddressSpace, struct_map: StructMap, struct_layout_map: *StructLayoutMap) !?u32 {
+fn sizeOf(arena: std.mem.Allocator, data_type: DataType, layout_ctx: LayoutCtx) !?u32 {
     return switch (data_type) {
         .scalar => 4,
         .vec => |v| v.size * 4,
         .mat => |m| m.rows * m.cols * 4,
         .array => |arr| if (arr.max_size) |max_size| @max(
-            (try alignOf(arena, arr.type.*, space, struct_map, struct_layout_map)).?,
-            (try sizeOf(arena, arr.type.*, space, struct_map, struct_layout_map)).?,
+            (try alignOf(arena, arr.type.*, layout_ctx)).?,
+            (try sizeOf(arena, arr.type.*, layout_ctx)).?,
         ) * max_size else null,
-        .struct_ref => |s| switch ((try getStructProperties(
-            arena,
-            s,
-            space,
-            struct_map,
-            struct_layout_map,
-        )).size) {
+        .struct_ref => |s| switch ((try getStructProperties(arena, s, layout_ctx)).size) {
             .fixed => |f| f,
             .runtime => null,
         },
@@ -548,7 +536,7 @@ fn parseWGSLDataType(arena: std.mem.Allocator, src: []const u8, type_node: c.TSN
         if (par_count == 2) {
             const elem_count_node = c.ts_node_named_child(template_list, 1);
             const count_inner = findDescendant(elem_count_node, "decimal_int_literal") orelse return null;
-            max_size = try std.fmt.parseInt(u8, nodeText(src, count_inner), 0);
+            max_size = try std.fmt.parseInt(u32, nodeText(src, count_inner), 0);
         }
 
         return .{
@@ -780,21 +768,19 @@ pub fn getEntryFunctions(
 pub fn getStructProperties(
     arena: std.mem.Allocator,
     struct_ref: []const u8,
-    space: AddressSpace,
-    struct_map: StructMap,
-    struct_layout_map: *StructLayoutMap,
+    layout_ctx: LayoutCtx,
 ) error{OutOfMemory}!StructLayout {
-    if (struct_layout_map.get(struct_ref)) |layout| return layout;
+    if (layout_ctx.struct_layout_map.get(struct_ref)) |layout| return layout;
 
-    const struct_fields = struct_map.get(struct_ref).?;
+    const struct_fields = layout_ctx.struct_map.get(struct_ref).?;
     var struct_layout_entries: StructLayoutEntries = .empty;
     var offset: u32 = 0;
     var max_alignment: u32 = 0;
     for (struct_fields.items) |field| {
         switch (field.type) {
             .struct_ref => |ref| {
-                const l = try getStructProperties(arena, ref, space, struct_map, struct_layout_map);
-                try struct_layout_map.put(arena, ref, l);
+                const l = try getStructProperties(arena, ref, layout_ctx);
+                try layout_ctx.struct_layout_map.put(arena, ref, l);
             },
             .array => |arr| {
                 var inner_type: DataType = arr.type.*;
@@ -802,8 +788,8 @@ pub fn getStructProperties(
                     inner_type = inner_type.array.type.*;
                 }
                 if (inner_type == .struct_ref) {
-                    const l = try getStructProperties(arena, arr.type.struct_ref, space, struct_map, struct_layout_map);
-                    try struct_layout_map.put(arena, arr.type.struct_ref, l);
+                    const l = try getStructProperties(arena, arr.type.struct_ref, layout_ctx);
+                    try layout_ctx.struct_layout_map.put(arena, arr.type.struct_ref, l);
                 }
             },
             else => {},
@@ -811,9 +797,7 @@ pub fn getStructProperties(
         const alignment = (try alignOf(
             arena,
             field.type,
-            space,
-            struct_map,
-            struct_layout_map,
+            layout_ctx,
         )).?;
         max_alignment = @max(max_alignment, alignment);
         const address: u32 = @intCast(std.mem.alignForward(usize, offset, alignment));
@@ -821,7 +805,7 @@ pub fn getStructProperties(
         if (field.type == .array and field.type.array.max_size == null) {
             const base = address;
             const array_stride = @max(
-                (try sizeOf(arena, field.type.array.type.*, .storage, struct_map, struct_layout_map)).?,
+                (try sizeOf(arena, field.type.array.type.*, layout_ctx)).?,
                 alignment,
             );
             try struct_layout_entries.append(arena, .{
@@ -842,18 +826,12 @@ pub fn getStructProperties(
             .padding_before = padding,
             .name = field.name,
         });
-        offset = address + (try sizeOf(arena, field.type, space, struct_map, struct_layout_map)).?;
+        offset = address + (try sizeOf(arena, field.type, layout_ctx)).?;
     }
     const size: u32 = @intCast(std.mem.alignForward(usize, offset, max_alignment));
     const last_field_layout = struct_layout_entries.items[struct_layout_entries.items.len - 1];
     const last_field_decl = struct_fields.items[struct_fields.items.len - 1];
-    const padding_after = size - (last_field_layout.offset + (try sizeOf(
-        arena,
-        last_field_decl.type,
-        space,
-        struct_map,
-        struct_layout_map,
-    )).?);
+    const padding_after = size - (last_field_layout.offset + (try sizeOf(arena, last_field_decl.type, layout_ctx)).?);
     return .{
         .alignment = max_alignment,
         .size = .{ .fixed = size },
@@ -953,6 +931,8 @@ pub fn main() !void {
     const cwd = std.Io.Dir.cwd();
 
     const parser = c.ts_parser_new();
+    defer c.ts_parser_delete(parser);
+
     _ = c.ts_parser_set_language(parser, tree_sitter_wgsl());
     const src = try cwd.readFileAlloc(
         io,
@@ -992,45 +972,25 @@ pub fn main() !void {
     var struct_layout_map: StructLayoutMap = .empty;
     std.debug.print("=== STRUCT LAYOUTS ===\n", .{});
     for (bindings.items) |b| {
+        const buf_type = switch (b.resource) {
+            .uniform_buffer => |ub| ub.type,
+            .storage_buffer => |ub| ub.type,
+            else => continue,
+        };
+        if (buf_type != .struct_ref) continue;
         const space: AddressSpace = switch (b.resource) {
             .uniform_buffer => .uniform,
             .storage_buffer => .storage,
             else => continue,
         };
-        var layout_ctx: LayoutCtx = .{
+        const layout_ctx: LayoutCtx = .{
             .space = space,
             .struct_map = &struct_map,
             .struct_layout_map = &struct_layout_map,
         };
-        switch (b.resource) {
-            .uniform_buffer => |ub| {
-                if (ub.type == .struct_ref) {
-                    const ref = ub.type.struct_ref;
-                    const layout = try getStructProperties(
-                        allocator,
-                        ref,
-                        .uniform,
-                        struct_map,
-                        &struct_layout_map,
-                    );
-                    try struct_layout_map.put(allocator, ref, layout);
-                }
-            },
-            .storage_buffer => |sb| {
-                if (sb.type == .struct_ref) {
-                    const ref = sb.type.struct_ref;
-                    const layout = try getStructProperties(
-                        allocator,
-                        ref,
-                        .uniform,
-                        struct_map,
-                        &struct_layout_map,
-                    );
-                    try struct_layout_map.put(allocator, ref, layout);
-                }
-            },
-            else => {},
-        }
+        const ref = buf_type.struct_ref;
+        const layout = try getStructProperties(allocator, ref, layout_ctx);
+        try struct_layout_map.put(allocator, ref, layout);
     }
 
     std.mem.sort(Binding, bindings.items, {}, sortByGroup);
@@ -1086,13 +1046,11 @@ pub fn main() !void {
                 },
                 else => try w.print(".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},", .{
                     if (sb.access == .read) ".read_only_storage" else ".storage",
-                    if (try sizeOf(
-                        allocator,
-                        sb.type,
-                        .storage,
-                        struct_map,
-                        &struct_layout_map,
-                    )) |size| size else 0,
+                    if (try sizeOf(allocator, sb.type, .{
+                        .space = .storage,
+                        .struct_map = &struct_map,
+                        .struct_layout_map = &struct_layout_map,
+                    })) |size| size else 0,
                 }),
             },
             .sampler => |smp| {
@@ -1132,6 +1090,12 @@ pub fn main() !void {
         const resource = binding.resource;
         if (resource == .uniform_buffer or resource == .storage_buffer) {
             const bind_type = if (resource == .uniform_buffer) resource.uniform_buffer.type else resource.storage_buffer.type;
+
+            const layout_ctx: LayoutCtx = .{
+                .space = .storage,
+                .struct_map = &struct_map,
+                .struct_layout_map = &struct_layout_map,
+            };
             switch (bind_type) {
                 .struct_ref => |ref| {
                     try printStructCode(allocator, ref, struct_map, struct_layout_map, w);
@@ -1139,14 +1103,8 @@ pub fn main() !void {
                 .array => |arr| {
                     if (arr.max_size == null) {
                         const array_stride = @max(
-                            (try alignOf(
-                                allocator,
-                                arr.type.*,
-                                .storage,
-                                struct_map,
-                                &struct_layout_map,
-                            )).?,
-                            (try sizeOf(allocator, arr.type.*, .storage, struct_map, &struct_layout_map)).?,
+                            (try alignOf(allocator, arr.type.*, layout_ctx)).?,
+                            (try sizeOf(allocator, arr.type.*, layout_ctx)).?,
                         );
                         try w.print(
                             "pub const {s}_STRIDE: u32 = {any};\n\n",
