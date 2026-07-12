@@ -204,7 +204,8 @@ pub const ShaderManager = struct {
         pub fn getBindingType(resource_type: []const u8) !gpu.BindingType {
             const map = std.StaticStringMap(gpu.BindingType).initComptime(.{
                 .{
-                    "UniformBuffer", gpu.BindingType{
+                    "UniformBuffer",
+                    gpu.BindingType{
                         .buffer = .uniform,
                     },
                 },

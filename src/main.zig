@@ -2,13 +2,30 @@ const std = @import("std");
 const gpu = @import("gpu.zig");
 const gs = @import("gpu-system.zig");
 const build_options = @import("build_options");
+const builtin = @import("builtin");
 const c = gpu.c;
 const Renderer = @import("renderer.zig");
+const Shader = @import("shaders/compiled/2DVertexColors.zig");
+
+// Triangle in clip space. Per vertex: position (x, y) + color (r, g, b),
+// matching the 2DVertexColors vertex layout (f32x2 @ offset 0, f32x3 @ offset 8).
+const vertices = [_]f32{
+    // x     y       r    g    b
+    0.0, 0.5, 1.0, 0.0, 0.0, // top    - red
+    -0.5, -0.5, 0.0, 1.0, 0.0, // left   - green
+    0.5, -0.5, 0.0, 0.0, 1.0, // right  - blue
+};
 
 pub fn main() !void {
-    // get allocator
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+    var debug_allocator = std.heap.DebugAllocator(.{}){};
+    const allocator = switch (builtin.mode) {
+        .Debug => debug_allocator.allocator(),
+        else => std.heap.smp_allocator,
+    };
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // Initialize SDL
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
@@ -35,10 +52,14 @@ pub fn main() !void {
     var height: i32 = 0;
     _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
 
-    // var instance = try gpu.GPUInstance.init();
-    // const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
+    const instance = try gpu.GPUInstance.init();
+    const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
 
-    const renderer = Renderer.initOwning(allocator, window);
+    const gpu_context = try gpu.GPUContext.initSync(io, instance.webgpu_instance, surface);
+    var target_surface = gpu.Surface.init(surface, gpu_context.adapter);
+    target_surface.configure(gpu_context.device, @intCast(width), @intCast(height));
+
+    // const renderer = Renderer.initOwning(allocator, window);
 
     const vertex_buffer = try gpu.createBuffer(
         gpu_context.device,
@@ -48,32 +69,35 @@ pub fn main() !void {
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
-    var uniform = [_]f32{0};
-    const uniform_byte_size = @sizeOf(f32) * 1;
+    var uniform: Shader.Uniforms = .{ .time = 0 };
+
     const uniform_buffer = try gpu.createBuffer(
         gpu_context.device,
         gpu_context.queue,
-        std.mem.sliceAsBytes(&uniform),
+        std.mem.asBytes(&uniform),
         "uniform",
         gpu.BufferUsage.uniform | gpu.BufferUsage.copy_dst,
     );
 
-    // ── Resolve bind group layouts from shader metadata ───────────────────────
+    // get bg layouts
 
-    var bg_layout_buf: [gs.MAX_BIND_GROUP_COUNT]c.WGPUBindGroupLayout = undefined;
-    var bg_layouts: ?[]const c.WGPUBindGroupLayout = null;
-    if (shader.metadata.bind_group_layouts) |bgs| {
-        for (bgs, 0..) |entries, i| {
-            bg_layout_buf[i] = try bind_group_layout_cache.getOrCreateBindGroupLayout(allocator, entries);
-        }
-        bg_layouts = bg_layout_buf[0..bgs.len];
-    }
+    const bg_layouts = try gpu.createBindGroupLayouts(
+        allocator,
+        gpu_context,
+        Shader.layouts.?,
+    );
+
+    // Get Shader
+
+    const shader_src = @embedFile("shaders/2DVertexColors.wgsl");
+    const shader_module = try gpu.createShader(gpu_context, shader_src, "vert color");
 
     // Create pipeline
 
-    const pipeline_desc: gs.PipelineDescriptor = .{
-        .shader_module = shader.module,
+    const pipeline_desc: gpu.PipelineDescriptor = .{
         .depth_stencil = null,
+        .shader_module = shader_module,
+        .color_format = target_surface.format,
         .vertex_layouts = &.{
             .{
                 .step_mode = .vertex,
@@ -94,16 +118,30 @@ pub fn main() !void {
         },
     };
 
-    const pipeline_entry = try pipelines.getOrCreatePipeline(
+    const pipeline = try gpu.createPipeline(
         allocator,
+        gpu_context,
         "2d pipeline",
         pipeline_desc,
-        shader.metadata.vertex_entry,
-        shader.metadata.fragment_entry,
+        Shader.VS,
+        Shader.FS,
         bg_layouts,
     );
 
-    const start_time = std.time.milliTimestamp();
+    const bind_group = try gpu.createBindGroup(allocator, gpu_context, .{
+        .layout = bg_layouts[0],
+        .entries = &.{.{
+            .binding = 0,
+            .resource = .{
+                .buffer = .{
+                    .buffer = uniform_buffer,
+                    .size = @sizeOf(Shader.Uniforms),
+                },
+            },
+        }},
+    });
+
+    const start_time = std.Io.Clock.real.now(io).toMilliseconds();
 
     var running = true;
     while (running) {
@@ -114,45 +152,47 @@ pub fn main() !void {
             }
         }
 
-        uniform[0] = @as(f32, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
-        const slice = std.mem.sliceAsBytes(&uniform);
+        uniform.time = @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0;
+        const slice: []const u8 = std.mem.asBytes(&uniform);
         c.wgpuQueueWriteBuffer(gpu_context.queue, uniform_buffer, 0, slice.ptr, slice.len);
 
-        var frame = try gpu.Frame.init(&gpu_context, &surface);
-        defer frame.deinit();
+        const view = try gpu.getNextSurfaceView(surface); // stateless helper, keep it
+        defer c.wgpuTextureViewRelease(view);
 
-        var pass = gs.RenderPass.init(
-            frame.encoder,
-            frame.target_view,
-            &bind_group_layout_cache,
-            &bind_group_cache,
-            &shaders,
-            .{
-                .color_attachment = .{
-                    .clear_value = .{ .a = 1.0, .r = 0.1, .g = 0.1, .b = 0.1 },
-                },
-            },
-        );
-        defer pass.deinit();
+        var enc_desc = gpu.z_WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT();
+        enc_desc.label = gpu.toWGPUString("frame encoder");
+        const encoder = c.wgpuDeviceCreateCommandEncoder(gpu_context.device, &enc_desc);
+        defer c.wgpuCommandEncoderRelease(encoder);
 
-        pass.setPipeline(pipeline_entry.pipeline);
-        pass.setVertexBuffer(0, vertex_buffer, 0, @sizeOf(f32) * vertices.len);
-        try pass.bindGroup(allocator, 0, shader_handle, &.{
-            .{
-                .binding = 0,
-                .resource = .{ .buffer = .{
-                    .buffer = uniform_buffer,
-                    .size = uniform_byte_size,
-                } },
-            },
-        });
-        pass.draw(3, 1, 0, 0);
-        pass.end();
+        var color = gpu.z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
+        color.view = view;
+        color.loadOp = c.WGPULoadOp_Clear;
+        color.storeOp = c.WGPUStoreOp_Store;
+        color.clearValue = .{ .r = 0.1, .g = 0.1, .b = 0.1, .a = 1.0 };
 
-        const render_commands = frame.end();
-        gpu_context.submitCommands(&.{render_commands});
-        try surface.present();
+        var rp_desc = gpu.z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
+        rp_desc.label = gpu.toWGPUString("main pass");
+        rp_desc.colorAttachmentCount = 1;
+        rp_desc.colorAttachments = &color; // &color must outlive BeginRenderPass (it copies) — fine, same scope
 
-        std.Thread.sleep(1_000_000);
+        const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &rp_desc);
+
+        c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+        c.wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, 0, null);
+        c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertex_buffer, 0, @sizeOf(@TypeOf(vertices)));
+        c.wgpuRenderPassEncoderDraw(pass, vertices.len / 5, 1, 0, 0);
+
+        c.wgpuRenderPassEncoderEnd(pass);
+        c.wgpuRenderPassEncoderRelease(pass);
+
+        var cmd_desc = gpu.z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
+        cmd_desc.label = gpu.toWGPUString("frame commands");
+        const cmd = c.wgpuCommandEncoderFinish(encoder, &cmd_desc);
+        c.wgpuQueueSubmit(gpu_context.queue, 1, &cmd);
+        c.wgpuCommandBufferRelease(cmd);
+
+        _ = c.wgpuSurfacePresent(surface);
+
+        try io.sleep(.fromMilliseconds(16), .awake);
     }
 }

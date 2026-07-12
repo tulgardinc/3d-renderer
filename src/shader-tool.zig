@@ -157,20 +157,37 @@ const HandleType = union(enum) {
 
 const AddressSpace = enum { uniform, storage, handle };
 
-fn alignOf(arena: std.mem.Allocator, data_type: DataType, layout_ctx: LayoutCtx) !?u32 {
+// invariant for alignof and sizeof: the layout of the struct must have been previously calcualted
+fn alignOf(data_type: DataType, space: AddressSpace, struct_layout_map: StructLayoutMap) ?u32 {
     return switch (data_type) {
         .scalar => 4,
         .vec => |v| if (v.size == 2) 8 else 16,
         .mat => |m| if (m.rows == 2) 8 else 16,
-        .array => |arr| switch (layout_ctx.space) {
+        .array => |arr| switch (space) {
             .uniform => 16,
-            .storage => (try alignOf(arena, arr.type.*, layout_ctx)).?,
+            .storage => alignOf(arr.type.*, space, struct_layout_map).?,
             .handle => null,
         },
-        .struct_ref => |s| switch (layout_ctx.space) {
+        .struct_ref => |s| switch (space) {
             .uniform => 16,
-            .storage => (try getStructProperties(arena, s, layout_ctx)).alignment,
+            .storage => struct_layout_map.get(s).?.alignment,
             .handle => null,
+        },
+    };
+}
+
+fn sizeOf(data_type: DataType, space: AddressSpace, struct_layout_map: StructLayoutMap) ?u32 {
+    return switch (data_type) {
+        .scalar => 4,
+        .vec => |v| v.size * 4,
+        .mat => |m| m.rows * m.cols * 4,
+        .array => |arr| if (arr.max_size) |max_size| @max(
+            alignOf(arr.type.*, space, struct_layout_map).?,
+            sizeOf(arr.type.*, space, struct_layout_map).?,
+        ) * max_size else null,
+        .struct_ref => |s| switch (struct_layout_map.get(s).?.size) {
+            .fixed => |f| f,
+            .runtime => null,
         },
     };
 }
@@ -192,22 +209,6 @@ const StructLayout = struct {
     fields: StructLayoutEntries,
     padding_after: ?u32 = null,
 };
-
-fn sizeOf(arena: std.mem.Allocator, data_type: DataType, layout_ctx: LayoutCtx) !?u32 {
-    return switch (data_type) {
-        .scalar => 4,
-        .vec => |v| v.size * 4,
-        .mat => |m| m.rows * m.cols * 4,
-        .array => |arr| if (arr.max_size) |max_size| @max(
-            (try alignOf(arena, arr.type.*, layout_ctx)).?,
-            (try sizeOf(arena, arr.type.*, layout_ctx)).?,
-        ) * max_size else null,
-        .struct_ref => |s| switch ((try getStructProperties(arena, s, layout_ctx)).size) {
-            .fixed => |f| f,
-            .runtime => null,
-        },
-    };
-}
 
 const VarWithAttributes = struct {
     name: []const u8,
@@ -294,9 +295,9 @@ fn nodeText(src: []const u8, node: c.TSNode) []const u8 {
 }
 
 fn findChild(node: c.TSNode, node_type: []const u8) ?c.TSNode {
-    const count = c.ts_node_child_count(node);
+    const count = c.ts_node_named_child_count(node);
     for (0..count) |i| {
-        const child = c.ts_node_child(node, @intCast(i));
+        const child = c.ts_node_named_child(node, @intCast(i));
         if (std.mem.eql(u8, std.mem.span(c.ts_node_type(child)), node_type))
             return child;
     }
@@ -768,19 +769,21 @@ pub fn getEntryFunctions(
 pub fn getStructProperties(
     arena: std.mem.Allocator,
     struct_ref: []const u8,
-    layout_ctx: LayoutCtx,
+    space: AddressSpace,
+    struct_map: StructMap,
+    struct_layout_map: *StructLayoutMap,
 ) error{OutOfMemory}!StructLayout {
-    if (layout_ctx.struct_layout_map.get(struct_ref)) |layout| return layout;
+    if (struct_layout_map.get(struct_ref)) |layout| return layout;
 
-    const struct_fields = layout_ctx.struct_map.get(struct_ref).?;
+    const struct_fields = struct_map.get(struct_ref).?;
     var struct_layout_entries: StructLayoutEntries = .empty;
     var offset: u32 = 0;
     var max_alignment: u32 = 0;
     for (struct_fields.items) |field| {
         switch (field.type) {
             .struct_ref => |ref| {
-                const l = try getStructProperties(arena, ref, layout_ctx);
-                try layout_ctx.struct_layout_map.put(arena, ref, l);
+                const l = try getStructProperties(arena, ref, space, struct_map, struct_layout_map);
+                try struct_layout_map.put(arena, ref, l);
             },
             .array => |arr| {
                 var inner_type: DataType = arr.type.*;
@@ -788,24 +791,20 @@ pub fn getStructProperties(
                     inner_type = inner_type.array.type.*;
                 }
                 if (inner_type == .struct_ref) {
-                    const l = try getStructProperties(arena, arr.type.struct_ref, layout_ctx);
-                    try layout_ctx.struct_layout_map.put(arena, arr.type.struct_ref, l);
+                    const l = try getStructProperties(arena, arr.type.struct_ref, space, struct_map, struct_layout_map);
+                    try struct_layout_map.put(arena, arr.type.struct_ref, l);
                 }
             },
             else => {},
         }
-        const alignment = (try alignOf(
-            arena,
-            field.type,
-            layout_ctx,
-        )).?;
+        const alignment = alignOf(field.type, space, struct_layout_map.*).?;
         max_alignment = @max(max_alignment, alignment);
         const address: u32 = @intCast(std.mem.alignForward(usize, offset, alignment));
         const padding = address - offset;
         if (field.type == .array and field.type.array.max_size == null) {
             const base = address;
             const array_stride = @max(
-                (try sizeOf(arena, field.type.array.type.*, layout_ctx)).?,
+                sizeOf(field.type.array.type.*, space, struct_layout_map.*).?,
                 alignment,
             );
             try struct_layout_entries.append(arena, .{
@@ -826,12 +825,12 @@ pub fn getStructProperties(
             .padding_before = padding,
             .name = field.name,
         });
-        offset = address + (try sizeOf(arena, field.type, layout_ctx)).?;
+        offset = address + sizeOf(field.type, space, struct_layout_map.*).?;
     }
     const size: u32 = @intCast(std.mem.alignForward(usize, offset, max_alignment));
     const last_field_layout = struct_layout_entries.items[struct_layout_entries.items.len - 1];
     const last_field_decl = struct_fields.items[struct_fields.items.len - 1];
-    const padding_after = size - (last_field_layout.offset + (try sizeOf(arena, last_field_decl.type, layout_ctx)).?);
+    const padding_after = size - (last_field_layout.offset + sizeOf(last_field_decl.type, space, struct_layout_map.*).?);
     return .{
         .alignment = max_alignment,
         .size = .{ .fixed = size },
@@ -910,13 +909,7 @@ pub fn printStructCode(
     try w.print("}};\n\n", .{});
 }
 
-const LayoutCtx = struct {
-    space: AddressSpace,
-    struct_map: *const StructMap,
-    struct_layout_map: *StructLayoutMap,
-};
-
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     // TODO: command line parameter inputs
     // TODO: try with real shaders
 
@@ -928,7 +921,17 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    const args = try init.args.toSlice(allocator);
+    if (args.len != 2) return error.WrongArgumentCount;
+    const path = args[1];
+    const file_name = std.fs.path.basename(path);
+    if (!std.mem.endsWith(u8, file_name, ".wgsl")) {
+        return error.WrongFileType;
+    }
+    const file_no_ext = file_name[0 .. file_name.len - 5];
+
     const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, "src/shaders/compiled");
 
     const parser = c.ts_parser_new();
     defer c.ts_parser_delete(parser);
@@ -936,7 +939,7 @@ pub fn main() !void {
     _ = c.ts_parser_set_language(parser, tree_sitter_wgsl());
     const src = try cwd.readFileAlloc(
         io,
-        "src/shaders/ForwardPBR.wgsl",
+        path,
         allocator,
         .unlimited,
     );
@@ -983,13 +986,14 @@ pub fn main() !void {
             .storage_buffer => .storage,
             else => continue,
         };
-        const layout_ctx: LayoutCtx = .{
-            .space = space,
-            .struct_map = &struct_map,
-            .struct_layout_map = &struct_layout_map,
-        };
         const ref = buf_type.struct_ref;
-        const layout = try getStructProperties(allocator, ref, layout_ctx);
+        const layout = try getStructProperties(
+            allocator,
+            ref,
+            space,
+            struct_map,
+            &struct_layout_map,
+        );
         try struct_layout_map.put(allocator, ref, layout);
     }
 
@@ -1002,100 +1006,102 @@ pub fn main() !void {
         break :blk "gpu.ShaderStage.vertex | gpu.ShaderStage.fragment";
     };
 
-    const write_path = "src/shaders/compiled.zig";
     var aw = std.Io.Writer.Allocating.init(allocator);
     const w = &aw.writer;
-    try w.print(
-        \\ const gpu = @import("../gpu.zig");
-        \\
-        \\ pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = &.{{
-        \\ &.{{
-    , .{});
+    try w.print("const gpu = @import(\"../../gpu.zig\");\n\n", .{});
 
-    var group: usize = 0;
-    for (bindings.items) |binding| {
-        if (binding.group != group) {
-            try w.print("}},\n", .{});
-            try w.print("&.{{", .{});
-            group = binding.group;
-        }
-        try w.print(
-            ".{{ .binding = {any}, .visibility = {s}, .type = ",
-            .{ binding.binding, visibility },
-        );
-        switch (binding.resource) {
-            .uniform_buffer => |ub| switch (ub.type) {
-                .struct_ref => |ref| try w.print(
-                    ".{{ .buffer = .{{.type = .uniform, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
-                    .{
-                        struct_layout_map.get(ref).?.size.fixed,
-                    },
-                ),
-                else => try w.print(".{{ .buffer = .{{.type = .uniform, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},", .{}),
-            },
-            .storage_buffer => |sb| switch (sb.type) {
-                .struct_ref => |ref| switch (struct_layout_map.get(ref).?.size) {
-                    .fixed => |f| try w.print(
-                        ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
-                        .{ if (sb.access == .read_write) ".storage" else ".read_only_storage", f },
-                    ),
-                    .runtime => try w.print(
-                        ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},",
-                        .{if (sb.access == .read_write) ".storage" else ".read_only_storage"},
-                    ),
-                },
-                else => try w.print(".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},", .{
-                    if (sb.access == .read) ".read_only_storage" else ".storage",
-                    if (try sizeOf(allocator, sb.type, .{
-                        .space = .storage,
-                        .struct_map = &struct_map,
-                        .struct_layout_map = &struct_layout_map,
-                    })) |size| size else 0,
-                }),
-            },
-            .sampler => |smp| {
-                const smp_type = if (smp == .sampler) ".filtering" else ".sampler_comparison";
-                try w.print(".{{ .sampler = {s} }} }},", .{smp_type});
-            },
-            .texture => |tex| switch (tex) {
-                .sampled_texture => |smp| {
-                    try w.print(
-                        ".{{ .texture = .{{ .sample_type = {s}, .view_dimension = {s}, .multi_sampled = {any}  }} }} }},",
-                        .{ smp.scalar.getSampleString(), smp.dim.getString(), smp.dim == .texture_multisampled_2d },
-                    );
-                },
-                .depth_texture => |depth| {
-                    try w.print(
-                        ".{{ .texture = .{{ .sample_type = {s}, .view_dimension = .depth, .multi_sampled = {any}  }} }} }},",
-                        .{ depth.getString(), depth == .texture_depth_multisampled_2d },
-                    );
-                },
-                .storage_texture => |strg| {
-                    try w.print(
-                        ".{{ .storage_texture = .{{ .view_dimension = {s}, .access = {s}, .format = .{s}  }} }} }},",
-                        .{
-                            strg.dim.getString(),
-                            strg.access.getString(),
-                            std.enums.tagName(TextureFormat, strg.format).?,
-                        },
-                    );
-                },
-                .external_texture => {},
-            },
-        }
+    for (entries.items) |item| {
+        const name = switch (item) {
+            inline else => |x| x.name,
+        };
+        const upper_name = try std.ascii.allocUpperString(allocator, name);
+        try w.print("pub const {s}: []const u8 = \"{s}\";\n", .{ upper_name, name });
     }
-    try w.print("}}, }};\n\n", .{});
+    try w.print("\n", .{});
+
+    if (bindings.items.len > 0) {
+        try w.print(
+            \\ pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = &.{{
+            \\ &.{{
+        , .{});
+
+        var group: usize = 0;
+        for (bindings.items) |binding| {
+            if (binding.group != group) {
+                try w.print("}},\n", .{});
+                try w.print("&.{{", .{});
+                group = binding.group;
+            }
+            try w.print(
+                ".{{ .binding = {any}, .visibility = {s}, .type = ",
+                .{ binding.binding, visibility },
+            );
+            switch (binding.resource) {
+                .uniform_buffer => |ub| switch (ub.type) {
+                    .struct_ref => |ref| try w.print(
+                        ".{{ .buffer = .{{.type = .uniform, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
+                        .{
+                            struct_layout_map.get(ref).?.size.fixed,
+                        },
+                    ),
+                    else => try w.print(".{{ .buffer = .{{.type = .uniform, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},", .{}),
+                },
+                .storage_buffer => |sb| switch (sb.type) {
+                    .struct_ref => |ref| switch (struct_layout_map.get(ref).?.size) {
+                        .fixed => |f| try w.print(
+                            ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
+                            .{ if (sb.access == .read_write) ".storage" else ".read_only_storage", f },
+                        ),
+                        .runtime => try w.print(
+                            ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},",
+                            .{if (sb.access == .read_write) ".storage" else ".read_only_storage"},
+                        ),
+                    },
+                    else => try w.print(".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},", .{
+                        if (sb.access == .read) ".read_only_storage" else ".storage",
+                        if (sizeOf(sb.type, .storage, struct_layout_map)) |size| size else 0,
+                    }),
+                },
+                .sampler => |smp| {
+                    const smp_type = if (smp == .sampler) ".filtering" else ".sampler_comparison";
+                    try w.print(".{{ .sampler = {s} }} }},", .{smp_type});
+                },
+                .texture => |tex| switch (tex) {
+                    .sampled_texture => |smp| {
+                        try w.print(
+                            ".{{ .texture = .{{ .sample_type = {s}, .view_dimension = {s}, .multi_sampled = {any}  }} }} }},",
+                            .{ smp.scalar.getSampleString(), smp.dim.getString(), smp.dim == .texture_multisampled_2d },
+                        );
+                    },
+                    .depth_texture => |depth| {
+                        try w.print(
+                            ".{{ .texture = .{{ .sample_type = {s}, .view_dimension = .depth, .multi_sampled = {any}  }} }} }},",
+                            .{ depth.getString(), depth == .texture_depth_multisampled_2d },
+                        );
+                    },
+                    .storage_texture => |strg| {
+                        try w.print(
+                            ".{{ .storage_texture = .{{ .view_dimension = {s}, .access = {s}, .format = .{s}  }} }} }},",
+                            .{
+                                strg.dim.getString(),
+                                strg.access.getString(),
+                                std.enums.tagName(TextureFormat, strg.format).?,
+                            },
+                        );
+                    },
+                    .external_texture => {},
+                },
+            }
+        }
+        try w.print("}}, }};\n\n", .{});
+    } else {
+        try w.print("pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = null;\n\n", .{});
+    }
 
     for (bindings.items) |binding| {
         const resource = binding.resource;
         if (resource == .uniform_buffer or resource == .storage_buffer) {
             const bind_type = if (resource == .uniform_buffer) resource.uniform_buffer.type else resource.storage_buffer.type;
-
-            const layout_ctx: LayoutCtx = .{
-                .space = .storage,
-                .struct_map = &struct_map,
-                .struct_layout_map = &struct_layout_map,
-            };
             switch (bind_type) {
                 .struct_ref => |ref| {
                     try printStructCode(allocator, ref, struct_map, struct_layout_map, w);
@@ -1103,8 +1109,8 @@ pub fn main() !void {
                 .array => |arr| {
                     if (arr.max_size == null) {
                         const array_stride = @max(
-                            (try alignOf(allocator, arr.type.*, layout_ctx)).?,
-                            (try sizeOf(allocator, arr.type.*, layout_ctx)).?,
+                            alignOf(arr.type.*, .storage, struct_layout_map).?,
+                            sizeOf(arr.type.*, .storage, struct_layout_map).?,
                         );
                         try w.print(
                             "pub const {s}_STRIDE: u32 = {any};\n\n",
@@ -1119,6 +1125,8 @@ pub fn main() !void {
             }
         }
     }
+
+    const write_path = try std.fmt.allocPrint(allocator, "src/shaders/compiled/{s}.zig", .{file_no_ext});
 
     try cwd.writeFile(io, .{
         .sub_path = write_path,

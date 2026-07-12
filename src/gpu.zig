@@ -79,7 +79,7 @@ pub fn getInstance() !c.WGPUInstance {
     };
 }
 
-pub fn requestAdapterSync(instance: c.WGPUInstance, surface: c.WGPUSurface) !c.WGPUAdapter {
+pub fn requestAdapterSync(io: std.Io, instance: c.WGPUInstance, surface: c.WGPUSurface) !c.WGPUAdapter {
     const CallbackData = struct {
         adapter: ?c.WGPUAdapter = null,
         done: bool = false,
@@ -119,7 +119,7 @@ pub fn requestAdapterSync(instance: c.WGPUInstance, surface: c.WGPUSurface) !c.W
     c.wgpuInstanceProcessEvents(instance);
 
     while (!cb_data.done) {
-        std.Thread.sleep(200);
+        try io.sleep(.fromMilliseconds(200), .awake);
         c.wgpuInstanceProcessEvents(instance);
     }
 
@@ -129,7 +129,7 @@ pub fn requestAdapterSync(instance: c.WGPUInstance, surface: c.WGPUSurface) !c.W
     };
 }
 
-pub fn requestDeviceSync(instance: c.WGPUInstance, adapter: c.WGPUAdapter) !c.WGPUDevice {
+pub fn requestDeviceSync(io: std.Io, instance: c.WGPUInstance, adapter: c.WGPUAdapter) !c.WGPUDevice {
     const CallbackData = struct {
         device: ?c.WGPUDevice = null,
         done: bool = false,
@@ -194,7 +194,7 @@ pub fn requestDeviceSync(instance: c.WGPUInstance, adapter: c.WGPUAdapter) !c.WG
     c.wgpuInstanceProcessEvents(instance);
 
     while (!cb_data.done) {
-        std.Thread.sleep(200);
+        try io.sleep(.fromMilliseconds(200), .awake);
         c.wgpuInstanceProcessEvents(instance);
     }
 
@@ -246,9 +246,9 @@ pub const GPUContext = struct {
 
     const Self = @This();
 
-    pub fn initSync(instance: c.WGPUInstance, surface: c.WGPUSurface) !Self {
-        const adapter = try requestAdapterSync(instance, surface);
-        const device = try requestDeviceSync(instance, adapter);
+    pub fn initSync(io: std.Io, instance: c.WGPUInstance, surface: c.WGPUSurface) !Self {
+        const adapter = try requestAdapterSync(io, instance, surface);
+        const device = try requestDeviceSync(io, instance, adapter);
         return .{
             .adapter = adapter,
             .device = device,
@@ -806,3 +806,348 @@ pub const BindGroupLayoutEntry = struct {
     // DO NOT CHANGE FOR NOW
     visibility: c.WGPUShaderStage = ShaderStage.fragment | ShaderStage.vertex,
 };
+
+pub const VertexBufferLayout = struct {
+    step_mode: StepMode,
+    array_stride: u64,
+    attributes: []const VertexAttribute,
+
+    const MAX_ATTRIBUTES = 16;
+
+    pub const VertexAttribute = struct {
+        format: VertexFormat = .u8,
+        offset: u64 = 0,
+        shader_location: u32 = 0,
+    };
+
+    pub const StepMode = enum(c.WGPUVertexStepMode) {
+        undefined = c.WGPUVertexStepMode_Undefined,
+        vertex = c.WGPUVertexStepMode_Vertex,
+        instance = c.WGPUVertexStepMode_Instance,
+    };
+};
+
+pub const StencilFaceState = struct {
+    compare: CompareFunction,
+    fail_op: StencilOperation,
+    depth_fail_op: StencilOperation,
+    pass_op: StencilOperation,
+};
+
+pub const DepthStencilState = struct {
+    depth_write_enabled: bool,
+    depth_compare: CompareFunction,
+    stencil_front: ?StencilFaceState = null,
+    stencil_back: ?StencilFaceState = null,
+    stencil_read_mask: u32 = 0xFFFFFFFF,
+    stencil_write_mask: u32 = 0xFFFFFFFF,
+    depth_bias: i32 = 0,
+    depth_bias_slope_scale: f32 = 0,
+    depth_bias_clamp: f32 = 0,
+};
+
+pub const BlendComponent = struct {
+    operation: BlendOperation,
+    src_factor: BlendFactor,
+    dst_factor: BlendFactor,
+};
+
+pub const BlendState = struct {
+    color: BlendComponent,
+    alpha: BlendComponent,
+};
+
+pub const PipelineDescriptor = struct {
+    color_format: TextureFormat,
+    depth_format: ?TextureFormat = null,
+    shader_module: c.WGPUShaderModule,
+    vertex_layouts: []const VertexBufferLayout = &.{},
+    primitive_topology: PrimitiveTopology = .triangle_list,
+    depth_stencil: ?DepthStencilState = .{
+        .depth_write_enabled = true,
+        .depth_compare = .less,
+    },
+    blend: ?BlendState = null,
+    cull_mode: CullMode = .back,
+};
+
+pub const BindGroupEntry = struct {
+    binding: u32,
+    resource: union(enum) {
+        buffer: BufferEntry,
+        sampler: c.WGPUSampler,
+        texture_view: c.WGPUTextureView,
+    },
+
+    pub const BufferEntry = struct {
+        buffer: c.WGPUBuffer,
+        size: u64,
+        offset: u64 = 0,
+    };
+};
+
+pub const BindGroupDescriptor = struct {
+    layout: c.WGPUBindGroupLayout,
+    entries: []const BindGroupEntry,
+};
+
+// Translate gpu.zig bind group layouts to WebGPU bind group layouts
+pub fn createBindGroupLayout(allocator: std.mem.Allocator, ctx: GPUContext, entries: []const BindGroupLayoutEntry) !c.WGPUBindGroupLayout {
+    var desc = z_WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT();
+    desc.entryCount = entries.len;
+
+    var layout_entries = try allocator.alloc(c.WGPUBindGroupLayoutEntry, entries.len);
+    defer allocator.free(layout_entries);
+
+    for (entries, 0..) |entry, i| {
+        var layout_entry = z_WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT();
+        layout_entry.binding = entry.binding;
+        layout_entry.visibility = entry.visibility;
+        switch (entry.type) {
+            .buffer => |buf| {
+                var buffer_layout = z_WGPU_BUFFER_BINDING_LAYOUT_INIT();
+                buffer_layout.type = @intFromEnum(buf.type);
+                buffer_layout.hasDynamicOffset = @intFromBool(buf.has_dynamic_offset);
+                buffer_layout.minBindingSize = buf.min_binding_size;
+                layout_entry.buffer = buffer_layout;
+            },
+            .sampler => |smp| {
+                var sampler_layout = z_WGPU_SAMPLER_BINDING_LAYOUT_INIT();
+                sampler_layout.type = @intFromEnum(smp);
+                layout_entry.sampler = sampler_layout;
+            },
+            .texture => |txt| {
+                layout_entry.texture.sampleType = @intFromEnum(txt.sample_type);
+                layout_entry.texture.viewDimension = @intFromEnum(txt.view_dimension);
+                layout_entry.texture.multisampled = toWGPUBool(txt.multi_sampled);
+            },
+            .storage_texture => |stx| {
+                var strg_texture_layout = z_WGPU_STORAGE_TEXTURE_BINDING_LAYOUT_INIT();
+                strg_texture_layout.access = @intFromEnum(stx.access);
+                strg_texture_layout.format = @intFromEnum(stx.format);
+                strg_texture_layout.viewDimension = @intFromEnum(stx.view_dimension);
+                layout_entry.storageTexture = strg_texture_layout;
+            },
+        }
+        layout_entries[i] = layout_entry;
+    }
+
+    desc.entries = layout_entries.ptr;
+
+    const layout = c.wgpuDeviceCreateBindGroupLayout(ctx.device, &desc);
+    if (layout == null) {
+        std.log.err("Failed to create bind group layout", .{});
+        return error.BindGroupLayoutCreationFailed;
+    }
+    return layout;
+}
+
+pub fn createBindGroupLayouts(
+    allocator: std.mem.Allocator,
+    ctx: GPUContext,
+    groups: []const []const BindGroupLayoutEntry,
+) ![]const c.WGPUBindGroupLayout {
+    var bg_layouts = try allocator.alloc(c.WGPUBindGroupLayout, groups.len);
+    for (groups, 0..) |entries, i| {
+        bg_layouts[i] = try createBindGroupLayout(allocator, ctx, entries);
+    }
+    return bg_layouts;
+}
+
+pub fn createShader(
+    ctx: GPUContext,
+    src: []const u8,
+    label: []const u8,
+) !c.WGPUShaderModule {
+    var desc = z_WGPU_SHADER_MODULE_DESCRIPTOR_INIT();
+    desc.label = toWGPUString(label);
+    var source = z_WGPU_SHADER_SOURCE_WGSL_INIT();
+    source.code = toWGPUString(src);
+    source.chain.next = null;
+    source.chain.sType = c.WGPUSType_ShaderSourceWGSL;
+
+    desc.nextInChain = &source.chain;
+
+    const module = c.wgpuDeviceCreateShaderModule(ctx.device, &desc);
+    if (module == null) {
+        std.log.err("ShaderManager: wgpuDeviceCreateShaderModule failed for '{s}'", .{label});
+        return error.ShaderModuleCreationFailed;
+    }
+    return module;
+}
+
+pub fn createPipeline(
+    allocator: std.mem.Allocator,
+    ctx: GPUContext,
+    label: []const u8,
+    descriptor: PipelineDescriptor,
+    vertex_entry: ?[]const u8,
+    fragment_entry: ?[]const u8,
+    bind_group_layouts: ?[]const c.WGPUBindGroupLayout,
+) !c.WGPURenderPipeline {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const temp = arena.allocator();
+
+    var desc = z_WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT();
+    desc.label = toWGPUString(label);
+
+    if (bind_group_layouts) |bgls| {
+        var pipeline_layout_desc = z_WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT();
+        pipeline_layout_desc.bindGroupLayoutCount = bgls.len;
+        pipeline_layout_desc.bindGroupLayouts = bgls.ptr;
+        const layout = c.wgpuDeviceCreatePipelineLayout(ctx.device, &pipeline_layout_desc);
+        if (layout == null) {
+            std.log.err("PipelineCache: wgpuDeviceCreatePipelineLayout failed for '{s}'", .{label});
+            return error.PipelineLayoutCreationFailed;
+        }
+        desc.layout = layout;
+    }
+
+    if (vertex_entry) |ve| {
+        var vertex_state = z_WGPU_VERTEX_STATE_INIT();
+        vertex_state.module = descriptor.shader_module;
+        vertex_state.entryPoint = toWGPUString(ve);
+
+        const buffers = try temp.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layouts.len);
+        for (descriptor.vertex_layouts, 0..) |vertex_layout, li| {
+            buffers[li] = z_WGPU_VERTEX_BUFFER_LAYOUT_INIT();
+            buffers[li].stepMode = @intFromEnum(vertex_layout.step_mode);
+            buffers[li].arrayStride = vertex_layout.array_stride;
+            buffers[li].attributeCount = vertex_layout.attributes.len;
+            var attributes = try temp.alloc(c.WGPUVertexAttribute, vertex_layout.attributes.len);
+            for (0..vertex_layout.attributes.len) |ai| {
+                const attribute = vertex_layout.attributes[ai];
+                attributes[ai] = z_WGPU_VERTEX_ATTRIBUTE_INIT();
+                attributes[ai].offset = attribute.offset;
+                attributes[ai].format = @intFromEnum(attribute.format);
+                attributes[ai].shaderLocation = attribute.shader_location;
+            }
+            buffers[li].attributes = attributes.ptr;
+        }
+
+        vertex_state.bufferCount = descriptor.vertex_layouts.len;
+        vertex_state.buffers = buffers.ptr;
+
+        desc.vertex = vertex_state;
+    }
+
+    // TODO handle constants
+
+    // TODO multi target rendering
+    if (fragment_entry) |fe| {
+        var fragment_state = z_WGPU_FRAGMENT_STATE_INIT();
+        fragment_state.module = descriptor.shader_module;
+        fragment_state.entryPoint = toWGPUString(fe);
+        fragment_state.targetCount = 1;
+
+        var target_state = z_WGPU_COLOR_TARGET_STATE_INIT();
+        target_state.format = @intFromEnum(descriptor.color_format);
+
+        var blend_state = z_WGPU_BLEND_STATE_INIT();
+        if (descriptor.blend) |b| {
+            var alpha = z_WGPU_BLEND_COMPONENT_INIT();
+            alpha.srcFactor = @intFromEnum(b.alpha.src_factor);
+            alpha.dstFactor = @intFromEnum(b.alpha.dst_factor);
+            alpha.operation = @intFromEnum(b.alpha.operation);
+            blend_state.alpha = alpha;
+            var color = z_WGPU_BLEND_COMPONENT_INIT();
+            color.srcFactor = @intFromEnum(b.color.src_factor);
+            color.dstFactor = @intFromEnum(b.color.dst_factor);
+            color.operation = @intFromEnum(b.color.operation);
+            blend_state.color = color;
+            target_state.blend = &blend_state;
+        }
+
+        // TODO MAYBE expose this
+        target_state.writeMask = c.WGPUColorWriteMask_All;
+
+        fragment_state.targets = &target_state;
+        desc.fragment = &fragment_state;
+    }
+
+    // TODO consider covering other fields
+    var primitive_state = z_WGPU_PRIMITIVE_STATE_INIT();
+    primitive_state.topology = @intFromEnum(descriptor.primitive_topology);
+    primitive_state.cullMode = @intFromEnum(descriptor.cull_mode);
+    desc.primitive = primitive_state;
+
+    if (descriptor.depth_stencil) |ds| {
+        var depth_stencil_state = z_WGPU_DEPTH_STENCIL_STATE_INIT();
+        depth_stencil_state.format = @intFromEnum(descriptor.depth_format.?);
+        depth_stencil_state.depthBias = ds.depth_bias;
+        depth_stencil_state.depthBiasClamp = ds.depth_bias_clamp;
+        depth_stencil_state.depthBiasSlopeScale = ds.depth_bias_slope_scale;
+        depth_stencil_state.depthCompare = @intFromEnum(ds.depth_compare);
+        depth_stencil_state.depthWriteEnabled = toWGPUOptBool(ds.depth_write_enabled);
+        if (ds.stencil_back) |dsb| {
+            depth_stencil_state.stencilBack = z_WGPU_STENCIL_FACE_STATE_INIT();
+            depth_stencil_state.stencilBack.compare = @intFromEnum(dsb.compare);
+            depth_stencil_state.stencilBack.depthFailOp = @intFromEnum(dsb.depth_fail_op);
+            depth_stencil_state.stencilBack.failOp = @intFromEnum(dsb.fail_op);
+            depth_stencil_state.stencilBack.passOp = @intFromEnum(dsb.pass_op);
+        }
+        if (ds.stencil_front) |dsf| {
+            depth_stencil_state.stencilFront = z_WGPU_STENCIL_FACE_STATE_INIT();
+            depth_stencil_state.stencilFront.compare = @intFromEnum(dsf.compare);
+            depth_stencil_state.stencilFront.depthFailOp = @intFromEnum(dsf.depth_fail_op);
+            depth_stencil_state.stencilFront.failOp = @intFromEnum(dsf.fail_op);
+            depth_stencil_state.stencilFront.passOp = @intFromEnum(dsf.pass_op);
+        }
+        depth_stencil_state.stencilReadMask = ds.stencil_read_mask;
+        depth_stencil_state.stencilWriteMask = ds.stencil_write_mask;
+        desc.depthStencil = &depth_stencil_state;
+    }
+
+    const multisample_state = z_WGPU_MULTISAMPLE_STATE_INIT();
+    desc.multisample = multisample_state;
+
+    const pipeline = c.wgpuDeviceCreateRenderPipeline(ctx.device, &desc);
+    if (pipeline == null) {
+        std.log.err("Failed to create pipeline for '{s}'", .{label});
+        return error.PipelineCreationFailed;
+    }
+
+    return pipeline;
+}
+
+pub fn createBindGroup(
+    allocator: std.mem.Allocator,
+    ctx: GPUContext,
+    descriptor: BindGroupDescriptor,
+) !c.WGPUBindGroup {
+    var desc = z_WGPU_BIND_GROUP_DESCRIPTOR_INIT();
+    desc.layout = descriptor.layout;
+    desc.entryCount = descriptor.entries.len;
+
+    var entries = try allocator.alloc(c.WGPUBindGroupEntry, descriptor.entries.len);
+    defer allocator.free(entries);
+    for (0..descriptor.entries.len) |i| {
+        const desc_entry = descriptor.entries[i];
+        var entry = z_WGPU_BIND_GROUP_ENTRY_INIT();
+        entry.binding = desc_entry.binding;
+        switch (desc_entry.resource) {
+            .buffer => |b| {
+                entry.buffer = b.buffer;
+                entry.offset = b.offset;
+                entry.size = b.size;
+            },
+            .sampler => |s| {
+                entry.sampler = s;
+            },
+            .texture_view => |tv| {
+                entry.textureView = tv;
+            },
+        }
+        entries[i] = entry;
+    }
+
+    desc.entries = entries.ptr;
+
+    const bind_group = c.wgpuDeviceCreateBindGroup(ctx.device, &desc);
+    if (bind_group == null) {
+        std.log.err("Failed to create bind group\n", .{});
+        return error.BindGroupCreationFailed;
+    }
+    return bind_group;
+}
