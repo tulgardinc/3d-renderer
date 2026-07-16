@@ -76,7 +76,7 @@ pub const Mesh = struct {
 // Bind group 0, the entire pass
 // Bind group 1, material uniforms,
 // Bind group 2, object overrides,
-pub const Material = struct {
+pub const MaterialOld = struct {
     shader: sys.ShaderHandle,
     uniforms: c.WGPUBuffer,
     bind_group: c.WGPUBindGroup,
@@ -89,7 +89,7 @@ pub const Material = struct {
 
 pub const DrawObject = struct {
     mesh: Mesh,
-    material: Material,
+    material: MaterialOld,
     instance_data: c.WGPUBuffer,
 };
 

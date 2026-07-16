@@ -37,7 +37,7 @@ struct ParticleBuffer {
 @compute @workgroup_size(64)
 fn simulate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= params.particle_count) {
+    if i >= params.particle_count {
         return;
     }
 

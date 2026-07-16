@@ -7,8 +7,6 @@ const c = gpu.c;
 const Renderer = @import("renderer.zig");
 const Shader = @import("shaders/compiled/2DVertexColors.zig");
 
-// Triangle in clip space. Per vertex: position (x, y) + color (r, g, b),
-// matching the 2DVertexColors vertex layout (f32x2 @ offset 0, f32x3 @ offset 8).
 const vertices = [_]f32{
     // x     y       r    g    b
     0.0, 0.5, 1.0, 0.0, 0.0, // top    - red
@@ -56,14 +54,11 @@ pub fn main() !void {
     const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
 
     const gpu_context = try gpu.GPUContext.initSync(io, instance.webgpu_instance, surface);
-    var target_surface = gpu.Surface.init(surface, gpu_context.adapter);
-    target_surface.configure(gpu_context.device, @intCast(width), @intCast(height));
-
-    // const renderer = Renderer.initOwning(allocator, window);
+    var target_surface = gpu.Surface.init(gpu_context, surface);
+    target_surface.configure(gpu_context, @intCast(width), @intCast(height));
 
     const vertex_buffer = try gpu.createBuffer(
-        gpu_context.device,
-        gpu_context.queue,
+        gpu_context,
         std.mem.sliceAsBytes(&vertices),
         "vertex buffer",
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
@@ -72,14 +67,11 @@ pub fn main() !void {
     var uniform: Shader.Uniforms = .{ .time = 0 };
 
     const uniform_buffer = try gpu.createBuffer(
-        gpu_context.device,
-        gpu_context.queue,
+        gpu_context,
         std.mem.asBytes(&uniform),
         "uniform",
         gpu.BufferUsage.uniform | gpu.BufferUsage.copy_dst,
     );
-
-    // get bg layouts
 
     const bg_layouts = try gpu.createBindGroupLayouts(
         allocator,
@@ -87,12 +79,8 @@ pub fn main() !void {
         Shader.layouts.?,
     );
 
-    // Get Shader
-
     const shader_src = @embedFile("shaders/2DVertexColors.wgsl");
     const shader_module = try gpu.createShader(gpu_context, shader_src, "vert color");
-
-    // Create pipeline
 
     const pipeline_desc: gpu.PipelineDescriptor = .{
         .depth_stencil = null,

@@ -5,7 +5,7 @@ pub const c = @cImport({
     @cInclude("webgpu/webgpu.h");
 });
 
-// ── Shim externs (C macro initializers that Zig can't call directly) ─────────
+// Shim externs
 
 pub extern fn z_WGPU_DEVICE_DESCRIPTOR_INIT() c.WGPUDeviceDescriptor;
 pub extern fn z_WGPU_REQUEST_ADAPTER_OPTIONS_INIT() c.WGPURequestAdapterOptions;
@@ -43,8 +43,6 @@ pub extern fn z_WGPU_STENCIL_FACE_STATE_INIT() c.WGPUStencilFaceState;
 pub extern fn z_WGPU_BIND_GROUP_DESCRIPTOR_INIT() c.WGPUBindGroupDescriptor;
 pub extern fn z_WGPU_BIND_GROUP_ENTRY_INIT() c.WGPUBindGroupEntry;
 
-// ── String / bool helpers ────────────────────────────────────────────────────
-
 pub fn wgpuStringToString(sv: *const c.WGPUStringView) []const u8 {
     if (sv.data == null) {
         return &.{};
@@ -69,7 +67,7 @@ pub inline fn toWGPUOptBool(val: bool) c.WGPUOptionalBool {
     return c.WGPU_FALSE;
 }
 
-// ── Sync wrappers (genuinely painful C callback patterns) ────────────────────
+// Sync wrappers
 
 pub fn getInstance() !c.WGPUInstance {
     const instance = c.wgpuCreateInstance(&.{});
@@ -223,7 +221,7 @@ pub fn getNextSurfaceView(surface: c.WGPUSurface) !c.WGPUTextureView {
     return target_view;
 }
 
-// ── Lifecycle structs ────────────────────────────────────────────────────────
+// Lifecycle
 
 pub const GPUInstance = struct {
     webgpu_instance: c.WGPUInstance,
@@ -288,9 +286,9 @@ pub const Surface = struct {
 
     const Self = @This();
 
-    pub fn init(surface: c.WGPUSurface, adapter: c.WGPUAdapter) Self {
+    pub fn init(ctx: GPUContext, surface: c.WGPUSurface) Self {
         var capabilities = z_WGPU_SURFACE_CAPABILITIES_INIT();
-        _ = c.wgpuSurfaceGetCapabilities(surface, adapter, &capabilities);
+        _ = c.wgpuSurfaceGetCapabilities(surface, ctx.adapter, &capabilities);
 
         return .{
             .surface = surface,
@@ -298,11 +296,11 @@ pub const Surface = struct {
         };
     }
 
-    pub fn configure(self: *Self, device: c.WGPUDevice, width: u32, height: u32) void {
+    pub fn configure(self: *Self, ctx: GPUContext, width: u32, height: u32) void {
         var conf = z_WGPU_SURFACE_CONFIGURATION_INIT();
         conf.width = width;
         conf.height = height;
-        conf.device = device;
+        conf.device = ctx.device;
         conf.format = @intFromEnum(self.format);
         c.wgpuSurfaceConfigure(self.surface, &conf);
     }
@@ -348,8 +346,7 @@ pub const Frame = struct {
 };
 
 pub fn createBuffer(
-    device: c.WGPUDevice,
-    queue: c.WGPUQueue,
+    ctx: GPUContext,
     contents: []const u8,
     label: []const u8,
     usage: c.WGPUBufferUsage,
@@ -359,13 +356,13 @@ pub fn createBuffer(
     desc.size = contents.len;
     desc.usage = @bitCast(usage);
 
-    const buffer = c.wgpuDeviceCreateBuffer(device, &desc);
+    const buffer = c.wgpuDeviceCreateBuffer(ctx.device, &desc);
     if (buffer == null) {
         std.log.err("ResourceManager: wgpuDeviceCreateBuffer failed for '{s}'", .{label});
         return error.BufferCreationFailed;
     }
 
-    c.wgpuQueueWriteBuffer(queue, buffer, 0, contents.ptr, contents.len);
+    c.wgpuQueueWriteBuffer(ctx.queue, buffer, 0, contents.ptr, contents.len);
     return buffer;
 }
 
@@ -890,6 +887,23 @@ pub const BindGroupDescriptor = struct {
     layout: c.WGPUBindGroupLayout,
     entries: []const BindGroupEntry,
 };
+
+pub const BindingMetadata = struct { name: []const u8, binding: u32, Type: ?type };
+
+pub fn BindGroup(Shader: type, index: comptime_int) !?type {
+    if (Shader.layouts[index] == null) return null;
+    const uniform_count = switch (@typeInfo(Shader.Uniforms[index])) {
+        .@"struct" => |s| s.fields.len,
+        else => 0,
+    };
+    return struct {
+        uniforms: Shader.Uniforms[index],
+        uniform_buffers: [uniform_count]c.WGPUBuffer,
+        resources: c.WGPUTextureView,
+        layout: c.WGPUBindGroupLayout,
+        group: c.WGPUBindGroup,
+    };
+}
 
 // Translate gpu.zig bind group layouts to WebGPU bind group layouts
 pub fn createBindGroupLayout(allocator: std.mem.Allocator, ctx: GPUContext, entries: []const BindGroupLayoutEntry) !c.WGPUBindGroupLayout {

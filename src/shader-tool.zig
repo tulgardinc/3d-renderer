@@ -1019,6 +1019,34 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     try w.print("\n", .{});
 
+    for (bindings.items) |binding| {
+        const resource = binding.resource;
+        if (resource == .uniform_buffer or resource == .storage_buffer) {
+            const bind_type = if (resource == .uniform_buffer) resource.uniform_buffer.type else resource.storage_buffer.type;
+            switch (bind_type) {
+                .struct_ref => |ref| {
+                    try printStructCode(allocator, ref, struct_map, struct_layout_map, w);
+                },
+                .array => |arr| {
+                    if (arr.max_size == null) {
+                        const array_stride = @max(
+                            alignOf(arr.type.*, .storage, struct_layout_map).?,
+                            sizeOf(arr.type.*, .storage, struct_layout_map).?,
+                        );
+                        try w.print(
+                            "pub const {s}_STRIDE: u32 = {any};\n\n",
+                            .{
+                                try std.ascii.allocUpperString(allocator, binding.name),
+                                array_stride,
+                            },
+                        );
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     if (bindings.items.len > 0) {
         try w.print(
             \\ pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = &.{{
@@ -1098,32 +1126,35 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try w.print("pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = null;\n\n", .{});
     }
 
-    for (bindings.items) |binding| {
-        const resource = binding.resource;
-        if (resource == .uniform_buffer or resource == .storage_buffer) {
-            const bind_type = if (resource == .uniform_buffer) resource.uniform_buffer.type else resource.storage_buffer.type;
-            switch (bind_type) {
-                .struct_ref => |ref| {
-                    try printStructCode(allocator, ref, struct_map, struct_layout_map, w);
-                },
-                .array => |arr| {
-                    if (arr.max_size == null) {
-                        const array_stride = @max(
-                            alignOf(arr.type.*, .storage, struct_layout_map).?,
-                            sizeOf(arr.type.*, .storage, struct_layout_map).?,
-                        );
-                        try w.print(
-                            "pub const {s}_STRIDE: u32 = {any};\n\n",
-                            .{
-                                try std.ascii.allocUpperString(allocator, binding.name),
-                                array_stride,
-                            },
-                        );
-                    }
-                },
-                else => {},
+    if (bindings.items.len > 0) {
+        try w.print("pub const Uniforms: ?[]const type = &.{{\n", .{});
+        var group: usize = 0;
+        var found_uniform = false;
+        for (bindings.items) |binding| {
+            if (binding.group != group) {
+                if (found_uniform) {
+                    try w.print("}},\n", .{});
+                } else {
+                    try w.print("void,\n", .{});
+                }
+                found_uniform = false;
+                group = binding.group;
             }
+            if (binding.resource != .uniform_buffer) continue;
+            if (!found_uniform) {
+                try w.print("struct {{\n", .{});
+                found_uniform = true;
+            }
+            const type_string = try binding.resource.uniform_buffer.type.getString(allocator);
+            try w.print("{s}: {s},\n", .{ binding.name, type_string });
         }
+        if (!found_uniform) {
+            try w.print("void,\n", .{});
+        }
+
+        try w.print("}};\n\n", .{});
+    } else {
+        try w.print("pub const Uniforms: ?[]const type = null;\n\n", .{});
     }
 
     const write_path = try std.fmt.allocPrint(allocator, "src/shaders/compiled/{s}.zig", .{file_no_ext});
