@@ -64,20 +64,10 @@ pub fn main() !void {
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
-    var uniform: Shader.Uniforms = .{ .time = 0 };
+    var bind_group = try gpu.BindGroup(Shader, 0).init(allocator, gpu_context, .{});
+    defer bind_group.deinit();
 
-    const uniform_buffer = try gpu.createBuffer(
-        gpu_context,
-        std.mem.asBytes(&uniform),
-        "uniform",
-        gpu.BufferUsage.uniform | gpu.BufferUsage.copy_dst,
-    );
-
-    const bg_layouts = try gpu.createBindGroupLayouts(
-        allocator,
-        gpu_context,
-        Shader.layouts.?,
-    );
+    bind_group.set_uniform(gpu_context, .time, 0);
 
     const shader_src = @embedFile("shaders/2DVertexColors.wgsl");
     const shader_module = try gpu.createShader(gpu_context, shader_src, "vert color");
@@ -113,21 +103,8 @@ pub fn main() !void {
         pipeline_desc,
         Shader.VS,
         Shader.FS,
-        bg_layouts,
+        &.{bind_group.layout},
     );
-
-    const bind_group = try gpu.createBindGroup(allocator, gpu_context, .{
-        .layout = bg_layouts[0],
-        .entries = &.{.{
-            .binding = 0,
-            .resource = .{
-                .buffer = .{
-                    .buffer = uniform_buffer,
-                    .size = @sizeOf(Shader.Uniforms),
-                },
-            },
-        }},
-    });
 
     const start_time = std.Io.Clock.real.now(io).toMilliseconds();
 
@@ -140,9 +117,11 @@ pub fn main() !void {
             }
         }
 
-        uniform.time = @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0;
-        const slice: []const u8 = std.mem.asBytes(&uniform);
-        c.wgpuQueueWriteBuffer(gpu_context.queue, uniform_buffer, 0, slice.ptr, slice.len);
+        bind_group.set_uniform(
+            gpu_context,
+            .time,
+            @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0,
+        );
 
         const view = try gpu.getNextSurfaceView(surface); // stateless helper, keep it
         defer c.wgpuTextureViewRelease(view);
@@ -166,7 +145,7 @@ pub fn main() !void {
         const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &rp_desc);
 
         c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
-        c.wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, 0, null);
+        c.wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group.group, 0, null);
         c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertex_buffer, 0, @sizeOf(@TypeOf(vertices)));
         c.wgpuRenderPassEncoderDraw(pass, vertices.len / 5, 1, 0, 0);
 

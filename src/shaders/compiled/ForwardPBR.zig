@@ -31,7 +31,24 @@ pub const LightBuffer = extern struct {
     pub const LIGHTS_OFFSET: u32 = 16;
 };
 
-pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = &.{
+pub const Uniforms: []const ?[]const gpu.BindGroupEntryMeta = &.{
+    &.{
+        .{ .binding = 0, .Type = Camera, .name = "camera" },
+    },
+    &.{
+        .{ .binding = 0, .Type = Material, .name = "material" },
+    },
+};
+
+pub const Resources: []const ?[]const gpu.BindGroupEntryMeta = &.{
+    null,
+    &.{
+        .{ .name = "albedo_tex", .binding = 1, .Type = gpu.c.WGPUTextureView },
+        .{ .name = "albedo_sampler", .binding = 2, .Type = gpu.c.WGPUSampler },
+    },
+};
+
+pub const layouts: []const ?[]const gpu.BindingGroupLayoutEntry = &.{
     &.{
         .{ .binding = 0, .visibility = gpu.ShaderStage.vertex | gpu.ShaderStage.fragment, .type = .{ .buffer = .{ .type = .uniform, .has_dynamic_offset = false, .min_binding_size = 80 } } },
     },
@@ -39,32 +56,5 @@ pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = &.{
         .{ .binding = 0, .visibility = gpu.ShaderStage.vertex | gpu.ShaderStage.fragment, .type = .{ .buffer = .{ .type = .uniform, .has_dynamic_offset = false, .min_binding_size = 32 } } },
         .{ .binding = 1, .visibility = gpu.ShaderStage.vertex | gpu.ShaderStage.fragment, .type = .{ .texture = .{ .sample_type = .float, .view_dimension = .@"2d", .multi_sampled = false } } },
         .{ .binding = 2, .visibility = gpu.ShaderStage.vertex | gpu.ShaderStage.fragment, .type = .{ .sampler = .filtering } },
-    },
-    &.{
-        .{ .binding = 0, .visibility = gpu.ShaderStage.vertex | gpu.ShaderStage.fragment, .type = .{ .buffer = .{ .type = .read_only_storage, .has_dynamic_offset = false, .min_binding_size = 0 } } },
-    },
-};
-
-pub const Uniforms: ?[]const type = &.{
-    struct {
-        camera: Camera,
-    },
-    struct {
-        material: Material,
-    },
-    void,
-};
-
-pub const Groups: ?[]const gpu.Group = &.{
-    &.{
-        .{
-            .Uniforms = void,
-            .Resources = struct {
-                texture: gpu.c.WGPUTextureView,
-            },
-            .layout = &.{
-                .{ .binding = 0, .visibility = gpu.ShaderStage.vertex | gpu.ShaderStage.fragment, .type = .{ .buffer = .{ .type = .uniform, .has_dynamic_offset = false, .min_binding_size = 80 } } },
-            },
-        },
     },
 };

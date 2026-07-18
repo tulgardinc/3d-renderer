@@ -8,11 +8,7 @@ struct VertexOutput {
     @location(0) color: vec3<f32>,
 };
 
-struct Uniforms {
-    time: f32
-};
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(0) var<uniform> time: f32;
 
 @vertex
 fn vs(in: VertexInput) -> VertexOutput {
@@ -25,6 +21,6 @@ fn vs(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
-    let pulse = (sin(u.time) + 1.0) / 2.0;
+    let pulse = (sin(time) + 1.0) / 2.0;
     return vec4<f32>(in.color * pulse, 1.0);
 }

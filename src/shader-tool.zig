@@ -840,7 +840,11 @@ pub fn getStructProperties(
 }
 
 pub fn sortByGroup(_: void, a: Binding, b: Binding) bool {
-    return a.group < b.group;
+    if (a.group < b.group) {
+        return true;
+    } else if (a.group == b.group) {
+        return a.binding < b.binding;
+    } else return false;
 }
 
 pub fn printStructCode(
@@ -998,6 +1002,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     std.mem.sort(Binding, bindings.items, {}, sortByGroup);
+    for (bindings.items) |b| {
+        std.debug.print("group: {any}, bind: {any}\n", .{ b.group, b.binding });
+    }
 
     const visibility: []const u8 = blk: {
         for (entries.items) |i| {
@@ -1047,19 +1054,69 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
-    if (bindings.items.len > 0) {
-        try w.print(
-            \\ pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = &.{{
-            \\ &.{{
-        , .{});
+    const max_group = bindings.items[bindings.items.len - 1].group;
 
-        var group: usize = 0;
+    // Uniforms
+    try w.print("pub const Uniforms: []const ?[]const gpu.BindGroupEntryMeta = &.{{ ", .{});
+
+    for (0..max_group + 1) |group| {
+        var found_uniform = false;
         for (bindings.items) |binding| {
-            if (binding.group != group) {
-                try w.print("}},\n", .{});
-                try w.print("&.{{", .{});
-                group = binding.group;
+            if (binding.group != group or binding.resource != .uniform_buffer) continue;
+            if (!found_uniform) {
+                try w.print("&.{{\n", .{});
+                found_uniform = true;
             }
+            const type_string = try binding.resource.uniform_buffer.type.getString(allocator);
+            try w.print(".{{ .binding = {any}, .Type = {s}, .name = \"{s}\" }},\n", .{ binding.binding, type_string, binding.name });
+        }
+        if (found_uniform) {
+            try w.print("}},\n", .{});
+        } else {
+            try w.print("null,\n", .{});
+        }
+    }
+    try w.print("}};\n\n", .{});
+
+    // Resources
+    try w.print("pub const Resources: []const ?[]const gpu.BindGroupEntryMeta = &.{{", .{});
+    for (0..max_group + 1) |group| {
+        var found_resource = false;
+        for (bindings.items) |binding| {
+            if (binding.group != group or binding.resource == .uniform_buffer) continue;
+            if (!found_resource) {
+                try w.print("&.{{\n", .{});
+                found_resource = true;
+            }
+            switch (binding.resource) {
+                .storage_buffer => {
+                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .Type = gpu.c.WGPUBuffer }},\n", .{ binding.name, binding.binding });
+                },
+                .sampler => {
+                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .Type = gpu.c.WGPUSampler }},\n", .{ binding.name, binding.binding });
+                },
+                .texture => {
+                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .Type = gpu.c.WGPUTextureView }},\n", .{ binding.name, binding.binding });
+                },
+                else => {},
+            }
+        }
+        if (found_resource) {
+            try w.print("}},\n", .{});
+        } else {
+            try w.print("null,\n", .{});
+        }
+    }
+    try w.print("}};\n\n", .{});
+
+    // layout
+    try w.print("pub const layouts: []const ?[]const gpu.BindGroupLayoutEntry = &.{{\n", .{});
+    for (0..max_group + 1) |group| {
+        try w.print("&.{{ \n", .{});
+        var found_group = false;
+        for (bindings.items) |binding| {
+            if (binding.group != group) continue;
+            found_group = true;
             try w.print(
                 ".{{ .binding = {any}, .visibility = {s}, .type = ",
                 .{ binding.binding, visibility },
@@ -1121,41 +1178,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 },
             }
         }
-        try w.print("}}, }};\n\n", .{});
-    } else {
-        try w.print("pub const layouts: ?[]const []const gpu.BindGroupLayoutEntry = null;\n\n", .{});
-    }
-
-    if (bindings.items.len > 0) {
-        try w.print("pub const Uniforms: ?[]const type = &.{{\n", .{});
-        var group: usize = 0;
-        var found_uniform = false;
-        for (bindings.items) |binding| {
-            if (binding.group != group) {
-                if (found_uniform) {
-                    try w.print("}},\n", .{});
-                } else {
-                    try w.print("void,\n", .{});
-                }
-                found_uniform = false;
-                group = binding.group;
-            }
-            if (binding.resource != .uniform_buffer) continue;
-            if (!found_uniform) {
-                try w.print("struct {{\n", .{});
-                found_uniform = true;
-            }
-            const type_string = try binding.resource.uniform_buffer.type.getString(allocator);
-            try w.print("{s}: {s},\n", .{ binding.name, type_string });
+        if (found_group) {
+            try w.print("}},\n", .{});
+        } else {
+            try w.print("null,\n", .{});
         }
-        if (!found_uniform) {
-            try w.print("void,\n", .{});
-        }
-
-        try w.print("}};\n\n", .{});
-    } else {
-        try w.print("pub const Uniforms: ?[]const type = null;\n\n", .{});
     }
+    try w.print("}};\n\n", .{});
 
     const write_path = try std.fmt.allocPrint(allocator, "src/shaders/compiled/{s}.zig", .{file_no_ext});
 

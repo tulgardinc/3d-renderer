@@ -888,20 +888,205 @@ pub const BindGroupDescriptor = struct {
     entries: []const BindGroupEntry,
 };
 
-pub const BindingMetadata = struct { name: []const u8, binding: u32, Type: ?type };
+pub const BindGroupEntryMeta = struct {
+    Type: type,
+    binding: u32,
+    name: []const u8,
+};
 
-pub fn BindGroup(Shader: type, index: comptime_int) !?type {
-    if (Shader.layouts[index] == null) return null;
-    const uniform_count = switch (@typeInfo(Shader.Uniforms[index])) {
-        .@"struct" => |s| s.fields.len,
-        else => 0,
+pub fn BindGroup(Shader: type, index: comptime_int) type {
+    if (Shader.layouts[index] == null) {
+        @compileError("This group is not defined in the shader");
+    }
+
+    const uniforms_meta: ?[]const BindGroupEntryMeta = Shader.Uniforms[index];
+    const resources_meta: ?[]const BindGroupEntryMeta = Shader.Resources[index];
+
+    const ResourcesStruct: type = comptime blk: {
+        if (resources_meta) |rm| {
+            var field_names: []const []const u8 = &.{};
+            var field_types: []const type = &.{};
+            var field_attrs: []const std.builtin.Type.StructField.Attributes = &.{};
+            for (rm) |meta| {
+                field_names = field_names ++ &.{meta.name};
+                field_attrs = field_attrs ++ &.{.{}};
+                if (meta.Type == c.WGPUBuffer) {
+                    field_types = field_types ++ &.{
+                        struct {
+                            buffer: c.WGPUBuffer,
+                            size: ?u32 = null,
+                            offset: u32 = 0,
+                        },
+                    };
+                } else {
+                    field_types = field_types ++ &.{meta.Type};
+                }
+            }
+            break :blk @Struct(
+                .auto,
+                null,
+                field_names,
+                field_types,
+                field_attrs,
+            );
+        }
+        break :blk struct {};
     };
+
+    const UniformsEnum: type = comptime blk: {
+        if (uniforms_meta) |um| {
+            var field_names: [um.len][]const u8 = undefined;
+            var field_values: [um.len]u32 = undefined;
+            for (um, 0..) |u, i| {
+                field_names[i] = u.name;
+                field_values[i] = u.binding;
+            }
+            break :blk @Enum(
+                u32,
+                .exhaustive,
+                &field_names,
+                &field_values,
+            );
+        }
+        break :blk enum {};
+    };
+
     return struct {
-        uniforms: Shader.Uniforms[index],
-        uniform_buffers: [uniform_count]c.WGPUBuffer,
-        resources: c.WGPUTextureView,
+        uniforms_buffer: ?c.WGPUBuffer,
+        resources: ResourcesStruct,
         layout: c.WGPUBindGroupLayout,
         group: c.WGPUBindGroup,
+
+        const Self = @This();
+
+        pub fn init(allocator: std.mem.Allocator, ctx: GPUContext, resources: ResourcesStruct) !Self {
+            comptime var total_size = 0;
+            comptime var offset = 0;
+            var group_entries: [Shader.layouts[index].?.len]BindGroupEntry = undefined;
+            var group_entries_index: usize = 0;
+            const uniform_buffer = blk: {
+                if (uniforms_meta) |um| {
+                    inline for (um) |u| {
+                        total_size += @sizeOf(u.Type);
+                        total_size = comptime std.mem.alignForwardAnyAlign(u32, total_size, 256);
+                    }
+
+                    var desc = z_WGPU_BUFFER_DESCRIPTOR_INIT();
+                    desc.label = toWGPUString(std.fmt.comptimePrint("Group {any}", .{index}));
+                    desc.size = total_size;
+                    desc.usage = c.WGPUBufferUsage_CopyDst | c.WGPUBufferUsage_Uniform;
+                    const buff = c.wgpuDeviceCreateBuffer(ctx.device, &desc);
+                    if (buff == null) {
+                        std.log.err("failed to create Uniform buffer", .{});
+                        return error.BufferCreationFailed;
+                    }
+
+                    inline for (um) |u| {
+                        group_entries[group_entries_index] =
+                            .{
+                                .binding = u.binding,
+                                .resource = .{
+                                    .buffer = .{
+                                        .buffer = buff,
+                                        .offset = offset,
+                                        .size = @sizeOf(u.Type),
+                                    },
+                                },
+                            };
+                        group_entries_index += 1;
+                        offset += @sizeOf(u.Type);
+                        offset = comptime std.mem.alignForwardAnyAlign(u64, offset, 256);
+                    }
+                    break :blk buff;
+                } else {
+                    break :blk null;
+                }
+            };
+
+            if (resources_meta) |rm| {
+                inline for (rm) |r| {
+                    const value = @field(resources, r.name);
+                    group_entries[group_entries_index] =
+                        .{
+                            .binding = r.binding,
+                            .resource = switch (r.Type) {
+                                c.WGPUBuffer => .{
+                                    .buffer = .{
+                                        .buffer = value.buffer,
+                                        .offset = value.offset,
+                                        .size = value.size,
+                                    },
+                                },
+                                c.WGPUTextureView => .{ .texture_view = value },
+                                c.WGPUSampler => .{ .sampler = value },
+                            },
+                        };
+                    group_entries_index += 1;
+                }
+            }
+
+            const group_layout = try createBindGroupLayout(allocator, ctx, Shader.layouts[index].?);
+            if (group_layout == null) {
+                std.log.err("failed to create group layout", .{});
+                return error.BufferCreationFailed;
+            }
+
+            const group = try createBindGroup(allocator, ctx, .{
+                .layout = group_layout,
+                .entries = &group_entries,
+            });
+
+            return .{
+                .uniforms_buffer = uniform_buffer,
+                .resources = resources,
+                .layout = group_layout,
+                .group = group,
+            };
+        }
+
+        fn GetUniformMetaFromEnum(e: UniformsEnum) BindGroupEntryMeta {
+            if (uniforms_meta == null) @compileError("can not be called with no unifroms defined on the shader");
+
+            for (uniforms_meta.?) |u| {
+                if (u.binding == @intFromEnum(e)) return u;
+            }
+            @compileError("unknown field");
+        }
+
+        pub fn set_uniform(
+            self: *Self,
+            ctx: GPUContext,
+            comptime field: UniformsEnum,
+            value: GetUniformMetaFromEnum(field).Type,
+        ) void {
+            if (uniforms_meta == null) @compileError("can not be called with no unifroms defined on the shader");
+
+            const field_offset = comptime blk: {
+                var total = 0;
+                for (0..@intFromEnum(field)) |_| {
+                    const u_meta = GetUniformMetaFromEnum(field);
+                    total += @sizeOf(u_meta.Type);
+                    total = std.mem.alignForwardAnyAlign(u32, total, 256);
+                    if (u_meta.binding == @intFromEnum(field)) break;
+                }
+                break :blk total;
+            };
+            c.wgpuQueueWriteBuffer(
+                ctx.queue,
+                self.uniforms_buffer.?,
+                field_offset,
+                &std.mem.toBytes(value),
+                @sizeOf(@TypeOf(value)),
+            );
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.uniforms_buffer) |ub| {
+                c.wgpuBufferDestroy(ub);
+            }
+            c.wgpuBindGroupRelease(self.group);
+            c.wgpuBindGroupLayoutRelease(self.layout);
+        }
     };
 }
 
