@@ -57,6 +57,11 @@ pub fn main() !void {
     var target_surface = gpu.Surface.init(gpu_context, surface);
     target_surface.configure(gpu_context, @intCast(width), @intCast(height));
 
+    var bind_group = try gpu.BindGroup(Shader, 0).init(allocator, gpu_context, .{});
+    defer bind_group.deinit();
+
+    bind_group.set_uniform(gpu_context, .time, 0);
+
     const vertex_buffer = try gpu.createBuffer(
         gpu_context,
         std.mem.sliceAsBytes(&vertices),
@@ -64,46 +69,33 @@ pub fn main() !void {
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
-    var bind_group = try gpu.BindGroup(Shader, 0).init(allocator, gpu_context, .{});
-    defer bind_group.deinit();
-
-    bind_group.set_uniform(gpu_context, .time, 0);
-
-    const shader_src = @embedFile("shaders/2DVertexColors.wgsl");
-    const shader_module = try gpu.createShader(gpu_context, shader_src, "vert color");
-
-    const pipeline_desc: gpu.PipelineDescriptor = .{
-        .depth_stencil = null,
-        .shader_module = shader_module,
-        .color_format = target_surface.format,
-        .vertex_layouts = &.{
+    const triangle_mesh: gpu.Mesh = .{
+        .buffers = &.{vertex_buffer},
+        .vertex_count = 3,
+        .strides = &.{5 * @sizeOf(f32)},
+        .attributes = &.{
             .{
-                .step_mode = .vertex,
-                .array_stride = 5 * @sizeOf(f32),
-                .attributes = &.{
-                    .{
-                        .shader_location = 0,
-                        .offset = 0,
-                        .format = .f32x2,
-                    },
-                    .{
-                        .shader_location = 1,
-                        .offset = 2 * @sizeOf(f32),
-                        .format = .f32x3,
-                    },
-                },
+                .semantic = .position,
+                .format = .f32x2,
+                .offset = 0,
+                .buffer = 0,
+            },
+            .{
+                .semantic = .color,
+                .format = .f32x3,
+                .offset = 2 * @sizeOf(f32),
+                .buffer = 0,
             },
         },
     };
 
-    const pipeline = try gpu.createPipeline(
+    const pipeline = try gpu.createPipelineFromMesh(
+        Shader,
         allocator,
         gpu_context,
-        "2d pipeline",
-        pipeline_desc,
-        Shader.VS,
-        Shader.FS,
+        triangle_mesh,
         &.{bind_group.layout},
+        .{ .color_format = target_surface.format },
     );
 
     const start_time = std.Io.Clock.real.now(io).toMilliseconds();
@@ -117,11 +109,8 @@ pub fn main() !void {
             }
         }
 
-        bind_group.set_uniform(
-            gpu_context,
-            .time,
-            @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0,
-        );
+        const new_time = @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0;
+        bind_group.set_uniform(gpu_context, .time, new_time);
 
         const view = try gpu.getNextSurfaceView(surface); // stateless helper, keep it
         defer c.wgpuTextureViewRelease(view);

@@ -856,14 +856,11 @@ pub const BlendState = struct {
 
 pub const PipelineDescriptor = struct {
     color_format: TextureFormat,
-    depth_format: ?TextureFormat = null,
     shader_module: c.WGPUShaderModule,
     vertex_layouts: []const VertexBufferLayout = &.{},
+    depth_format: ?TextureFormat = null,
     primitive_topology: PrimitiveTopology = .triangle_list,
-    depth_stencil: ?DepthStencilState = .{
-        .depth_write_enabled = true,
-        .depth_compare = .less,
-    },
+    depth_stencil: ?DepthStencilState = null,
     blend: ?BlendState = null,
     cull_mode: CullMode = .back,
 };
@@ -892,6 +889,18 @@ pub const BindGroupEntryMeta = struct {
     Type: type,
     binding: u32,
     name: []const u8,
+};
+
+pub const VertexInputSemantics = enum {
+    position,
+    color,
+    normal,
+    uv,
+};
+
+pub const VertexInputMeta = struct {
+    location: u32,
+    sem_meaning: VertexInputSemantics,
 };
 
 pub fn BindGroup(Shader: type, index: comptime_int) type {
@@ -1349,4 +1358,79 @@ pub fn createBindGroup(
         return error.BindGroupCreationFailed;
     }
     return bind_group;
+}
+
+pub const Mesh = struct {
+    buffers: []const c.WGPUBuffer,
+    strides: []const u32,
+    attributes: []const AttributeDesc,
+    indices: ?IndexBuffer = null,
+    vertex_count: u32,
+
+    pub const AttributeDesc = struct {
+        semantic: VertexInputSemantics,
+        format: VertexFormat,
+        offset: u32,
+        buffer: u8,
+    };
+
+    pub const IndexBuffer = struct {
+        buffer: c.WGPUBuffer,
+        format: enum { u16, u32 },
+        index_count: u32,
+    };
+};
+
+pub fn createPipelineFromMesh(
+    Shader: type,
+    allocator: std.mem.Allocator,
+    ctx: GPUContext,
+    mesh: Mesh,
+    bind_group_layouts: ?[]const c.WGPUBindGroupLayout,
+    config: struct { color_format: TextureFormat, label: ?[]const u8 = null },
+) !c.WGPURenderPipeline {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    const arena_alloc = arena.allocator();
+    defer arena.deinit();
+    const shader_module = try createShader(ctx, Shader.SOURCE, "vert color");
+
+    var vertex_layouts: std.ArrayList(VertexBufferLayout) = .empty;
+    for (0..mesh.buffers.len) |i| {
+        const stride = mesh.strides[i];
+        var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
+        for (mesh.attributes) |attr| {
+            const shader_location = blk: {
+                inline for (Shader.vertex_meta) |meta| {
+                    if (meta.sem_meaning == attr.semantic) break :blk meta.location;
+                }
+                break :blk 0;
+            };
+            try vertex_attributes.append(arena_alloc, .{
+                .offset = attr.offset,
+                .format = attr.format,
+                .shader_location = shader_location,
+            });
+        }
+        try vertex_layouts.append(arena_alloc, .{
+            .attributes = vertex_attributes.items,
+            .array_stride = stride,
+            .step_mode = .vertex,
+        });
+    }
+
+    const pipeline_descriptor: PipelineDescriptor = .{
+        .color_format = config.color_format,
+        .shader_module = shader_module,
+        .vertex_layouts = vertex_layouts.items,
+    };
+
+    return try createPipeline(
+        allocator,
+        ctx,
+        if (config.label) |label| label else "Pipeline",
+        pipeline_descriptor,
+        Shader.VS,
+        Shader.FS,
+        bind_group_layouts,
+    );
 }

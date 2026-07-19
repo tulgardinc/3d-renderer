@@ -235,6 +235,13 @@ const ShaderEntry = union(EntryTypes) {
     },
 };
 
+pub const VertexInputSemantics = enum {
+    position,
+    color,
+    normal,
+    uv,
+};
+
 const ViewDimension = enum {
     @"1d",
     @"2d",
@@ -1017,7 +1024,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const w = &aw.writer;
     try w.print("const gpu = @import(\"../../gpu.zig\");\n\n", .{});
 
-    for (entries.items) |item| {
+    var vertex_index: ?usize = null;
+    for (entries.items, 0..) |item, i| {
+        if (item == .vertex) vertex_index = i;
         const name = switch (item) {
             inline else => |x| x.name,
         };
@@ -1025,6 +1034,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try w.print("pub const {s}: []const u8 = \"{s}\";\n", .{ upper_name, name });
     }
     try w.print("\n", .{});
+
+    if (vertex_index) |i| {
+        const params = entries.items[i].vertex.parameters;
+        try w.print("pub const vertex_meta: []const gpu.VertexInputMeta = &.{{\n", .{});
+        for (params) |param| {
+            if (std.meta.stringToEnum(VertexInputSemantics, param.name)) |_| {
+                try w.print(".{{ .sem_meaning = .{s}, .location = {any} }},\n", .{ param.name, param.location });
+            }
+        }
+        try w.print("}};\n\n", .{});
+    }
 
     for (bindings.items) |binding| {
         const resource = binding.resource;
@@ -1185,6 +1205,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
     try w.print("}};\n\n", .{});
+
+    const rel_path = try std.fs.path.relative(allocator, ".", null, "src/shaders/compiled", path);
+
+    try w.print("pub const NAME: []const u8 = \"{s}\";\n", .{file_no_ext});
+    try w.print("pub const SOURCE: []const u8 = @embedFile(\"{s}\");\n\n", .{rel_path});
 
     const write_path = try std.fmt.allocPrint(allocator, "src/shaders/compiled/{s}.zig", .{file_no_ext});
 
