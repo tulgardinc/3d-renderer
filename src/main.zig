@@ -1,10 +1,8 @@
 const std = @import("std");
 const gpu = @import("gpu.zig");
-const gs = @import("gpu-system.zig");
 const build_options = @import("build_options");
 const builtin = @import("builtin");
 const c = gpu.c;
-const Renderer = @import("renderer.zig");
 const Shader = @import("shaders/compiled/2DVertexColors.zig");
 
 const vertices = [_]f32{
@@ -15,6 +13,8 @@ const vertices = [_]f32{
 };
 
 pub fn main() !void {
+    // TODO: Texture quad
+
     var debug_allocator = std.heap.DebugAllocator(.{}){};
     const allocator = switch (builtin.mode) {
         .Debug => debug_allocator.allocator(),
@@ -112,6 +112,9 @@ pub fn main() !void {
 
     var running = true;
     while (running) {
+        const encoder = gpu_context.getEncoder();
+        defer c.wgpuCommandEncoderRelease(encoder);
+
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             if (event.type == c.SDL_EVENT_QUIT) {
@@ -122,39 +125,18 @@ pub fn main() !void {
         const new_time = @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0;
         bind_group.set_uniform(gpu_context, .time, new_time);
 
-        const view = try gpu.getNextSurfaceView(surface);
-        defer c.wgpuTextureViewRelease(view);
+        const target_texture_view = try target_surface.getCurrentView();
+        defer c.wgpuTextureViewRelease(target_texture_view);
 
-        var enc_desc = gpu.z_WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT();
-        enc_desc.label = gpu.toWGPUString("frame encoder");
-        const encoder = c.wgpuDeviceCreateCommandEncoder(gpu_context.device, &enc_desc);
-        defer c.wgpuCommandEncoderRelease(encoder);
+        const rp = gpu.RenderPass.init(encoder, target_texture_view, .{});
+        rp.draw(draw_object);
+        rp.end();
 
-        var color = gpu.z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
-        color.view = view;
-        color.loadOp = c.WGPULoadOp_Clear;
-        color.storeOp = c.WGPUStoreOp_Store;
-        color.clearValue = .{ .r = 0.1, .g = 0.1, .b = 0.1, .a = 1.0 };
+        const buffer = gpu.finishEncoder(encoder);
 
-        var rp_desc = gpu.z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
-        rp_desc.label = gpu.toWGPUString("main pass");
-        rp_desc.colorAttachmentCount = 1;
-        rp_desc.colorAttachments = &color;
+        gpu_context.submitCommands(&.{buffer});
 
-        const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &rp_desc);
-
-        draw_object.draw(pass);
-
-        c.wgpuRenderPassEncoderEnd(pass);
-        c.wgpuRenderPassEncoderRelease(pass);
-
-        var cmd_desc = gpu.z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
-        cmd_desc.label = gpu.toWGPUString("frame commands");
-        const cmd = c.wgpuCommandEncoderFinish(encoder, &cmd_desc);
-        c.wgpuQueueSubmit(gpu_context.queue, 1, &cmd);
-        c.wgpuCommandBufferRelease(cmd);
-
-        _ = c.wgpuSurfacePresent(surface);
+        try target_surface.present();
 
         try io.sleep(.fromMilliseconds(16), .awake);
     }

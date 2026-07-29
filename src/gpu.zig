@@ -254,19 +254,13 @@ pub const GPUContext = struct {
         };
     }
 
-    pub fn getEncoder(self: *const Self) c.WGPUCommandEncoder {
+    pub fn getEncoder(self: Self) c.WGPUCommandEncoder {
         var desc = z_WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT();
         desc.label = toWGPUString("command encoder");
         return c.wgpuDeviceCreateCommandEncoder(self.device, &desc);
     }
 
-    pub fn getCommandBuffer(_: *const Self, encoder: c.WGPUCommandEncoder) c.WGPUCommandBuffer {
-        var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
-        desc.label = toWGPUString("command buffer");
-        return c.wgpuCommandEncoderFinish(encoder, &desc);
-    }
-
-    pub fn submitCommands(self: *const Self, commands: []const c.WGPUCommandBuffer) void {
+    pub fn submitCommands(self: Self, commands: []const c.WGPUCommandBuffer) void {
         c.wgpuQueueSubmit(self.queue, commands.len, @ptrCast(commands));
         for (commands) |command| {
             c.wgpuCommandBufferRelease(command);
@@ -279,6 +273,12 @@ pub const GPUContext = struct {
         c.wgpuAdapterRelease(self.adapter);
     }
 };
+
+pub fn finishEncoder(encoder: c.WGPUCommandEncoder) c.WGPUCommandBuffer {
+    var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
+    desc.label = toWGPUString("command buffer");
+    return c.wgpuCommandEncoderFinish(encoder, &desc);
+}
 
 pub const Surface = struct {
     surface: c.WGPUSurface,
@@ -317,31 +317,6 @@ pub const Surface = struct {
 
     pub fn deinit(self: *Self) void {
         c.wgpuSurfaceRelease(self.surface);
-    }
-};
-
-pub const Frame = struct {
-    encoder: c.WGPUCommandEncoder,
-    target_view: c.WGPUTextureView,
-
-    const Self = @This();
-
-    pub fn init(gpu_context: *const GPUContext, surface: *const Surface) !Self {
-        return .{
-            .encoder = gpu_context.getEncoder(),
-            .target_view = try surface.getCurrentView(),
-        };
-    }
-
-    pub fn end(self: *Self) c.WGPUCommandBuffer {
-        var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
-        desc.label = toWGPUString("command buffer");
-        return c.wgpuCommandEncoderFinish(self.encoder, &desc);
-    }
-
-    pub fn deinit(self: *Self) void {
-        c.wgpuCommandEncoderRelease(self.encoder);
-        c.wgpuTextureViewRelease(self.target_view);
     }
 };
 
@@ -1450,29 +1425,6 @@ pub const DrawObject = struct {
     pipeline: c.WGPURenderPipeline,
 
     const Self = @This();
-
-    pub fn draw(self: Self, pass: c.WGPURenderPassEncoder) void {
-        c.wgpuRenderPassEncoderSetPipeline(pass, self.pipeline);
-        for (self.bind_groups) |bg| {
-            c.wgpuRenderPassEncoderSetBindGroup(
-                pass,
-                bg.index,
-                bg.ptr,
-                0,
-                null,
-            );
-        }
-        for (self.mesh.buffers) |buf| {
-            c.wgpuRenderPassEncoderSetVertexBuffer(
-                pass,
-                buf.index,
-                buf.ptr,
-                0,
-                self.mesh.vertex_count * buf.stride,
-            );
-        }
-        c.wgpuRenderPassEncoderDraw(pass, self.mesh.vertex_count, 1, 0, 0);
-    }
 };
 
 pub const DepthStencilAttachment = struct {
@@ -1526,11 +1478,60 @@ pub const RenderPass = struct {
         };
     }
 
-    pub fn end(self: *Self) void {
-        c.wgpuRenderPassEncoderEnd(self.render_pass);
+    pub fn draw(self: Self, draw_object: DrawObject) void {
+        c.wgpuRenderPassEncoderSetPipeline(self.render_pass, draw_object.pipeline);
+        for (draw_object.bind_groups) |bg| {
+            c.wgpuRenderPassEncoderSetBindGroup(
+                self.render_pass,
+                bg.index,
+                bg.ptr,
+                0,
+                null,
+            );
+        }
+        for (draw_object.mesh.buffers) |buf| {
+            c.wgpuRenderPassEncoderSetVertexBuffer(
+                self.render_pass,
+                buf.index,
+                buf.ptr,
+                0,
+                draw_object.mesh.vertex_count * buf.stride,
+            );
+        }
+        c.wgpuRenderPassEncoderDraw(self.render_pass, draw_object.mesh.vertex_count, 1, 0, 0);
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn end(self: Self) void {
+        c.wgpuRenderPassEncoderEnd(self.render_pass);
         c.wgpuRenderPassEncoderRelease(self.render_pass);
     }
 };
+
+// pub const Frame = struct {
+//     encoder: c.WGPUCommandEncoder,
+//     target_view: c.WGPUTextureView,
+//
+//     const Self = @This();
+//
+//     pub fn init(gpu_context: GPUContext, surface: c.WGPUSurface) !Self {
+//         return .{
+//             .encoder = gpu_context.getEncoder(),
+//             .target_view = try getNextSurfaceView(surface),
+//         };
+//     }
+//
+//     pub fn beginRenderPass(self: Self, config: RenderPassConfig) RenderPass {
+//         return RenderPass.init(self.encoder, self.target_view, config);
+//     }
+//
+//     pub fn end(self: Self) c.WGPUCommandBuffer {
+//         var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
+//         desc.label = toWGPUString("command buffer");
+//         return c.wgpuCommandEncoderFinish(self.encoder, &desc);
+//
+//         c.wgpuCommandEncoderRelease(self.encoder);
+//         c.wgpuTextureViewRelease(self.target_view);
+//     }
+//
+//     const CommandBuffer = struct {};
+// };
