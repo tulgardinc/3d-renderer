@@ -9,9 +9,9 @@ const Shader = @import("shaders/compiled/2DVertexColors.zig");
 
 const vertices = [_]f32{
     // x     y       r    g    b
-    0.0, 0.5, 1.0, 0.0, 0.0, // top    - red
+    0.0, 0.5, 1.0, 0.0, 0.0, //   top    - red
     -0.5, -0.5, 0.0, 1.0, 0.0, // left   - green
-    0.5, -0.5, 0.0, 0.0, 1.0, // right  - blue
+    0.5, -0.5, 0.0, 0.0, 1.0, //  right  - blue
 };
 
 pub fn main() !void {
@@ -57,7 +57,7 @@ pub fn main() !void {
     var target_surface = gpu.Surface.init(gpu_context, surface);
     target_surface.configure(gpu_context, @intCast(width), @intCast(height));
 
-    var bind_group = try gpu.BindGroup(Shader, 0).init(allocator, gpu_context, .{});
+    var bind_group = try gpu.ShaderBindGroup(Shader, 0).init(allocator, gpu_context, .{});
     defer bind_group.deinit();
 
     bind_group.set_uniform(gpu_context, .time, 0);
@@ -70,21 +70,25 @@ pub fn main() !void {
     );
 
     const triangle_mesh: gpu.Mesh = .{
-        .buffers = &.{vertex_buffer},
         .vertex_count = 3,
-        .strides = &.{5 * @sizeOf(f32)},
-        .attributes = &.{
+        .buffers = &.{
             .{
-                .semantic = .position,
-                .format = .f32x2,
-                .offset = 0,
-                .buffer = 0,
-            },
-            .{
-                .semantic = .color,
-                .format = .f32x3,
-                .offset = 2 * @sizeOf(f32),
-                .buffer = 0,
+                .index = 0,
+                .ptr = vertex_buffer,
+                .stride = 5 * @sizeOf(f32),
+
+                .attributes = &.{
+                    .{
+                        .semantic = .position,
+                        .format = .f32x2,
+                        .offset = 0,
+                    },
+                    .{
+                        .semantic = .color,
+                        .format = .f32x3,
+                        .offset = 2 * @sizeOf(f32),
+                    },
+                },
             },
         },
     };
@@ -97,6 +101,12 @@ pub fn main() !void {
         &.{bind_group.layout},
         .{ .color_format = target_surface.format },
     );
+
+    const draw_object: gpu.DrawObject = .{
+        .bind_groups = &.{bind_group.group},
+        .mesh = triangle_mesh,
+        .pipeline = pipeline,
+    };
 
     const start_time = std.Io.Clock.real.now(io).toMilliseconds();
 
@@ -112,7 +122,7 @@ pub fn main() !void {
         const new_time = @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0;
         bind_group.set_uniform(gpu_context, .time, new_time);
 
-        const view = try gpu.getNextSurfaceView(surface); // stateless helper, keep it
+        const view = try gpu.getNextSurfaceView(surface);
         defer c.wgpuTextureViewRelease(view);
 
         var enc_desc = gpu.z_WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT();
@@ -129,14 +139,11 @@ pub fn main() !void {
         var rp_desc = gpu.z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
         rp_desc.label = gpu.toWGPUString("main pass");
         rp_desc.colorAttachmentCount = 1;
-        rp_desc.colorAttachments = &color; // &color must outlive BeginRenderPass (it copies) — fine, same scope
+        rp_desc.colorAttachments = &color;
 
         const pass = c.wgpuCommandEncoderBeginRenderPass(encoder, &rp_desc);
 
-        c.wgpuRenderPassEncoderSetPipeline(pass, pipeline);
-        c.wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group.group, 0, null);
-        c.wgpuRenderPassEncoderSetVertexBuffer(pass, 0, vertex_buffer, 0, @sizeOf(@TypeOf(vertices)));
-        c.wgpuRenderPassEncoderDraw(pass, vertices.len / 5, 1, 0, 0);
+        draw_object.draw(pass);
 
         c.wgpuRenderPassEncoderEnd(pass);
         c.wgpuRenderPassEncoderRelease(pass);

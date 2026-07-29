@@ -415,7 +415,7 @@ pub fn getBindingResource(arena: std.mem.Allocator, src: []const u8, var_decl: c
     }
 }
 
-pub fn getBindingDeclerations(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) !std.ArrayList(Binding) {
+pub fn getBindingDeclerations(arena: std.mem.Allocator, src: []const u8, root: c.TSNode, cursor: ?*c.TSQueryCursor) ![]const Binding {
     var error_offset: u32 = 0;
     var error_type = c.TSQueryErrorNone;
 
@@ -456,7 +456,7 @@ pub fn getBindingDeclerations(arena: std.mem.Allocator, src: []const u8, root: c
         }
     }
 
-    return binding_declerations;
+    return binding_declerations.items;
 }
 
 fn parseWGSLDataType(arena: std.mem.Allocator, src: []const u8, type_node: c.TSNode) !?DataType {
@@ -675,7 +675,7 @@ pub fn getEntryFunctions(
     root: c.TSNode,
     cursor: ?*c.TSQueryCursor,
     struct_map: StructMap,
-) !std.ArrayList(ShaderEntry) {
+) ![]const ShaderEntry {
     var error_offset: u32 = 0;
     var error_type = c.TSQueryErrorNone;
 
@@ -770,7 +770,7 @@ pub fn getEntryFunctions(
         }
     }
 
-    return entry_functions;
+    return entry_functions.items;
 }
 
 pub fn getStructProperties(
@@ -973,19 +973,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.debug.print("=== ENTRY FUNCTIONS ===\n", .{});
     const entries = try getEntryFunctions(allocator, src, root, cursor, struct_map);
-    for (entries.items) |e| {
+    for (entries) |e| {
         std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
     }
 
     std.debug.print("=== BINDINGS ===\n", .{});
     const bindings = try getBindingDeclerations(allocator, src, root, cursor);
-    for (bindings.items) |e| {
+    for (bindings) |e| {
         std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
     }
 
     var struct_layout_map: StructLayoutMap = .empty;
     std.debug.print("=== STRUCT LAYOUTS ===\n", .{});
-    for (bindings.items) |b| {
+    for (bindings) |b| {
         const buf_type = switch (b.resource) {
             .uniform_buffer => |ub| ub.type,
             .storage_buffer => |ub| ub.type,
@@ -1008,13 +1008,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try struct_layout_map.put(allocator, ref, layout);
     }
 
-    std.mem.sort(Binding, bindings.items, {}, sortByGroup);
-    for (bindings.items) |b| {
+    std.mem.sort(Binding, @constCast(bindings), {}, sortByGroup);
+    for (bindings) |b| {
         std.debug.print("group: {any}, bind: {any}\n", .{ b.group, b.binding });
     }
 
     const visibility: []const u8 = blk: {
-        for (entries.items) |i| {
+        for (entries) |i| {
             if (i == .compute) break :blk "gpu.ShaderStage.compute";
         }
         break :blk "gpu.ShaderStage.vertex | gpu.ShaderStage.fragment";
@@ -1025,7 +1025,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try w.print("const gpu = @import(\"../../gpu.zig\");\n\n", .{});
 
     var vertex_index: ?usize = null;
-    for (entries.items, 0..) |item, i| {
+    for (entries, 0..) |item, i| {
         if (item == .vertex) vertex_index = i;
         const name = switch (item) {
             inline else => |x| x.name,
@@ -1036,7 +1036,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try w.print("\n", .{});
 
     if (vertex_index) |i| {
-        const params = entries.items[i].vertex.parameters;
+        const params = entries[i].vertex.parameters;
         try w.print("pub const vertex_meta: []const gpu.VertexInputMeta = &.{{\n", .{});
         for (params) |param| {
             if (std.meta.stringToEnum(VertexInputSemantics, param.name)) |_| {
@@ -1046,7 +1046,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try w.print("}};\n\n", .{});
     }
 
-    for (bindings.items) |binding| {
+    for (bindings) |binding| {
         const resource = binding.resource;
         if (resource == .uniform_buffer or resource == .storage_buffer) {
             const bind_type = if (resource == .uniform_buffer) resource.uniform_buffer.type else resource.storage_buffer.type;
@@ -1074,14 +1074,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
-    const max_group = bindings.items[bindings.items.len - 1].group;
+    const max_group = bindings[bindings.len - 1].group;
 
     // Uniforms
     try w.print("pub const Uniforms: []const ?[]const gpu.BindGroupEntryMeta = &.{{ ", .{});
 
     for (0..max_group + 1) |group| {
         var found_uniform = false;
-        for (bindings.items) |binding| {
+        for (bindings) |binding| {
             if (binding.group != group or binding.resource != .uniform_buffer) continue;
             if (!found_uniform) {
                 try w.print("&.{{\n", .{});
@@ -1102,7 +1102,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try w.print("pub const Resources: []const ?[]const gpu.BindGroupEntryMeta = &.{{", .{});
     for (0..max_group + 1) |group| {
         var found_resource = false;
-        for (bindings.items) |binding| {
+        for (bindings) |binding| {
             if (binding.group != group or binding.resource == .uniform_buffer) continue;
             if (!found_resource) {
                 try w.print("&.{{\n", .{});
@@ -1134,7 +1134,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     for (0..max_group + 1) |group| {
         try w.print("&.{{ \n", .{});
         var found_group = false;
-        for (bindings.items) |binding| {
+        for (bindings) |binding| {
             if (binding.group != group) continue;
             found_group = true;
             try w.print(

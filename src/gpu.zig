@@ -903,7 +903,7 @@ pub const VertexInputMeta = struct {
     sem_meaning: VertexInputSemantics,
 };
 
-pub fn BindGroup(Shader: type, index: comptime_int) type {
+pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
     if (Shader.layouts[index] == null) {
         @compileError("This group is not defined in the shader");
     }
@@ -964,7 +964,7 @@ pub fn BindGroup(Shader: type, index: comptime_int) type {
         uniforms_buffer: ?c.WGPUBuffer,
         resources: ResourcesStruct,
         layout: c.WGPUBindGroupLayout,
-        group: c.WGPUBindGroup,
+        group: BindGroup,
 
         const Self = @This();
 
@@ -1049,7 +1049,7 @@ pub fn BindGroup(Shader: type, index: comptime_int) type {
                 .uniforms_buffer = uniform_buffer,
                 .resources = resources,
                 .layout = group_layout,
-                .group = group,
+                .group = .{ .ptr = group, .index = index },
             };
         }
 
@@ -1093,7 +1093,7 @@ pub fn BindGroup(Shader: type, index: comptime_int) type {
             if (self.uniforms_buffer) |ub| {
                 c.wgpuBufferDestroy(ub);
             }
-            c.wgpuBindGroupRelease(self.group);
+            c.wgpuBindGroupRelease(self.group.ptr);
             c.wgpuBindGroupLayoutRelease(self.layout);
         }
     };
@@ -1361,17 +1361,21 @@ pub fn createBindGroup(
 }
 
 pub const Mesh = struct {
-    buffers: []const c.WGPUBuffer,
-    strides: []const u32,
-    attributes: []const AttributeDesc,
+    buffers: []const VertexBuffer,
     indices: ?IndexBuffer = null,
     vertex_count: u32,
+
+    pub const VertexBuffer = struct {
+        index: u32,
+        ptr: c.WGPUBuffer,
+        stride: u32,
+        attributes: []const AttributeDesc,
+    };
 
     pub const AttributeDesc = struct {
         semantic: VertexInputSemantics,
         format: VertexFormat,
         offset: u32,
-        buffer: u8,
     };
 
     pub const IndexBuffer = struct {
@@ -1395,10 +1399,10 @@ pub fn createPipelineFromMesh(
     const shader_module = try createShader(ctx, Shader.SOURCE, "vert color");
 
     var vertex_layouts: std.ArrayList(VertexBufferLayout) = .empty;
-    for (0..mesh.buffers.len) |i| {
-        const stride = mesh.strides[i];
+    for (mesh.buffers) |buf| {
+        const stride = buf.stride;
         var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
-        for (mesh.attributes) |attr| {
+        for (buf.attributes) |attr| {
             const shader_location = blk: {
                 inline for (Shader.vertex_meta) |meta| {
                     if (meta.sem_meaning == attr.semantic) break :blk meta.location;
@@ -1434,3 +1438,99 @@ pub fn createPipelineFromMesh(
         bind_group_layouts,
     );
 }
+
+pub const BindGroup = struct {
+    ptr: c.WGPUBindGroup,
+    index: u32,
+};
+
+pub const DrawObject = struct {
+    mesh: Mesh,
+    bind_groups: []const BindGroup,
+    pipeline: c.WGPURenderPipeline,
+
+    const Self = @This();
+
+    pub fn draw(self: Self, pass: c.WGPURenderPassEncoder) void {
+        c.wgpuRenderPassEncoderSetPipeline(pass, self.pipeline);
+        for (self.bind_groups) |bg| {
+            c.wgpuRenderPassEncoderSetBindGroup(
+                pass,
+                bg.index,
+                bg.ptr,
+                0,
+                null,
+            );
+        }
+        for (self.mesh.buffers) |buf| {
+            c.wgpuRenderPassEncoderSetVertexBuffer(
+                pass,
+                buf.index,
+                buf.ptr,
+                0,
+                self.mesh.vertex_count * buf.stride,
+            );
+        }
+        c.wgpuRenderPassEncoderDraw(pass, self.mesh.vertex_count, 1, 0, 0);
+    }
+};
+
+pub const DepthStencilAttachment = struct {
+    depth_clear_value: f32 = 1.0,
+    depth_load_op: LoadOp = .clear,
+    depth_store_op: StoreOp = .store,
+};
+
+pub const ColorAttachment = struct {
+    clear_value: Color = .{ .r = 0.2, .g = 0.2, .b = 0.2, .a = 1.0 },
+    load_op: LoadOp = .clear,
+    store_op: StoreOp = .store,
+};
+
+pub const RenderPassConfig = struct {
+    color_attachment: ColorAttachment = .{},
+    depth_stencil_attachment: ?DepthStencilAttachment = null,
+    label: []const u8 = "render pass",
+};
+
+pub const RenderPass = struct {
+    render_pass: c.WGPURenderPassEncoder,
+
+    const Self = @This();
+
+    pub fn init(
+        encoder: c.WGPUCommandEncoder,
+        target_view: c.WGPUTextureView,
+        config: RenderPassConfig,
+    ) Self {
+        var desc = z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
+        desc.label = toWGPUString(config.label);
+
+        var color_attachment = z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
+        color_attachment.view = target_view;
+        color_attachment.loadOp = @intFromEnum(config.color_attachment.load_op);
+        color_attachment.storeOp = @intFromEnum(config.color_attachment.store_op);
+        color_attachment.clearValue = c.WGPUColor{
+            .r = config.color_attachment.clear_value.r,
+            .g = config.color_attachment.clear_value.g,
+            .b = config.color_attachment.clear_value.b,
+            .a = config.color_attachment.clear_value.a,
+        };
+        desc.colorAttachmentCount = 1;
+        desc.colorAttachments = &color_attachment;
+
+        const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(encoder, &desc);
+
+        return .{
+            .render_pass = render_pass_encoder,
+        };
+    }
+
+    pub fn end(self: *Self) void {
+        c.wgpuRenderPassEncoderEnd(self.render_pass);
+    }
+
+    pub fn deinit(self: *Self) void {
+        c.wgpuRenderPassEncoderRelease(self.render_pass);
+    }
+};
