@@ -42,6 +42,10 @@ pub extern fn z_WGPU_STORAGE_TEXTURE_BINDING_LAYOUT_INIT() c.WGPUStorageTextureB
 pub extern fn z_WGPU_STENCIL_FACE_STATE_INIT() c.WGPUStencilFaceState;
 pub extern fn z_WGPU_BIND_GROUP_DESCRIPTOR_INIT() c.WGPUBindGroupDescriptor;
 pub extern fn z_WGPU_BIND_GROUP_ENTRY_INIT() c.WGPUBindGroupEntry;
+pub extern fn z_WGPU_TEXTURE_DESCRIPTOR_INIT() c.WGPUTextureDescriptor;
+pub extern fn z_WGPU_SAMPLER_DESCRIPTOR_INIT() c.WGPUSamplerDescriptor;
+pub extern fn z_WGPU_TEXEL_COPY_TEXTURE_INFO_INIT() c.WGPUTexelCopyTextureInfo;
+pub extern fn z_WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT() c.WGPUTexelCopyBufferLayout;
 
 pub fn wgpuStringToString(sv: *const c.WGPUStringView) []const u8 {
     if (sv.data == null) {
@@ -486,6 +490,42 @@ pub const TextureFormat = enum(c.WGPUTextureFormat) {
     external = c.WGPUTextureFormat_External,
 };
 
+pub const TextureDimension = enum(c.WGPUTextureDimension) {
+    undefined = c.WGPUTextureDimension_Undefined,
+    @"1d" = c.WGPUTextureDimension_1D,
+    @"2d" = c.WGPUTextureDimension_2D,
+    @"3d" = c.WGPUTextureDimension_3D,
+};
+
+pub const TextureAspect = enum(c.WGPUTextureAspect) {
+    undefined = c.WGPUTextureAspect_Undefined,
+    all = c.WGPUTextureAspect_All,
+    stencil_only = c.WGPUTextureAspect_StencilOnly,
+    depth_only = c.WGPUTextureAspect_DepthOnly,
+    plane0_only = c.WGPUTextureAspect_Plane0Only,
+    plane1_only = c.WGPUTextureAspect_Plane1Only,
+    plane2_only = c.WGPUTextureAspect_Plane2Only,
+};
+
+pub const AddressMode = enum(c.WGPUAddressMode) {
+    undefined = c.WGPUAddressMode_Undefined,
+    clamp_to_edge = c.WGPUAddressMode_ClampToEdge,
+    repeat = c.WGPUAddressMode_Repeat,
+    mirror_repeat = c.WGPUAddressMode_MirrorRepeat,
+};
+
+pub const FilterMode = enum(c.WGPUFilterMode) {
+    undefined = c.WGPUFilterMode_Undefined,
+    nearest = c.WGPUFilterMode_Nearest,
+    linear = c.WGPUFilterMode_Linear,
+};
+
+pub const MipmapFilterMode = enum(c.WGPUMipmapFilterMode) {
+    undefined = c.WGPUMipmapFilterMode_Undefined,
+    nearest = c.WGPUMipmapFilterMode_Nearest,
+    linear = c.WGPUMipmapFilterMode_Linear,
+};
+
 pub const VertexFormat = enum(c.WGPUVertexFormat) {
     undefined = 0,
     u8 = c.WGPUVertexFormat_Uint8,
@@ -888,14 +928,14 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
 
     const ResourcesStruct: type = comptime blk: {
         if (resources_meta) |rm| {
-            var field_names: []const []const u8 = &.{};
-            var field_types: []const type = &.{};
-            var field_attrs: []const std.builtin.Type.StructField.Attributes = &.{};
-            for (rm) |meta| {
-                field_names = field_names ++ &.{meta.name};
-                field_attrs = field_attrs ++ &.{.{}};
+            var field_names: [rm.len][]const u8 = undefined;
+            var field_types: [rm.len]type = undefined;
+            var field_attrs: [rm.len]std.builtin.Type.StructField.Attributes = undefined;
+            for (rm, 0..) |meta, i| {
+                field_names[i] = meta.name;
+                field_attrs[i] = .{};
                 if (meta.Type == c.WGPUBuffer) {
-                    field_types = field_types ++ &.{
+                    field_types[i] = .{
                         struct {
                             buffer: c.WGPUBuffer,
                             size: ?u32 = null,
@@ -903,15 +943,15 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
                         },
                     };
                 } else {
-                    field_types = field_types ++ &.{meta.Type};
+                    field_types[i] = meta.Type;
                 }
             }
             break :blk @Struct(
                 .auto,
                 null,
-                field_names,
-                field_types,
-                field_attrs,
+                &field_names,
+                &field_types,
+                &field_attrs,
             );
         }
         break :blk struct {};
@@ -1003,6 +1043,7 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
                                 },
                                 c.WGPUTextureView => .{ .texture_view = value },
                                 c.WGPUSampler => .{ .sampler = value },
+                                else => unreachable,
                             },
                         };
                     group_entries_index += 1;
@@ -1507,31 +1548,71 @@ pub const RenderPass = struct {
     }
 };
 
-// pub const Frame = struct {
-//     encoder: c.WGPUCommandEncoder,
-//     target_view: c.WGPUTextureView,
-//
-//     const Self = @This();
-//
-//     pub fn init(gpu_context: GPUContext, surface: c.WGPUSurface) !Self {
-//         return .{
-//             .encoder = gpu_context.getEncoder(),
-//             .target_view = try getNextSurfaceView(surface),
-//         };
-//     }
-//
-//     pub fn beginRenderPass(self: Self, config: RenderPassConfig) RenderPass {
-//         return RenderPass.init(self.encoder, self.target_view, config);
-//     }
-//
-//     pub fn end(self: Self) c.WGPUCommandBuffer {
-//         var desc = z_WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT();
-//         desc.label = toWGPUString("command buffer");
-//         return c.wgpuCommandEncoderFinish(self.encoder, &desc);
-//
-//         c.wgpuCommandEncoderRelease(self.encoder);
-//         c.wgpuTextureViewRelease(self.target_view);
-//     }
-//
-//     const CommandBuffer = struct {};
-// };
+pub const Texture = struct {
+    ptr: c.WGPUTexture,
+    width: u32,
+    height: u32,
+
+    const Self = @This();
+
+    pub fn init(
+        ctx: GPUContext,
+        data: []const u8,
+        label: []const u8,
+        width: u32,
+        height: u32,
+        dimension: TextureDimension,
+        format: TextureFormat,
+    ) Self {
+        const size: c.WGPUExtent3D = .{
+            .width = width,
+            .height = height,
+            .depthOrArrayLayers = 1,
+        };
+
+        var desc = z_WGPU_TEXTURE_DESCRIPTOR_INIT();
+        desc.label = toWGPUString(label);
+        desc.dimension = @intFromEnum(dimension);
+        desc.format = @intFromEnum(format);
+        desc.size = size;
+        desc.usage = c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst;
+
+        const texture = c.wgpuDeviceCreateTexture(ctx.device, &desc);
+
+        var dest = z_WGPU_TEXEL_COPY_TEXTURE_INFO_INIT();
+        dest.texture = texture;
+
+        var layout = z_WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT();
+        layout.offset = 0;
+        layout.bytesPerRow = 4 * width;
+        layout.rowsPerImage = height;
+
+        c.wgpuQueueWriteTexture(
+            ctx.queue,
+            &dest,
+            data.ptr,
+            data.len,
+            &layout,
+            &size,
+        );
+
+        return .{
+            .ptr = texture,
+            .width = width,
+            .height = height,
+        };
+    }
+
+    pub fn getView(self: Self, label: []const u8) c.WGPUTextureView {
+        var desc = z_WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT();
+        desc.label = toWGPUString(label);
+
+        return c.wgpuTextureCreateView(self.ptr, &desc);
+    }
+};
+
+pub fn createSampler(ctx: GPUContext, label: []const u8) c.WGPUSampler {
+    var desc = z_WGPU_SAMPLER_DESCRIPTOR_INIT();
+    desc.label = toWGPUString(label);
+    return c.wgpuDeviceCreateSampler(ctx.device, &desc);
+}

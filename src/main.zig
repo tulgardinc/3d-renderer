@@ -1,20 +1,33 @@
 const std = @import("std");
-const gpu = @import("gpu.zig");
+const gpu = @import("gpu");
 const build_options = @import("build_options");
 const builtin = @import("builtin");
 const c = gpu.c;
-const Shader = @import("shaders/compiled/2DVertexColors.zig");
+const Shader = @import("2DTextured");
 
-const vertices = [_]f32{
-    // x     y       r    g    b
+const triangle_vertices = [_]f32{
+    // x y   r g b
     0.0, 0.5, 1.0, 0.0, 0.0, //   top    - red
     -0.5, -0.5, 0.0, 1.0, 0.0, // left   - green
     0.5, -0.5, 0.0, 0.0, 1.0, //  right  - blue
 };
 
-pub fn main() !void {
-    // TODO: Texture quad
+const quad_vertices = [_]f32{
+    // x y   u v
+    -0.5, 0.5, 0.0, 0.0, //  tl
+    -0.5, -0.5, 0.0, 1.0, // bl
+    0.5, -0.5, 1.0, 1.0, //  br
+    0.5, -0.5, 1.0, 1.0, //  br
+    0.5, 0.5, 1.0, 0.0, //   tr
+    -0.5, 0.5, 0.0, 0.0, //  tl
+};
 
+const checker_texture = [_]u8{
+    255, 255, 255, 255, 0,   0,   0,   255,
+    0,   0,   0,   255, 255, 255, 255, 255,
+};
+
+pub fn main() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
     const allocator = switch (builtin.mode) {
         .Debug => debug_allocator.allocator(),
@@ -57,25 +70,45 @@ pub fn main() !void {
     var target_surface = gpu.Surface.init(gpu_context, surface);
     target_surface.configure(gpu_context, @intCast(width), @intCast(height));
 
-    var bind_group = try gpu.ShaderBindGroup(Shader, 0).init(allocator, gpu_context, .{});
-    defer bind_group.deinit();
+    const texture = gpu.Texture.init(
+        gpu_context,
+        &checker_texture,
+        "checker",
+        2,
+        2,
+        .@"2d",
+        .rgba8_unorm,
+    );
+    const checker_view = texture.getView("checker view");
+    defer c.wgpuTextureViewRelease(checker_view);
 
-    bind_group.set_uniform(gpu_context, .time, 0);
+    const sampler = gpu.createSampler(gpu_context, "checker sampler");
+    defer c.wgpuSamplerRelease(sampler);
+
+    var bind_group = try gpu.ShaderBindGroup(Shader, 0).init(
+        allocator,
+        gpu_context,
+        .{
+            .smp = sampler,
+            .tex = checker_view,
+        },
+    );
+    defer bind_group.deinit();
 
     const vertex_buffer = try gpu.createBuffer(
         gpu_context,
-        std.mem.sliceAsBytes(&vertices),
+        std.mem.sliceAsBytes(&quad_vertices),
         "vertex buffer",
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
-    const triangle_mesh: gpu.Mesh = .{
-        .vertex_count = 3,
+    const quad_mesh: gpu.Mesh = .{
+        .vertex_count = 6,
         .buffers = &.{
             .{
                 .index = 0,
                 .ptr = vertex_buffer,
-                .stride = 5 * @sizeOf(f32),
+                .stride = 4 * @sizeOf(f32),
 
                 .attributes = &.{
                     .{
@@ -84,8 +117,8 @@ pub fn main() !void {
                         .offset = 0,
                     },
                     .{
-                        .semantic = .color,
-                        .format = .f32x3,
+                        .semantic = .uv,
+                        .format = .f32x2,
                         .offset = 2 * @sizeOf(f32),
                     },
                 },
@@ -97,18 +130,16 @@ pub fn main() !void {
         Shader,
         allocator,
         gpu_context,
-        triangle_mesh,
+        quad_mesh,
         &.{bind_group.layout},
         .{ .color_format = target_surface.format },
     );
 
     const draw_object: gpu.DrawObject = .{
         .bind_groups = &.{bind_group.group},
-        .mesh = triangle_mesh,
+        .mesh = quad_mesh,
         .pipeline = pipeline,
     };
-
-    const start_time = std.Io.Clock.real.now(io).toMilliseconds();
 
     var running = true;
     while (running) {
@@ -121,9 +152,6 @@ pub fn main() !void {
                 running = false;
             }
         }
-
-        const new_time = @as(f32, @floatFromInt(std.Io.Clock.real.now(io).toMilliseconds() - start_time)) / 1000.0;
-        bind_group.set_uniform(gpu_context, .time, new_time);
 
         const target_texture_view = try target_surface.getCurrentView();
         defer c.wgpuTextureViewRelease(target_texture_view);

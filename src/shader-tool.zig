@@ -1,9 +1,15 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("tree_sitter/api.h");
 });
 
 extern fn tree_sitter_wgsl() *const c.TSLanguage;
+
+// Reflection-dump logging, gated behind -Ddebug. No-op in normal builds.
+fn dprint(comptime fmt: []const u8, args: anytype) void {
+    if (build_options.debug) std.debug.print(fmt, args);
+}
 
 const vs_query_string =
     \\(function_decl 
@@ -921,9 +927,6 @@ pub fn printStructCode(
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    // TODO: command line parameter inputs
-    // TODO: try with real shaders
-
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -933,16 +936,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const io = threaded.io();
 
     const args = try init.args.toSlice(allocator);
-    if (args.len != 2) return error.WrongArgumentCount;
-    const path = args[1];
-    const file_name = std.fs.path.basename(path);
-    if (!std.mem.endsWith(u8, file_name, ".wgsl")) {
+    if (args.len != 3) return error.WrongArgumentCount;
+    const src_path = args[1];
+    // Tier 1: arg[2] is the exact output .zig file path (a build-cache path),
+    // not a directory. The build system creates the parent dir for us.
+    const out_path = args[2];
+    const src_file_name = std.fs.path.basename(src_path);
+    if (!std.mem.endsWith(u8, src_file_name, ".wgsl")) {
         return error.WrongFileType;
     }
-    const file_no_ext = file_name[0 .. file_name.len - 5];
-
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, "src/shaders/compiled");
+    const src_no_ext = src_file_name[0 .. src_file_name.len - 5];
 
     const parser = c.ts_parser_new();
     defer c.ts_parser_delete(parser);
@@ -950,7 +954,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = c.ts_parser_set_language(parser, tree_sitter_wgsl());
     const src = try cwd.readFileAlloc(
         io,
-        path,
+        src_path,
         allocator,
         .unlimited,
     );
@@ -961,30 +965,30 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const cursor = c.ts_query_cursor_new();
     defer c.ts_query_cursor_delete(cursor);
 
-    std.debug.print("=== STRUCT DECLERATIONS ===\n", .{});
+    dprint("=== STRUCT DECLERATIONS ===\n", .{});
     const struct_map = try getStructDeclerations(allocator, src, root, cursor);
     var iter = struct_map.iterator();
     while (iter.next()) |entry| {
-        std.debug.print("{s}\n", .{entry.key_ptr.*});
+        dprint("{s}\n", .{entry.key_ptr.*});
         for (entry.value_ptr.items) |field| {
-            std.debug.print("{f}\n", .{std.json.fmt(field, .{})});
+            dprint("{f}\n", .{std.json.fmt(field, .{})});
         }
     }
 
-    std.debug.print("=== ENTRY FUNCTIONS ===\n", .{});
+    dprint("=== ENTRY FUNCTIONS ===\n", .{});
     const entries = try getEntryFunctions(allocator, src, root, cursor, struct_map);
     for (entries) |e| {
-        std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
+        dprint("{f}\n", .{std.json.fmt(e, .{})});
     }
 
-    std.debug.print("=== BINDINGS ===\n", .{});
+    dprint("=== BINDINGS ===\n", .{});
     const bindings = try getBindingDeclerations(allocator, src, root, cursor);
     for (bindings) |e| {
-        std.debug.print("{f}\n", .{std.json.fmt(e, .{})});
+        dprint("{f}\n", .{std.json.fmt(e, .{})});
     }
 
     var struct_layout_map: StructLayoutMap = .empty;
-    std.debug.print("=== STRUCT LAYOUTS ===\n", .{});
+    dprint("=== STRUCT LAYOUTS ===\n", .{});
     for (bindings) |b| {
         const buf_type = switch (b.resource) {
             .uniform_buffer => |ub| ub.type,
@@ -1010,7 +1014,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     std.mem.sort(Binding, @constCast(bindings), {}, sortByGroup);
     for (bindings) |b| {
-        std.debug.print("group: {any}, bind: {any}\n", .{ b.group, b.binding });
+        dprint("group: {any}, bind: {any}\n", .{ b.group, b.binding });
     }
 
     const visibility: []const u8 = blk: {
@@ -1022,7 +1026,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var aw = std.Io.Writer.Allocating.init(allocator);
     const w = &aw.writer;
-    try w.print("const gpu = @import(\"../../gpu.zig\");\n\n", .{});
+    try w.print("const gpu = @import(\"gpu\");\n\n", .{});
 
     var vertex_index: ?usize = null;
     for (entries, 0..) |item, i| {
@@ -1206,15 +1210,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     try w.print("}};\n\n", .{});
 
-    const rel_path = try std.fs.path.relative(allocator, ".", null, "src/shaders/compiled", path);
-
-    try w.print("pub const NAME: []const u8 = \"{s}\";\n", .{file_no_ext});
-    try w.print("pub const SOURCE: []const u8 = @embedFile(\"{s}\");\n\n", .{rel_path});
-
-    const write_path = try std.fmt.allocPrint(allocator, "src/shaders/compiled/{s}.zig", .{file_no_ext});
+    try w.print("pub const NAME: []const u8 = \"{s}\";\n", .{src_no_ext});
+    // Inline the WGSL as a Zig multiline string literal: each source line is
+    // prefixed with `\\` (emitted as \\\\ here) and no escaping is needed.
+    try w.print("pub const SOURCE: []const u8 =\n", .{});
+    var src_iter = std.mem.splitScalar(u8, src, '\n');
+    while (src_iter.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        try w.print("    \\\\{s}\n", .{line});
+    }
+    try w.print(";\n", .{});
 
     try cwd.writeFile(io, .{
-        .sub_path = write_path,
+        .sub_path = out_path,
         .data = aw.written(),
     });
 }
