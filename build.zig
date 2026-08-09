@@ -102,13 +102,63 @@ pub fn build(b: *std.Build) void {
     gpu_mod.addFrameworkPath(b.path("lib/sdl3/"));
     exe.root_module.addImport("gpu", gpu_mod);
 
-    const run_tool_step = b.step("tool", "Run the shader tool");
+    const run_tool_step = b.step("tool", "Compile all shaders with no args, or one: zig build tool -- <ShaderName>");
 
-    const run_tool_cmd = b.addRunArtifact(shader_tool);
-    run_tool_step.dependOn(&run_tool_cmd.step);
+    if (b.args) |tool_args| {
+        const run_tool_cmd = b.addRunArtifact(shader_tool);
+        if (tool_args.len == 1) {
+            // Convenience form: resolve src/shaders/<Name>.wgsl, run codegen,
+            // then compile the generated module against `gpu` (same as the
+            // exe's per-shader step) so this catches Zig-side errors too —
+            // not just wgsl parse/reflection errors — without linking the
+            // full app (SDL/Dawn/frameworks).
+            const stem = std.fs.path.stem(std.fs.path.basename(tool_args[0]));
+            run_tool_cmd.addFileArg(b.path(b.fmt("src/shaders/{s}.wgsl", .{stem})));
+            const out = run_tool_cmd.addOutputFileArg(b.fmt("{s}.zig", .{stem}));
 
-    if (b.args) |args| {
-        run_tool_cmd.addArgs(args);
+            const shader_mod = b.createModule(.{
+                .root_source_file = out,
+                .target = target,
+                .optimize = optimize,
+            });
+            shader_mod.addImport("gpu", gpu_mod);
+
+            const shader_obj = b.addObject(.{
+                .name = stem,
+                .root_module = shader_mod,
+            });
+            run_tool_step.dependOn(&shader_obj.step);
+        } else {
+            // Raw passthrough: zig build tool -- <src> <out>
+            run_tool_cmd.addArgs(tool_args);
+        }
+        run_tool_step.dependOn(&run_tool_cmd.step);
+    } else {
+        // No args: compile every shader in src/shaders/ so `zig build tool`
+        // alone is a full shader-compile check, without touching the app exe.
+        const io = b.graph.io;
+        var tool_shaders_handle = b.build_root.handle.openDir(
+            io,
+            "src/shaders",
+            .{ .iterate = true },
+        ) catch |err|
+            std.debug.panic("failed to open src/shaders: {s}", .{@errorName(err)});
+        defer tool_shaders_handle.close(io);
+
+        var tool_shader_it = tool_shaders_handle.iterate();
+        while (tool_shader_it.next(io) catch |err|
+            std.debug.panic("failed to iterate src/shaders: {s}", .{@errorName(err)})) |entry|
+        {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".wgsl")) continue;
+
+            const stem = entry.name[0 .. entry.name.len - ".wgsl".len];
+
+            const run_tool_cmd = b.addRunArtifact(shader_tool);
+            run_tool_cmd.addFileArg(b.path(b.fmt("src/shaders/{s}", .{entry.name})));
+            _ = run_tool_cmd.addOutputFileArg(b.fmt("{s}.zig", .{stem}));
+            run_tool_step.dependOn(&run_tool_cmd.step);
+        }
     }
 
     const install_fw = b.addInstallDirectory(.{
@@ -127,6 +177,12 @@ pub fn build(b: *std.Build) void {
     ) catch |err|
         std.debug.panic("failed to open src/shaders: {s}", .{@errorName(err)});
     defer shaders_handle.close(io);
+
+    // Mirrors every generated shader .zig (normally buried in the Zig cache)
+    // into src/shaders/compiled-copy/ so the codegen output is readable in-tree.
+    // addUpdateSourceFiles is Zig's sanctioned way to write generated files back
+    // into the source dir. Note: this dirties git — gitignore compiled-copy/.
+    const copy_shaders = b.addUpdateSourceFiles();
 
     var shader_it = shaders_handle.iterate();
     while (shader_it.next(io) catch |err|
@@ -157,7 +213,19 @@ pub fn build(b: *std.Build) void {
         // Guarantee every shader is generated even if the exe never imports it
         // (an unused module import wouldn't force the Run on its own).
         exe.step.dependOn(&gen_cmd.step);
+
+        // Drop a readable copy of the generated file into the source tree.
+        copy_shaders.addCopyFileToSource(
+            out,
+            b.fmt("src/shaders/compiled-copy/{s}.zig", .{stem}),
+        );
     }
+
+    // `zig build copy-shaders` on its own, and also on every normal build so the
+    // in-tree copies never go stale.
+    const copy_shaders_step = b.step("copy-shaders", "Copy generated shader .zig into src/shaders/compiled-copy/");
+    copy_shaders_step.dependOn(&copy_shaders.step);
+    exe.step.dependOn(&copy_shaders.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);

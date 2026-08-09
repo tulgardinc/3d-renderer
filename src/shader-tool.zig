@@ -6,7 +6,8 @@ const c = @cImport({
 
 extern fn tree_sitter_wgsl() *const c.TSLanguage;
 
-// Reflection-dump logging, gated behind -Ddebug. No-op in normal builds.
+// TODO: Remove semantic meaning
+
 fn dprint(comptime fmt: []const u8, args: anytype) void {
     if (build_options.debug) std.debug.print(fmt, args);
 }
@@ -131,28 +132,82 @@ const DataType = union(enum) {
         size: u32,
         scalar: WGSLScalar,
     },
-    mat: struct {
+    mat: Matrix,
+    array: Array,
+    struct_ref: []const u8,
+
+    const Matrix = struct {
         cols: u32,
         rows: u32,
         scalar: WGSLScalar,
-    },
-    array: struct {
+    };
+
+    const Array = struct {
         max_size: ?u32,
         type: *const DataType,
-    },
-    struct_ref: []const u8,
+    };
 
     pub fn getString(d: DataType, arena: std.mem.Allocator) ![]const u8 {
         return switch (d) {
             .scalar => |s| std.enums.tagName(WGSLScalar, s).?,
             .vec => |v| try std.fmt.allocPrint(arena, "[{any}]{s}", .{ v.size, std.enums.tagName(WGSLScalar, v.scalar).? }),
-            .mat => |m| try std.fmt.allocPrint(arena, "[{any}][{any}]{s}", .{ m.cols, m.rows, std.enums.tagName(WGSLScalar, m.scalar).? }),
+            .mat => |m| try getMatString(m, arena),
             .array => |a| if (a.max_size) |ms|
-                try std.fmt.allocPrint(arena, "[{any}]{s}", .{ ms, try getString(a.type.*, arena) })
+                try std.fmt.allocPrint(
+                    arena,
+                    "[{any}]{s}",
+                    .{ ms, try getArrayTypeString(a, arena) },
+                )
             else
-                return error.NoString,
+                try std.fmt.allocPrint(
+                    arena,
+                    "[]const {s}",
+                    .{try getArrayTypeString(a, arena)},
+                ),
             .struct_ref => |s| s,
         };
+    }
+
+    fn getMatString(m: Matrix, allocator: std.mem.Allocator) ![]const u8 {
+        return if (m.rows == 3) std.fmt.allocPrint(
+            allocator,
+            \\struct [{any}]{{
+            \\vec3: [3]{s},
+            \\pad: [4]u8 = @splat(0),
+            \\}};
+            \\
+        ,
+            .{
+                m.cols,
+                std.enums.tagName(WGSLScalar, m.scalar).?,
+            },
+        ) else std.fmt.allocPrint(
+            allocator,
+            "[{any}][{any}]{s}",
+            .{
+                m.cols,
+                m.rows,
+                std.enums.tagName(WGSLScalar, m.scalar).?,
+            },
+        );
+    }
+
+    fn getArrayTypeString(a: Array, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        return if (a.type.* == .vec and a.type.vec.size == 3)
+            std.fmt.allocPrint(
+                allocator,
+                \\struct {{
+                \\vec3: [3]{s},
+                \\pad: [4]u8 = @splat(0),
+                \\}};
+                \\
+            ,
+                .{
+                    std.enums.tagName(WGSLScalar, a.type.vec.scalar).?,
+                },
+            )
+        else
+            try a.type.getString(allocator);
     }
 };
 
@@ -186,11 +241,25 @@ fn sizeOf(data_type: DataType, space: AddressSpace, struct_layout_map: StructLay
     return switch (data_type) {
         .scalar => 4,
         .vec => |v| v.size * 4,
-        .mat => |m| m.rows * m.cols * 4,
-        .array => |arr| if (arr.max_size) |max_size| @max(
-            alignOf(arr.type.*, space, struct_layout_map).?,
-            sizeOf(arr.type.*, space, struct_layout_map).?,
-        ) * max_size else null,
+        .mat => |m| m.cols * alignOf(
+            .{
+                .vec = .{
+                    .size = m.rows,
+                    .scalar = m.scalar,
+                },
+            },
+            space,
+            struct_layout_map,
+        ).?,
+        .array => |arr| if (arr.max_size) |max_size| switch (space) {
+            .uniform => std.mem.alignForward(u32, sizeOf(arr.type.*, space, struct_layout_map).?, 16) * max_size,
+            .storage => std.mem.alignForward(
+                u32,
+                sizeOf(arr.type.*, space, struct_layout_map).?,
+                alignOf(arr.type.*, space, struct_layout_map).?,
+            ) * max_size,
+            .handle => null,
+        } else null,
         .struct_ref => |s| switch (struct_layout_map.get(s).?.size) {
             .fixed => |f| f,
             .runtime => null,
@@ -437,7 +506,7 @@ pub fn getBindingDeclerations(arena: std.mem.Allocator, src: []const u8, root: c
     defer c.ts_query_delete(query);
 
     if (query == null) {
-        std.debug.print("error at: {s}\n", .{global_var_decl_query[error_offset..]});
+        dprint("error at: {s}\n", .{global_var_decl_query[error_offset..]});
         return error.BadQuery;
     }
 
@@ -615,7 +684,7 @@ pub fn getStructDeclerations(
     defer c.ts_query_delete(query);
 
     if (query == null) {
-        std.debug.print("error at: {s}\n", .{struct_decl_query[error_offset..]});
+        dprint("error at: {s}\n", .{struct_decl_query[error_offset..]});
         return error.BadQuery;
     }
 
@@ -705,7 +774,7 @@ pub fn getEntryFunctions(
         defer c.ts_query_delete(query);
 
         if (query == null) {
-            std.debug.print("error at: {s}\n", .{query_string[error_offset..]});
+            dprint("error at: {s}\n", .{query_string[error_offset..]});
             return error.BadQuery;
         }
 
@@ -867,9 +936,11 @@ pub fn printStructCode(
     struct_layout_map: StructLayoutMap,
     w: *std.Io.Writer,
 ) !void {
+    dprint("{s}\n", .{ref});
     const struct_definition = struct_map.get(ref).?;
     const struct_layout = struct_layout_map.get(ref).?;
     for (struct_definition.items) |field| {
+        dprint("{any}\n", .{field.type});
         switch (field.type) {
             .struct_ref => |in_ref| try printStructCode(allocator, in_ref, struct_map, struct_layout_map, w),
             .array => |arr| {
@@ -884,6 +955,8 @@ pub fn printStructCode(
             else => {},
         }
     }
+
+    dprint("PRINTING!\n", .{});
     try w.print(
         "pub const {s} = extern struct {{\n",
         .{ref},
@@ -951,6 +1024,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const parser = c.ts_parser_new();
     defer c.ts_parser_delete(parser);
 
+    // initialize tree-sitter
     _ = c.ts_parser_set_language(parser, tree_sitter_wgsl());
     const src = try cwd.readFileAlloc(
         io,
@@ -995,13 +1069,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
             .storage_buffer => |ub| ub.type,
             else => continue,
         };
-        if (buf_type != .struct_ref) continue;
+        const ref = switch (buf_type) {
+            .struct_ref => |sr| sr,
+            .array => |arr| switch (arr.type.*) {
+                .struct_ref => |sr| sr,
+                else => continue,
+            },
+            else => continue,
+        };
         const space: AddressSpace = switch (b.resource) {
             .uniform_buffer => .uniform,
             .storage_buffer => .storage,
             else => continue,
         };
-        const ref = buf_type.struct_ref;
         const layout = try getStructProperties(
             allocator,
             ref,
@@ -1055,21 +1135,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (resource == .uniform_buffer or resource == .storage_buffer) {
             const bind_type = if (resource == .uniform_buffer) resource.uniform_buffer.type else resource.storage_buffer.type;
             switch (bind_type) {
-                .struct_ref => |ref| {
-                    try printStructCode(allocator, ref, struct_map, struct_layout_map, w);
+                .struct_ref => |sr| {
+                    try printStructCode(
+                        allocator,
+                        sr,
+                        struct_map,
+                        struct_layout_map,
+                        w,
+                    );
                 },
-                .array => |arr| {
-                    if (arr.max_size == null) {
-                        const array_stride = @max(
-                            alignOf(arr.type.*, .storage, struct_layout_map).?,
-                            sizeOf(arr.type.*, .storage, struct_layout_map).?,
-                        );
-                        try w.print(
-                            "pub const {s}_STRIDE: u32 = {any};\n\n",
-                            .{
-                                try std.ascii.allocUpperString(allocator, binding.name),
-                                array_stride,
-                            },
+                .array => |ar| {
+                    if (ar.type.* == .struct_ref) {
+                        try printStructCode(
+                            allocator,
+                            ar.type.struct_ref,
+                            struct_map,
+                            struct_layout_map,
+                            w,
                         );
                     }
                 },
@@ -1081,7 +1163,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const max_group = bindings[bindings.len - 1].group;
 
     // Uniforms
-    try w.print("pub const Uniforms: []const ?[]const gpu.BindGroupEntryMeta = &.{{ ", .{});
+    try w.print("pub const Uniforms: []const ?[]const gpu.BindGroupUniformEntryMeta = &.{{ ", .{});
 
     for (0..max_group + 1) |group| {
         var found_uniform = false;
@@ -1103,7 +1185,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try w.print("}};\n\n", .{});
 
     // Resources
-    try w.print("pub const Resources: []const ?[]const gpu.BindGroupEntryMeta = &.{{", .{});
+    try w.print("pub const Resources: []const ?[]const gpu.BindGroupResourceEntryMeta = &.{{", .{});
     for (0..max_group + 1) |group| {
         var found_resource = false;
         for (bindings) |binding| {
@@ -1114,13 +1196,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
             switch (binding.resource) {
                 .storage_buffer => {
-                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .Type = gpu.c.WGPUBuffer }},\n", .{ binding.name, binding.binding });
+                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .resource_type = .{{ .storage_buffer = {s} }} }},\n", .{
+                        binding.name,
+                        binding.binding,
+                        try binding.resource.storage_buffer.type.getString(allocator),
+                    });
                 },
                 .sampler => {
-                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .Type = gpu.c.WGPUSampler }},\n", .{ binding.name, binding.binding });
+                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .resource_type = .{{ .sampler = {{}} }} }},\n", .{ binding.name, binding.binding });
                 },
                 .texture => {
-                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .Type = gpu.c.WGPUTextureView }},\n", .{ binding.name, binding.binding });
+                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .resource_type = .{{ .texture = {{}} }} }},\n", .{ binding.name, binding.binding });
                 },
                 else => {},
             }
@@ -1211,8 +1297,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     try w.print("}};\n\n", .{});
 
     try w.print("pub const NAME: []const u8 = \"{s}\";\n", .{src_no_ext});
-    // Inline the WGSL as a Zig multiline string literal: each source line is
-    // prefixed with `\\` (emitted as \\\\ here) and no escaping is needed.
     try w.print("pub const SOURCE: []const u8 =\n", .{});
     var src_iter = std.mem.splitScalar(u8, src, '\n');
     while (src_iter.next()) |raw_line| {

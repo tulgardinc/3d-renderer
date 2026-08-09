@@ -900,12 +900,23 @@ pub const BindGroupDescriptor = struct {
     entries: []const BindGroupEntry,
 };
 
-pub const BindGroupEntryMeta = struct {
+pub const BindGroupUniformEntryMeta = struct {
     Type: type,
     binding: u32,
     name: []const u8,
 };
 
+pub const BindGroupResourceEntryMeta = struct {
+    binding: u32,
+    name: []const u8,
+    resource_type: union(enum) {
+        sampler: void,
+        texture: void,
+        storage_buffer: type,
+    },
+};
+
+// TODO: Delete
 pub const VertexInputSemantics = enum {
     position,
     color,
@@ -923,8 +934,8 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
         @compileError("This group is not defined in the shader");
     }
 
-    const uniforms_meta: ?[]const BindGroupEntryMeta = Shader.Uniforms[index];
-    const resources_meta: ?[]const BindGroupEntryMeta = Shader.Resources[index];
+    const uniforms_meta: ?[]const BindGroupUniformEntryMeta = Shader.Uniforms[index];
+    const resources_meta: ?[]const BindGroupResourceEntryMeta = Shader.Resources[index];
 
     const ResourcesStruct: type = comptime blk: {
         if (resources_meta) |rm| {
@@ -934,17 +945,15 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
             for (rm, 0..) |meta, i| {
                 field_names[i] = meta.name;
                 field_attrs[i] = .{};
-                if (meta.Type == c.WGPUBuffer) {
-                    field_types[i] = .{
-                        struct {
-                            buffer: c.WGPUBuffer,
-                            size: ?u32 = null,
-                            offset: u32 = 0,
-                        },
-                    };
-                } else {
-                    field_types[i] = meta.Type;
-                }
+                field_types[i] = switch (meta.resource_type) {
+                    .storage_buffer => |Type| struct {
+                        buffer: Type,
+                        size: ?u32 = null,
+                        offset: u32 = 0,
+                    },
+                    .texture => c.WGPUTextureView,
+                    .sampler => c.WGPUSampler,
+                };
             }
             break :blk @Struct(
                 .auto,
@@ -1033,17 +1042,16 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
                     group_entries[group_entries_index] =
                         .{
                             .binding = r.binding,
-                            .resource = switch (r.Type) {
-                                c.WGPUBuffer => .{
+                            .resource = switch (r.resource_type) {
+                                .storage_buffer => .{
                                     .buffer = .{
                                         .buffer = value.buffer,
                                         .offset = value.offset,
                                         .size = value.size,
                                     },
                                 },
-                                c.WGPUTextureView => .{ .texture_view = value },
-                                c.WGPUSampler => .{ .sampler = value },
-                                else => unreachable,
+                                .texture => .{ .texture_view = value },
+                                .sampler => .{ .sampler = value },
                             },
                         };
                     group_entries_index += 1;
@@ -1069,7 +1077,7 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
             };
         }
 
-        fn GetUniformMetaFromEnum(e: UniformsEnum) BindGroupEntryMeta {
+        fn GetUniformMetaFromEnum(e: UniformsEnum) BindGroupUniformEntryMeta {
             if (uniforms_meta == null) @compileError("can not be called with no unifroms defined on the shader");
 
             for (uniforms_meta.?) |u| {
@@ -1376,23 +1384,27 @@ pub fn createBindGroup(
     return bind_group;
 }
 
+pub const Instances = struct {
+    buffers: []const VertexBuffer,
+    count: u32,
+};
+
+pub const VertexBuffer = struct {
+    ptr: c.WGPUBuffer,
+    stride: u32,
+    attributes: []const AttributeDesc,
+
+    pub const AttributeDesc = struct {
+        location: u32,
+        format: VertexFormat,
+        offset: u32,
+    };
+};
+
 pub const Mesh = struct {
     buffers: []const VertexBuffer,
     indices: ?IndexBuffer = null,
     vertex_count: u32,
-
-    pub const VertexBuffer = struct {
-        index: u32,
-        ptr: c.WGPUBuffer,
-        stride: u32,
-        attributes: []const AttributeDesc,
-    };
-
-    pub const AttributeDesc = struct {
-        semantic: VertexInputSemantics,
-        format: VertexFormat,
-        offset: u32,
-    };
 
     pub const IndexBuffer = struct {
         buffer: c.WGPUBuffer,
@@ -1406,6 +1418,7 @@ pub fn createPipelineFromMesh(
     allocator: std.mem.Allocator,
     ctx: GPUContext,
     mesh: Mesh,
+    instances: Instances,
     bind_group_layouts: ?[]const c.WGPUBindGroupLayout,
     config: struct { color_format: TextureFormat, label: ?[]const u8 = null },
 ) !c.WGPURenderPipeline {
@@ -1419,22 +1432,33 @@ pub fn createPipelineFromMesh(
         const stride = buf.stride;
         var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
         for (buf.attributes) |attr| {
-            const shader_location = blk: {
-                inline for (Shader.vertex_meta) |meta| {
-                    if (meta.sem_meaning == attr.semantic) break :blk meta.location;
-                }
-                break :blk 0;
-            };
             try vertex_attributes.append(arena_alloc, .{
                 .offset = attr.offset,
                 .format = attr.format,
-                .shader_location = shader_location,
+                .shader_location = attr.location,
             });
         }
         try vertex_layouts.append(arena_alloc, .{
             .attributes = vertex_attributes.items,
             .array_stride = stride,
             .step_mode = .vertex,
+        });
+    }
+
+    for (instances.buffers) |buf| {
+        const stride = buf.stride;
+        var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
+        for (buf.attributes) |attr| {
+            try vertex_attributes.append(arena_alloc, .{
+                .offset = attr.offset,
+                .format = attr.format,
+                .shader_location = attr.location,
+            });
+        }
+        try vertex_layouts.append(arena_alloc, .{
+            .attributes = vertex_attributes.items,
+            .array_stride = stride,
+            .step_mode = .instance,
         });
     }
 
@@ -1462,10 +1486,9 @@ pub const BindGroup = struct {
 
 pub const DrawObject = struct {
     mesh: Mesh,
-    bind_groups: []const BindGroup,
     pipeline: c.WGPURenderPipeline,
-
-    const Self = @This();
+    bind_groups: []const BindGroup,
+    instances: Instances,
 };
 
 pub const DepthStencilAttachment = struct {
@@ -1530,16 +1553,34 @@ pub const RenderPass = struct {
                 null,
             );
         }
+        var buffer_index: u32 = 0;
         for (draw_object.mesh.buffers) |buf| {
             c.wgpuRenderPassEncoderSetVertexBuffer(
                 self.render_pass,
-                buf.index,
+                buffer_index,
                 buf.ptr,
                 0,
                 draw_object.mesh.vertex_count * buf.stride,
             );
+            buffer_index += 1;
         }
-        c.wgpuRenderPassEncoderDraw(self.render_pass, draw_object.mesh.vertex_count, 1, 0, 0);
+        for (draw_object.instances.buffers) |buf| {
+            c.wgpuRenderPassEncoderSetVertexBuffer(
+                self.render_pass,
+                buffer_index,
+                buf.ptr,
+                0,
+                draw_object.instances.count * buf.stride,
+            );
+            buffer_index += 1;
+        }
+        c.wgpuRenderPassEncoderDraw(
+            self.render_pass,
+            draw_object.mesh.vertex_count,
+            draw_object.instances.count,
+            0,
+            0,
+        );
     }
 
     pub fn end(self: Self) void {
@@ -1603,11 +1644,15 @@ pub const Texture = struct {
         };
     }
 
-    pub fn getView(self: Self, label: []const u8) c.WGPUTextureView {
+    pub fn createView(self: Self, label: []const u8) c.WGPUTextureView {
         var desc = z_WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT();
         desc.label = toWGPUString(label);
 
         return c.wgpuTextureCreateView(self.ptr, &desc);
+    }
+
+    pub fn deinit(self: Self) void {
+        c.wgpuTextureRelease(self.ptr);
     }
 };
 
@@ -1615,4 +1660,17 @@ pub fn createSampler(ctx: GPUContext, label: []const u8) c.WGPUSampler {
     var desc = z_WGPU_SAMPLER_DESCRIPTOR_INIT();
     desc.label = toWGPUString(label);
     return c.wgpuDeviceCreateSampler(ctx.device, &desc);
+}
+
+// Shader helpers
+pub fn PaddedVec3(T: type) type {
+    return struct {
+        vec3: [3]T,
+        pad: [1]u8 = @splat(0),
+    };
+}
+
+pub fn PaddedMatNx3(N: comptime_int, T: type) type {
+    if (N < 2 or N > 4) @compileError("N must be 2, 3, or 4");
+    return [N]PaddedVec3(T);
 }

@@ -27,6 +27,13 @@ const checker_texture = [_]u8{
     0,   0,   0,   255, 255, 255, 255, 255,
 };
 
+const checker_texture2 = [_]u8{
+    255, 0, 0, 255, 0,   0, 0, 255,
+    0,   0, 0, 255, 255, 0, 0, 255,
+};
+
+// TODO array stride between cpu and gpu different!!!!!!!!!
+
 pub fn main() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
     const allocator = switch (builtin.mode) {
@@ -79,8 +86,24 @@ pub fn main() !void {
         .@"2d",
         .rgba8_unorm,
     );
-    const checker_view = texture.getView("checker view");
+    defer texture.deinit();
+
+    const checker_view = texture.createView("checker view");
     defer c.wgpuTextureViewRelease(checker_view);
+
+    const texture2 = gpu.Texture.init(
+        gpu_context,
+        &checker_texture2,
+        "checker",
+        2,
+        2,
+        .@"2d",
+        .rgba8_unorm,
+    );
+    defer texture2.deinit();
+
+    const checker_view2 = texture2.createView("checker view 2");
+    defer c.wgpuTextureViewRelease(checker_view2);
 
     const sampler = gpu.createSampler(gpu_context, "checker sampler");
     defer c.wgpuSamplerRelease(sampler);
@@ -95,6 +118,16 @@ pub fn main() !void {
     );
     defer bind_group.deinit();
 
+    var bind_group2 = try gpu.ShaderBindGroup(Shader, 0).init(
+        allocator,
+        gpu_context,
+        .{
+            .smp = sampler,
+            .tex = checker_view2,
+        },
+    );
+    defer bind_group2.deinit();
+
     const vertex_buffer = try gpu.createBuffer(
         gpu_context,
         std.mem.sliceAsBytes(&quad_vertices),
@@ -102,22 +135,29 @@ pub fn main() !void {
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
+    const pos = [_]f32{ -0.6, 0, 0.6, 0 };
+
+    const instance_buffer = try gpu.createBuffer(
+        gpu_context,
+        std.mem.sliceAsBytes(&pos),
+        "test",
+        gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
+    );
+
     const quad_mesh: gpu.Mesh = .{
         .vertex_count = 6,
         .buffers = &.{
             .{
-                .index = 0,
                 .ptr = vertex_buffer,
                 .stride = 4 * @sizeOf(f32),
-
                 .attributes = &.{
                     .{
-                        .semantic = .position,
+                        .location = 0,
                         .format = .f32x2,
                         .offset = 0,
                     },
                     .{
-                        .semantic = .uv,
+                        .location = 1,
                         .format = .f32x2,
                         .offset = 2 * @sizeOf(f32),
                     },
@@ -126,19 +166,39 @@ pub fn main() !void {
         },
     };
 
+    const instances: gpu.Instances =
+        .{
+            .count = 2,
+            .buffers = &.{
+                .{
+                    .ptr = instance_buffer,
+                    .stride = 2 * @sizeOf(f32),
+                    .attributes = &.{
+                        .{
+                            .location = 2,
+                            .format = .f32x2,
+                            .offset = 0,
+                        },
+                    },
+                },
+            },
+        };
+
     const pipeline = try gpu.createPipelineFromMesh(
         Shader,
         allocator,
         gpu_context,
         quad_mesh,
+        instances,
         &.{bind_group.layout},
         .{ .color_format = target_surface.format },
     );
 
-    const draw_object: gpu.DrawObject = .{
+    const quad1_object: gpu.DrawObject = .{
         .bind_groups = &.{bind_group.group},
         .mesh = quad_mesh,
         .pipeline = pipeline,
+        .instances = instances,
     };
 
     var running = true;
@@ -157,7 +217,7 @@ pub fn main() !void {
         defer c.wgpuTextureViewRelease(target_texture_view);
 
         const rp = gpu.RenderPass.init(encoder, target_texture_view, .{});
-        rp.draw(draw_object);
+        rp.draw(quad1_object);
         rp.end();
 
         const buffer = gpu.finishEncoder(encoder);

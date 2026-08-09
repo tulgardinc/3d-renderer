@@ -1,6 +1,7 @@
 struct VertexInput {
-    @location(0) position: vec2<f32>,
+    @location(0) vpos: vec2<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) ipos: vec2<f32>,
 };
 
 struct VertexOutput {
@@ -14,7 +15,7 @@ struct VertexOutput {
 @vertex
 fn vs(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.position = vec4<f32>(in.position.xy, 0.0f, 1.0f);
+    out.position = vec4<f32>(in.vpos.xy + in.ipos.xy, 0.0f, 1.0f);
     out.uv = in.uv;
     return out;
 }

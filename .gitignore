@@ -2,4 +2,5 @@ lib/
 .zig-cache/
 zig-out/
 tmp/
+src/shaders/compiled-copy/
 
