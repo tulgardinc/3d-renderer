@@ -6,8 +6,6 @@ const c = @cImport({
 
 extern fn tree_sitter_wgsl() *const c.TSLanguage;
 
-// TODO: Remove semantic meaning
-
 fn dprint(comptime fmt: []const u8, args: anytype) void {
     if (build_options.debug) std.debug.print(fmt, args);
 }
@@ -147,28 +145,28 @@ const DataType = union(enum) {
         type: *const DataType,
     };
 
-    pub fn getString(d: DataType, arena: std.mem.Allocator) ![]const u8 {
+    pub fn getString(d: DataType, allocator: std.mem.Allocator, struct_map: StructMap) ![]const u8 {
         return switch (d) {
             .scalar => |s| std.enums.tagName(WGSLScalar, s).?,
-            .vec => |v| try std.fmt.allocPrint(arena, "[{any}]{s}", .{ v.size, std.enums.tagName(WGSLScalar, v.scalar).? }),
-            .mat => |m| try getMatString(m, arena),
+            .vec => |v| try std.fmt.allocPrint(allocator, "[{any}]{s}", .{ v.size, std.enums.tagName(WGSLScalar, v.scalar).? }),
+            .mat => |m| try getMatString(allocator, m),
             .array => |a| if (a.max_size) |ms|
                 try std.fmt.allocPrint(
-                    arena,
+                    allocator,
                     "[{any}]{s}",
-                    .{ ms, try getArrayTypeString(a, arena) },
+                    .{ ms, try getArrayTypeString(allocator, a, struct_map) },
                 )
             else
                 try std.fmt.allocPrint(
-                    arena,
+                    allocator,
                     "[]const {s}",
-                    .{try getArrayTypeString(a, arena)},
+                    .{try getArrayTypeString(allocator, a, struct_map)},
                 ),
             .struct_ref => |s| s,
         };
     }
 
-    fn getMatString(m: Matrix, allocator: std.mem.Allocator) ![]const u8 {
+    fn getMatString(allocator: std.mem.Allocator, m: Matrix) ![]const u8 {
         return if (m.rows == 3) std.fmt.allocPrint(
             allocator,
             \\struct [{any}]{{
@@ -192,7 +190,7 @@ const DataType = union(enum) {
         );
     }
 
-    fn getArrayTypeString(a: Array, allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+    fn getArrayTypeString(allocator: std.mem.Allocator, a: Array, struct_map: StructMap) std.mem.Allocator.Error![]const u8 {
         return if (a.type.* == .vec and a.type.vec.size == 3)
             std.fmt.allocPrint(
                 allocator,
@@ -207,7 +205,7 @@ const DataType = union(enum) {
                 },
             )
         else
-            try a.type.getString(allocator);
+            try a.type.getString(allocator, struct_map);
     }
 };
 
@@ -308,13 +306,6 @@ const ShaderEntry = union(EntryTypes) {
     compute: struct {
         name: []const u8,
     },
-};
-
-pub const VertexInputSemantics = enum {
-    position,
-    color,
-    normal,
-    uv,
 };
 
 const ViewDimension = enum {
@@ -921,6 +912,52 @@ pub fn getStructProperties(
     };
 }
 
+/// Mirrors gpu.StorageShape.
+const StorageShape = union(enum) {
+    value: DataType,
+    array: DataType,
+    buffer: struct { header: []const u8, element: DataType },
+};
+
+fn classifyStorage(
+    data_type: DataType,
+    struct_map: StructMap,
+    struct_layout_map: StructLayoutMap,
+) StorageShape {
+    return switch (data_type) {
+        .array => |arr| if (arr.max_size == null)
+            .{ .array = arr.type.* }
+        else
+            .{ .value = data_type },
+        .struct_ref => |ref| switch (struct_layout_map.get(ref).?.size) {
+            .fixed => .{ .value = data_type },
+            .runtime => blk: {
+                const fields = struct_map.get(ref).?;
+                const last = fields.items[fields.items.len - 1];
+                break :blk .{ .buffer = .{
+                    .header = ref,
+                    .element = last.type.array.type.*,
+                } };
+            },
+        },
+        else => .{ .value = data_type },
+    };
+}
+
+fn minBindingSize(shape: StorageShape, struct_layout_map: StructLayoutMap) u32 {
+    return switch (shape) {
+        .value => |dt| sizeOf(dt, .storage, struct_layout_map) orelse 0,
+        .array => |element| @max(
+            sizeOf(element, .storage, struct_layout_map).?,
+            alignOf(element, .storage, struct_layout_map).?,
+        ),
+        .buffer => |b| blk: {
+            const runtime = struct_layout_map.get(b.header).?.size.runtime;
+            break :blk runtime.base + runtime.array_stride;
+        },
+    };
+}
+
 pub fn sortByGroup(_: void, a: Binding, b: Binding) bool {
     if (a.group < b.group) {
         return true;
@@ -934,29 +971,32 @@ pub fn printStructCode(
     ref: []const u8,
     struct_map: StructMap,
     struct_layout_map: StructLayoutMap,
+    emitted: *std.StringHashMapUnmanaged(void),
     w: *std.Io.Writer,
 ) !void {
     dprint("{s}\n", .{ref});
+    if (emitted.contains(ref)) return;
+    try emitted.put(allocator, ref, {});
+
     const struct_definition = struct_map.get(ref).?;
     const struct_layout = struct_layout_map.get(ref).?;
     for (struct_definition.items) |field| {
         dprint("{any}\n", .{field.type});
         switch (field.type) {
-            .struct_ref => |in_ref| try printStructCode(allocator, in_ref, struct_map, struct_layout_map, w),
+            .struct_ref => |in_ref| try printStructCode(allocator, in_ref, struct_map, struct_layout_map, emitted, w),
             .array => |arr| {
                 var inner_type: DataType = arr.type.*;
                 while (inner_type == .array) {
                     inner_type = inner_type.array.type.*;
                 }
                 if (inner_type == .struct_ref) {
-                    try printStructCode(allocator, inner_type.struct_ref, struct_map, struct_layout_map, w);
+                    try printStructCode(allocator, inner_type.struct_ref, struct_map, struct_layout_map, emitted, w);
                 }
             },
             else => {},
         }
     }
 
-    dprint("PRINTING!\n", .{});
     try w.print(
         "pub const {s} = extern struct {{\n",
         .{ref},
@@ -975,7 +1015,7 @@ pub fn printStructCode(
         }
         try w.print(
             "{s}: {s},\n",
-            .{ field.name, try field_def.type.getString(allocator) },
+            .{ field.name, try field_def.type.getString(allocator, struct_map) },
         );
     }
     if (struct_layout.padding_after) |p| {
@@ -1123,13 +1163,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const params = entries[i].vertex.parameters;
         try w.print("pub const vertex_meta: []const gpu.VertexInputMeta = &.{{\n", .{});
         for (params) |param| {
-            if (std.meta.stringToEnum(VertexInputSemantics, param.name)) |_| {
-                try w.print(".{{ .sem_meaning = .{s}, .location = {any} }},\n", .{ param.name, param.location });
-            }
+            try w.print(".{{ .name = .{s}, .location = {any} }},\n", .{ param.name, param.location });
         }
         try w.print("}};\n\n", .{});
     }
 
+    var emitted_structs: std.StringHashMapUnmanaged(void) = .empty;
     for (bindings) |binding| {
         const resource = binding.resource;
         if (resource == .uniform_buffer or resource == .storage_buffer) {
@@ -1141,6 +1180,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         sr,
                         struct_map,
                         struct_layout_map,
+                        &emitted_structs,
                         w,
                     );
                 },
@@ -1151,6 +1191,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                             ar.type.struct_ref,
                             struct_map,
                             struct_layout_map,
+                            &emitted_structs,
                             w,
                         );
                     }
@@ -1173,7 +1214,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 try w.print("&.{{\n", .{});
                 found_uniform = true;
             }
-            const type_string = try binding.resource.uniform_buffer.type.getString(allocator);
+            const type_string = try binding.resource.uniform_buffer.type.getString(allocator, struct_map);
             try w.print(".{{ .binding = {any}, .Type = {s}, .name = \"{s}\" }},\n", .{ binding.binding, type_string, binding.name });
         }
         if (found_uniform) {
@@ -1195,11 +1236,24 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 found_resource = true;
             }
             switch (binding.resource) {
-                .storage_buffer => {
-                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .resource_type = .{{ .storage_buffer = {s} }} }},\n", .{
+                .storage_buffer => |sb| {
+                    const payload = switch (classifyStorage(sb.type, struct_map, struct_layout_map)) {
+                        .value => |dt| try std.fmt.allocPrint(allocator, ".value = {s}", .{
+                            try dt.getString(allocator, struct_map),
+                        }),
+                        .array => |element| try std.fmt.allocPrint(allocator, ".array = {s}", .{
+                            try element.getString(allocator, struct_map),
+                        }),
+                        .buffer => |b| try std.fmt.allocPrint(
+                            allocator,
+                            ".buffer = .{{ .Header = {s}, .Element = {s} }}",
+                            .{ b.header, try b.element.getString(allocator, struct_map) },
+                        ),
+                    };
+                    try w.print(".{{ .name = \"{s}\", .binding = {any}, .resource_type = .{{ .storage = .{{ {s} }} }} }},\n", .{
                         binding.name,
                         binding.binding,
-                        try binding.resource.storage_buffer.type.getString(allocator),
+                        payload,
                     });
                 },
                 .sampler => {
@@ -1241,22 +1295,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     ),
                     else => try w.print(".{{ .buffer = .{{.type = .uniform, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},", .{}),
                 },
-                .storage_buffer => |sb| switch (sb.type) {
-                    .struct_ref => |ref| switch (struct_layout_map.get(ref).?.size) {
-                        .fixed => |f| try w.print(
-                            ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
-                            .{ if (sb.access == .read_write) ".storage" else ".read_only_storage", f },
-                        ),
-                        .runtime => try w.print(
-                            ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = 0 }} }} }},",
-                            .{if (sb.access == .read_write) ".storage" else ".read_only_storage"},
+                .storage_buffer => |sb| try w.print(
+                    ".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},",
+                    .{
+                        if (sb.access == .read_write) ".storage" else ".read_only_storage",
+                        minBindingSize(
+                            classifyStorage(sb.type, struct_map, struct_layout_map),
+                            struct_layout_map,
                         ),
                     },
-                    else => try w.print(".{{ .buffer = .{{ .type = {s}, .has_dynamic_offset = false, .min_binding_size = {any} }} }} }},", .{
-                        if (sb.access == .read) ".read_only_storage" else ".storage",
-                        if (sizeOf(sb.type, .storage, struct_layout_map)) |size| size else 0,
-                    }),
-                },
+                ),
                 .sampler => |smp| {
                     const smp_type = if (smp == .sampler) ".filtering" else ".sampler_comparison";
                     try w.print(".{{ .sampler = {s} }} }},", .{smp_type});

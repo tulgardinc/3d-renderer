@@ -906,27 +906,29 @@ pub const BindGroupUniformEntryMeta = struct {
     name: []const u8,
 };
 
+pub const StorageShape = union(enum) {
+    /// `var<storage> x: Config;`
+    value: type,
+    /// `var<storage> x: array<Element>;`
+    array: type,
+    /// `var<storage> x: Header;` where Header ends in `array<Element>`.
+    /// Header carries <FIELD>_OFFSET / <FIELD>_STRIDE.
+    buffer: struct { Header: type, Element: type },
+};
+
 pub const BindGroupResourceEntryMeta = struct {
     binding: u32,
     name: []const u8,
     resource_type: union(enum) {
         sampler: void,
         texture: void,
-        storage_buffer: type,
+        storage: StorageShape,
     },
-};
-
-// TODO: Delete
-pub const VertexInputSemantics = enum {
-    position,
-    color,
-    normal,
-    uv,
 };
 
 pub const VertexInputMeta = struct {
     location: u32,
-    sem_meaning: VertexInputSemantics,
+    name: []const u8,
 };
 
 pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
@@ -946,11 +948,7 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
                 field_names[i] = meta.name;
                 field_attrs[i] = .{};
                 field_types[i] = switch (meta.resource_type) {
-                    .storage_buffer => |Type| struct {
-                        buffer: Type,
-                        size: ?u32 = null,
-                        offset: u32 = 0,
-                    },
+                    .storage => BindGroupEntry.BufferEntry,
                     .texture => c.WGPUTextureView,
                     .sampler => c.WGPUSampler,
                 };
@@ -1036,6 +1034,8 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
                 }
             };
 
+            // TODO handle binding
+
             if (resources_meta) |rm| {
                 inline for (rm) |r| {
                     const value = @field(resources, r.name);
@@ -1043,13 +1043,7 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
                         .{
                             .binding = r.binding,
                             .resource = switch (r.resource_type) {
-                                .storage_buffer => .{
-                                    .buffer = .{
-                                        .buffer = value.buffer,
-                                        .offset = value.offset,
-                                        .size = value.size,
-                                    },
-                                },
+                                .storage => .{ .buffer = value },
                                 .texture => .{ .texture_view = value },
                                 .sampler => .{ .sampler = value },
                             },
@@ -1086,7 +1080,7 @@ pub fn ShaderBindGroup(Shader: type, comptime index: u32) type {
             @compileError("unknown field");
         }
 
-        pub fn set_uniform(
+        pub fn setUniform(
             self: *Self,
             ctx: GPUContext,
             comptime field: UniformsEnum,
@@ -1660,17 +1654,4 @@ pub fn createSampler(ctx: GPUContext, label: []const u8) c.WGPUSampler {
     var desc = z_WGPU_SAMPLER_DESCRIPTOR_INIT();
     desc.label = toWGPUString(label);
     return c.wgpuDeviceCreateSampler(ctx.device, &desc);
-}
-
-// Shader helpers
-pub fn PaddedVec3(T: type) type {
-    return struct {
-        vec3: [3]T,
-        pad: [1]u8 = @splat(0),
-    };
-}
-
-pub fn PaddedMatNx3(N: comptime_int, T: type) type {
-    if (N < 2 or N > 4) @compileError("N must be 2, 3, or 4");
-    return [N]PaddedVec3(T);
 }

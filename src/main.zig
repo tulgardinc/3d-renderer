@@ -32,8 +32,6 @@ const checker_texture2 = [_]u8{
     0,   0, 0, 255, 255, 0, 0, 255,
 };
 
-// TODO array stride between cpu and gpu different!!!!!!!!!
-
 pub fn main() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
     const allocator = switch (builtin.mode) {
