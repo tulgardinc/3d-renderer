@@ -1,36 +1,72 @@
 const std = @import("std");
 const gpu = @import("gpu");
-const build_options = @import("build_options");
 const builtin = @import("builtin");
 const c = gpu.c;
-const Shader = @import("2DTextured");
 
-const triangle_vertices = [_]f32{
-    // x y   r g b
-    0.0, 0.5, 1.0, 0.0, 0.0, //   top    - red
-    -0.5, -0.5, 0.0, 1.0, 0.0, // left   - green
-    0.5, -0.5, 0.0, 0.0, 1.0, //  right  - blue
-};
+const Reflected = @import("InstancedQuad");
+const QuadShader = gpu.Shader(Reflected);
+
+const Instance = Reflected.Instance;
+const InstanceStorage = QuadShader.Storage.instances;
+
+const grid_cols = 16;
+const grid_rows = 12;
+const quad_count = grid_cols * grid_rows;
 
 const quad_vertices = [_]f32{
     // x y   u v
-    -0.5, 0.5, 0.0, 0.0, //  tl
+    -0.5, 0.5, 0.0, 0.0, // tl
     -0.5, -0.5, 0.0, 1.0, // bl
-    0.5, -0.5, 1.0, 1.0, //  br
-    0.5, -0.5, 1.0, 1.0, //  br
-    0.5, 0.5, 1.0, 0.0, //   tr
-    -0.5, 0.5, 0.0, 0.0, //  tl
+    0.5, -0.5, 1.0, 1.0, // br
+    0.5, -0.5, 1.0, 1.0, // br
+    0.5, 0.5, 1.0, 0.0, // tr
+    -0.5, 0.5, 0.0, 0.0, // tl
 };
 
 const checker_texture = [_]u8{
-    255, 255, 255, 255, 0,   0,   0,   255,
-    0,   0,   0,   255, 255, 255, 255, 255,
+    255, 255, 255, 255, 110, 110, 110, 255,
+    110, 110, 110, 255, 255, 255, 255, 255,
 };
 
-const checker_texture2 = [_]u8{
-    255, 0, 0, 255, 0,   0, 0, 255,
-    0,   0, 0, 255, 255, 0, 0, 255,
-};
+fn model(tx: f32, ty: f32, scale_x: f32, scale_y: f32, angle: f32) [4][4]f32 {
+    const ca = @cos(angle);
+    const sa = @sin(angle);
+    return .{
+        .{ ca * scale_x, sa * scale_y, 0.0, 0.0 },
+        .{ -sa * scale_x, ca * scale_y, 0.0, 0.0 },
+        .{ 0.0, 0.0, 1.0, 0.0 },
+        .{ tx, ty, 0.0, 1.0 },
+    };
+}
+
+fn fillInstances(out: *[quad_count]Instance, t: f32, aspect: f32) void {
+    const cell_w = 2.0 / @as(f32, grid_cols);
+    const cell_h = 2.0 / @as(f32, grid_rows);
+
+    for (0..grid_rows) |row| {
+        for (0..grid_cols) |col| {
+            const fx = @as(f32, @floatFromInt(col));
+            const fy = @as(f32, @floatFromInt(row));
+
+            const tx = -1.0 + cell_w * (fx + 0.5);
+            const ty = 1.0 - cell_h * (fy + 0.5);
+
+            const phase = t + (fx + fy) * 0.35;
+            const pulse = 0.55 + 0.45 * @sin(phase);
+            const size = cell_h * 0.8 * pulse;
+
+            out[row * grid_cols + col] = .{
+                .model = model(tx, ty, size / aspect, size, phase * 0.5),
+                .tint = .{
+                    0.5 + 0.5 * @sin(phase),
+                    0.5 + 0.5 * @sin(phase + 2.094),
+                    0.5 + 0.5 * @sin(phase + 4.188),
+                    1.0,
+                },
+            };
+        }
+    }
+}
 
 pub fn main() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
@@ -52,7 +88,7 @@ pub fn main() !void {
 
     // Create window
     const window = c.SDL_CreateWindow(
-        "WebGPU Clear Color",
+        "Storage-buffer instanced quads",
         800,
         600,
         c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY,
@@ -89,24 +125,11 @@ pub fn main() !void {
     const checker_view = texture.createView("checker view");
     defer c.wgpuTextureViewRelease(checker_view);
 
-    const texture2 = gpu.Texture.init(
-        gpu_context,
-        &checker_texture2,
-        "checker",
-        2,
-        2,
-        .@"2d",
-        .rgba8_unorm,
-    );
-    defer texture2.deinit();
-
-    const checker_view2 = texture2.createView("checker view 2");
-    defer c.wgpuTextureViewRelease(checker_view2);
-
     const sampler = gpu.createSampler(gpu_context, "checker sampler");
     defer c.wgpuSamplerRelease(sampler);
 
-    var bind_group = try gpu.ShaderBindGroup(Shader, 0).init(
+    // Group 0: the material side
+    var material_group = try QuadShader.BindGroup(0).init(
         allocator,
         gpu_context,
         .{
@@ -114,31 +137,27 @@ pub fn main() !void {
             .tex = checker_view,
         },
     );
-    defer bind_group.deinit();
+    defer material_group.deinit();
 
-    var bind_group2 = try gpu.ShaderBindGroup(Shader, 0).init(
+    // Group 1: the instance array
+    const instance_storage = try InstanceStorage.initCapacity(
+        gpu_context,
+        quad_count,
+        .{ .label = "quad instances" },
+    );
+    defer instance_storage.deinit();
+
+    var instance_group = try QuadShader.BindGroup(1).init(
         allocator,
         gpu_context,
-        .{
-            .smp = sampler,
-            .tex = checker_view2,
-        },
+        .{ .instances = instance_storage.binding() },
     );
-    defer bind_group2.deinit();
+    defer instance_group.deinit();
 
     const vertex_buffer = try gpu.createBuffer(
         gpu_context,
         std.mem.sliceAsBytes(&quad_vertices),
         "vertex buffer",
-        gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
-    );
-
-    const pos = [_]f32{ -0.6, 0, 0.6, 0 };
-
-    const instance_buffer = try gpu.createBuffer(
-        gpu_context,
-        std.mem.sliceAsBytes(&pos),
-        "test",
         gpu.BufferUsage.vertex | gpu.BufferUsage.copy_dst,
     );
 
@@ -164,40 +183,25 @@ pub fn main() !void {
         },
     };
 
-    const instances: gpu.Instances =
-        .{
-            .count = 2,
-            .buffers = &.{
-                .{
-                    .ptr = instance_buffer,
-                    .stride = 2 * @sizeOf(f32),
-                    .attributes = &.{
-                        .{
-                            .location = 2,
-                            .format = .f32x2,
-                            .offset = 0,
-                        },
-                    },
-                },
-            },
-        };
-
     const pipeline = try gpu.createPipelineFromMesh(
-        Shader,
+        Reflected,
         allocator,
         gpu_context,
         quad_mesh,
-        instances,
-        &.{bind_group.layout},
+        &.{},
+        &.{ material_group.layout, instance_group.layout },
         .{ .color_format = target_surface.format },
     );
 
-    const quad1_object: gpu.DrawObject = .{
-        .bind_groups = &.{bind_group.group},
+    const quads: gpu.DrawObject = .{
+        .bind_groups = &.{ material_group.group, instance_group.group },
         .mesh = quad_mesh,
         .pipeline = pipeline,
-        .instances = instances,
+        .instances = .initCount(quad_count),
     };
+
+    var instance_data: [quad_count]Instance = undefined;
+    var frame: u32 = 0;
 
     var running = true;
     while (running) {
@@ -211,11 +215,21 @@ pub fn main() !void {
             }
         }
 
+        _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
+        const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+
+        // Frame-count time: the loop paces itself at ~16ms below.
+        const t = @as(f32, @floatFromInt(frame)) * 0.016;
+        frame +%= 1;
+
+        fillInstances(&instance_data, t, aspect);
+        try instance_storage.upload(gpu_context, &instance_data);
+
         const target_texture_view = try target_surface.getCurrentView();
         defer c.wgpuTextureViewRelease(target_texture_view);
 
         const rp = gpu.RenderPass.init(encoder, target_texture_view, .{});
-        rp.draw(quad1_object);
+        rp.draw(quads);
         rp.end();
 
         const buffer = gpu.finishEncoder(encoder);
