@@ -39,17 +39,26 @@ const panel_depth = 0.5;
 const orbit_radius = 0.62;
 const depth_span = 0.42; // cards sweep panel_depth +/- this
 
-// Counter-clockwise winding: the pipeline culls back faces and WebGPU's
-// default front face is CCW.
+// Winding: the pipeline culls back faces and WebGPU's default front face is
+// "ccw" -- but the spec judges winding in *framebuffer* coordinates, whose +y
+// points DOWN, while NDC's +y points up. The y-flip between the two reverses
+// the apparent order, so a front-facing triangle must be authored CLOCKWISE in
+// the y-up space we write vertices in. Reverse any of these triples and the
+// quad silently vanishes.
 const quad_vertices = [_]f32{
     // x     y     u    v
-    -0.5, -0.5, 0.0, 1.0, // bl
-    0.5,  -0.5, 1.0, 1.0, // br
-    0.5,  0.5,  1.0, 0.0, // tr
+    -0.5, 0.5,  0.0, 0.0, // 0 tl
+    -0.5, -0.5, 0.0, 1.0, // 1 bl
+    0.5,  -0.5, 1.0, 1.0, // 2 br
+    0.5,  0.5,  1.0, 0.0, // 3 tr
+};
 
-    -0.5, -0.5, 0.0, 1.0, // bl
-    0.5,  0.5,  1.0, 0.0, // tr
-    -0.5, 0.5,  0.0, 0.0, // tl
+// The two triangles that were spelled out longhand above. tl and br each
+// appear in both, which is the whole point: 4 vertices feed 6 slots. Each
+// triple keeps the clockwise-in-y-up order the cull mode demands.
+const quad_indices = [_]u16{
+    0, 1, 2, // tl, bl, br
+    2, 3, 0, // br, tr, tl
 };
 
 const checker_texture = [_]u8{
@@ -218,8 +227,22 @@ pub fn main() !void {
         .{ .vertex = true, .copy_dst = true },
     );
 
+    const index_buffer = try gpu.createBuffer(
+        gpu_context,
+        std.mem.sliceAsBytes(&quad_indices),
+        "index buffer",
+        .{ .index = true, .copy_dst = true },
+    );
+
     const quad_mesh: gpu.Mesh = .{
-        .vertex_count = 6,
+        // Vertices in the buffer (4), not slots drawn (6) -- the index count
+        // drives the draw now.
+        .vertex_count = 4,
+        .indices = .{
+            .buffer = index_buffer,
+            .format = .u16,
+            .index_count = quad_indices.len,
+        },
         .buffers = &.{
             .{
                 .ptr = vertex_buffer,

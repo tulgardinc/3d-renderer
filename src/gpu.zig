@@ -1640,6 +1640,7 @@ pub fn createPipeline(
     var primitive_state = z_WGPU_PRIMITIVE_STATE_INIT();
     primitive_state.topology = @intFromEnum(descriptor.primitive_topology);
     primitive_state.cullMode = @intFromEnum(descriptor.cull_mode);
+    primitive_state.frontFace = c.WGPUFrontFace_CCW;
     desc.primitive = primitive_state;
 
     if (descriptor.depth_stencil) |ds| {
@@ -1750,8 +1751,27 @@ pub const Mesh = struct {
 
     pub const IndexBuffer = struct {
         buffer: c.WGPUBuffer,
-        format: enum { u16, u32 },
+        format: Format,
         index_count: u32,
+
+        pub const Format = enum(c.WGPUIndexFormat) {
+            undefined = c.WGPUIndexFormat_Undefined,
+            u16 = c.WGPUIndexFormat_Uint16,
+            u32 = c.WGPUIndexFormat_Uint32,
+
+            pub fn byteSize(self: @This()) u64 {
+                return switch (self) {
+                    .u16 => 2,
+                    .u32 => 4,
+                    .undefined => unreachable,
+                };
+            }
+        };
+
+        /// Byte span of the whole index range, for `SetIndexBuffer`.
+        pub fn byteLength(self: @This()) u64 {
+            return self.index_count * self.format.byteSize();
+        }
     };
 };
 
@@ -1934,13 +1954,32 @@ pub const RenderPass = struct {
             );
             buffer_index += 1;
         }
-        c.wgpuRenderPassEncoderDraw(
-            self.render_pass,
-            draw_object.mesh.vertex_count,
-            draw_object.instances.count,
-            0,
-            0,
-        );
+        if (draw_object.mesh.indices) |ib| {
+            c.wgpuRenderPassEncoderSetIndexBuffer(
+                self.render_pass,
+                ib.buffer,
+                @intFromEnum(ib.format),
+                0,
+                ib.byteLength(),
+            );
+
+            c.wgpuRenderPassEncoderDrawIndexed(
+                self.render_pass,
+                ib.index_count,
+                draw_object.instances.count,
+                0,
+                0,
+                0,
+            );
+        } else {
+            c.wgpuRenderPassEncoderDraw(
+                self.render_pass,
+                draw_object.mesh.vertex_count,
+                draw_object.instances.count,
+                0,
+                0,
+            );
+        }
     }
 
     pub fn end(self: Self) void {
