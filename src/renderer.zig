@@ -122,7 +122,7 @@ pub fn initPrimitiveMeshes(
                     queue,
                     std.mem.sliceAsBytes(&vertices),
                     "cube vertices",
-                    gpu.BufferUsage.copy_dst | gpu.BufferUsage.vertex,
+                    .{ .copy_dst = true, .vertex = true },
                 );
                 const indices = [_]u32{
                     0, 1, 2,
@@ -133,7 +133,7 @@ pub fn initPrimitiveMeshes(
                     queue,
                     std.mem.sliceAsBytes(&indices),
                     "cube indices",
-                    gpu.BufferUsage.copy_dst | gpu.BufferUsage.index,
+                    .{ .copy_dst = true, .index = true },
                 );
 
                 const vertex_buffers: []const sys.VertexBuffer = &.{

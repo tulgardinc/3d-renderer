@@ -46,6 +46,7 @@ pub extern fn z_WGPU_TEXTURE_DESCRIPTOR_INIT() c.WGPUTextureDescriptor;
 pub extern fn z_WGPU_SAMPLER_DESCRIPTOR_INIT() c.WGPUSamplerDescriptor;
 pub extern fn z_WGPU_TEXEL_COPY_TEXTURE_INFO_INIT() c.WGPUTexelCopyTextureInfo;
 pub extern fn z_WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT() c.WGPUTexelCopyBufferLayout;
+pub extern fn z_WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT() c.WGPURenderPassDepthStencilAttachment;
 
 pub fn wgpuStringToString(sv: *const c.WGPUStringView) []const u8 {
     if (sv.data == null) {
@@ -326,12 +327,12 @@ pub fn createBuffer(
     ctx: GPUContext,
     contents: []const u8,
     label: []const u8,
-    usage: c.WGPUBufferUsage,
+    usage: BufferUsage,
 ) !c.WGPUBuffer {
     var desc = z_WGPU_BUFFER_DESCRIPTOR_INIT();
     desc.label = toWGPUString(label);
     desc.size = contents.len;
-    desc.usage = @bitCast(usage);
+    desc.usage = usage.toC();
 
     const buffer = c.wgpuDeviceCreateBuffer(ctx.device, &desc);
     if (buffer == null) {
@@ -486,6 +487,141 @@ pub const TextureFormat = enum(c.WGPUTextureFormat) {
     r10x6bg10x6_biplanar422_unorm = c.WGPUTextureFormat_R10X6BG10X6Biplanar422Unorm,
     r10x6bg10x6_biplanar444_unorm = c.WGPUTextureFormat_R10X6BG10X6Biplanar444Unorm,
     external = c.WGPUTextureFormat_External,
+
+    // Null means no defined layout
+    pub fn sizeOf(self: @This()) ?u32 {
+        return switch (self) {
+            .r8_unorm,
+            .r8_snorm,
+            .r8_uint,
+            .r8_sint,
+            .stencil8,
+            => 1,
+
+            .r16_unorm,
+            .r16_snorm,
+            .r16_uint,
+            .r16_sint,
+            .r16_float,
+            .rg8_unorm,
+            .rg8_snorm,
+            .rg8_uint,
+            .rg8_sint,
+            .depth16_unorm,
+            => 2,
+
+            .r32_float,
+            .r32_uint,
+            .r32_sint,
+            .rg16_unorm,
+            .rg16_snorm,
+            .rg16_uint,
+            .rg16_sint,
+            .rg16_float,
+            .rgba8_unorm,
+            .rgba8_unorm_srgb,
+            .rgba8_snorm,
+            .rgba8_uint,
+            .rgba8_sint,
+            .bgra8_unorm,
+            .bgra8_unorm_srgb,
+            .rgb10a2_uint,
+            .rgb10a2_unorm,
+            .rg11b10_ufloat,
+            .rgb9e5_ufloat,
+            .depth32_float,
+            => 4,
+
+            .rg32_float,
+            .rg32_uint,
+            .rg32_sint,
+            .rgba16_unorm,
+            .rgba16_snorm,
+            .rgba16_uint,
+            .rgba16_sint,
+            .rgba16_float,
+            => 8,
+
+            .rgba32_float,
+            .rgba32_uint,
+            .rgba32_sint,
+            => 16,
+
+            // 4x4 blocks
+            .bc1_rgba_unorm,
+            .bc1_rgba_unorm_srgb,
+            .bc4_r_unorm,
+            .bc4_r_snorm,
+            .etc2_rgb8_unorm,
+            .etc2_rgb8_unorm_srgb,
+            .etc2_rgb8a1_unorm,
+            .etc2_rgb8a1_unorm_srgb,
+            .eac_r11_unorm,
+            .eac_r11_snorm,
+            => 8,
+
+            .bc2_rgba_unorm,
+            .bc2_rgba_unorm_srgb,
+            .bc3_rgba_unorm,
+            .bc3_rgba_unorm_srgb,
+            .bc5_rg_unorm,
+            .bc5_rg_snorm,
+            .bc6h_rgb_ufloat,
+            .bc6h_rgb_float,
+            .bc7_rgba_unorm,
+            .bc7_rgba_unorm_srgb,
+            .etc2_rgba8_unorm,
+            .etc2_rgba8_unorm_srgb,
+            .eac_rg11_unorm,
+            .eac_rg11_snorm,
+            => 16,
+
+            // ASTC blocks
+            .astc4x4_unorm,
+            .astc4x4_unorm_srgb,
+            .astc5x4_unorm,
+            .astc5x4_unorm_srgb,
+            .astc5x5_unorm,
+            .astc5x5_unorm_srgb,
+            .astc6x5_unorm,
+            .astc6x5_unorm_srgb,
+            .astc6x6_unorm,
+            .astc6x6_unorm_srgb,
+            .astc8x5_unorm,
+            .astc8x5_unorm_srgb,
+            .astc8x6_unorm,
+            .astc8x6_unorm_srgb,
+            .astc8x8_unorm,
+            .astc8x8_unorm_srgb,
+            .astc10x5_unorm,
+            .astc10x5_unorm_srgb,
+            .astc10x6_unorm,
+            .astc10x6_unorm_srgb,
+            .astc10x8_unorm,
+            .astc10x8_unorm_srgb,
+            .astc10x10_unorm,
+            .astc10x10_unorm_srgb,
+            .astc12x10_unorm,
+            .astc12x10_unorm_srgb,
+            .astc12x12_unorm,
+            .astc12x12_unorm_srgb,
+            => 16,
+
+            .undefined,
+            .depth24_plus,
+            .depth24_plus_stencil8,
+            .depth32_float_stencil8,
+            .r8bg8_biplanar420_unorm,
+            .r10x6bg10x6_biplanar420_unorm,
+            .r8bg8a8_triplanar420_unorm,
+            .r8bg8_biplanar422_unorm,
+            .r8bg8_biplanar444_unorm,
+            .r10x6bg10x6_biplanar422_unorm,
+            .r10x6bg10x6_biplanar444_unorm,
+            .external,
+            => null,
+        };
+    }
 };
 
 pub const TextureDimension = enum(c.WGPUTextureDimension) {
@@ -710,31 +846,68 @@ pub const CullMode = enum(c.WGPUCullMode) {
     back = c.WGPUCullMode_Back,
 };
 
-// ── Bitmask namespaces (need bitwise OR, can't be enums) ─────────────────────
+pub const TextureUsage = packed struct(c.WGPUTextureUsage) {
+    copy_src: bool = false,
+    copy_dst: bool = false,
+    texture_binding: bool = false,
+    storage_binding: bool = false,
+    render_attachment: bool = false,
+    transient_attachment: bool = false,
+    storage_attachment: bool = false,
+    _padding: u57 = 0,
 
-pub const TextureUsage = struct {
-    pub const none: c.WGPUTextureUsage = c.WGPUTextureUsage_None;
-    pub const copy_src: c.WGPUTextureUsage = c.WGPUTextureUsage_CopySrc;
-    pub const copy_dst: c.WGPUTextureUsage = c.WGPUTextureUsage_CopyDst;
-    pub const texture_binding: c.WGPUTextureUsage = c.WGPUTextureUsage_TextureBinding;
-    pub const storage_binding: c.WGPUTextureUsage = c.WGPUTextureUsage_StorageBinding;
-    pub const render_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_RenderAttachment;
-    pub const transient_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_TransientAttachment;
-    pub const storage_attachment: c.WGPUTextureUsage = c.WGPUTextureUsage_StorageAttachment;
+    pub const none: TextureUsage = .{};
+
+    pub fn toC(self: TextureUsage) c.WGPUTextureUsage {
+        return @bitCast(self);
+    }
+
+    comptime {
+        std.debug.assert((TextureUsage{ .copy_src = true }).toC() == c.WGPUTextureUsage_CopySrc);
+        std.debug.assert((TextureUsage{ .copy_dst = true }).toC() == c.WGPUTextureUsage_CopyDst);
+        std.debug.assert((TextureUsage{ .texture_binding = true }).toC() == c.WGPUTextureUsage_TextureBinding);
+        std.debug.assert((TextureUsage{ .storage_binding = true }).toC() == c.WGPUTextureUsage_StorageBinding);
+        std.debug.assert((TextureUsage{ .render_attachment = true }).toC() == c.WGPUTextureUsage_RenderAttachment);
+        std.debug.assert((TextureUsage{ .transient_attachment = true }).toC() == c.WGPUTextureUsage_TransientAttachment);
+        std.debug.assert((TextureUsage{ .storage_attachment = true }).toC() == c.WGPUTextureUsage_StorageAttachment);
+        std.debug.assert(TextureUsage.none.toC() == c.WGPUTextureUsage_None);
+    }
 };
 
-pub const BufferUsage = struct {
-    pub const map_read: c.WGPUBufferUsage = c.WGPUBufferUsage_MapRead;
-    pub const map_write: c.WGPUBufferUsage = c.WGPUBufferUsage_MapWrite;
-    pub const copy_src: c.WGPUBufferUsage = c.WGPUBufferUsage_CopySrc;
-    pub const copy_dst: c.WGPUBufferUsage = c.WGPUBufferUsage_CopyDst;
-    pub const index: c.WGPUBufferUsage = c.WGPUBufferUsage_Index;
-    pub const vertex: c.WGPUBufferUsage = c.WGPUBufferUsage_Vertex;
-    pub const uniform: c.WGPUBufferUsage = c.WGPUBufferUsage_Uniform;
-    pub const storage: c.WGPUBufferUsage = c.WGPUBufferUsage_Storage;
-    pub const indirect: c.WGPUBufferUsage = c.WGPUBufferUsage_Indirect;
-    pub const query_resolve: c.WGPUBufferUsage = c.WGPUBufferUsage_QueryResolve;
-    pub const texel_buffer: c.WGPUBufferUsage = c.WGPUBufferUsage_TexelBuffer;
+pub const BufferUsage = packed struct(c.WGPUBufferUsage) {
+    map_read: bool = false,
+    map_write: bool = false,
+    copy_src: bool = false,
+    copy_dst: bool = false,
+    index: bool = false,
+    vertex: bool = false,
+    uniform: bool = false,
+    storage: bool = false,
+    indirect: bool = false,
+    query_resolve: bool = false,
+    texel_buffer: bool = false,
+    _padding: u53 = 0,
+
+    pub const none: BufferUsage = .{};
+
+    pub fn toC(self: BufferUsage) c.WGPUBufferUsage {
+        return @bitCast(self);
+    }
+
+    comptime {
+        std.debug.assert((BufferUsage{ .map_read = true }).toC() == c.WGPUBufferUsage_MapRead);
+        std.debug.assert((BufferUsage{ .map_write = true }).toC() == c.WGPUBufferUsage_MapWrite);
+        std.debug.assert((BufferUsage{ .copy_src = true }).toC() == c.WGPUBufferUsage_CopySrc);
+        std.debug.assert((BufferUsage{ .copy_dst = true }).toC() == c.WGPUBufferUsage_CopyDst);
+        std.debug.assert((BufferUsage{ .index = true }).toC() == c.WGPUBufferUsage_Index);
+        std.debug.assert((BufferUsage{ .vertex = true }).toC() == c.WGPUBufferUsage_Vertex);
+        std.debug.assert((BufferUsage{ .uniform = true }).toC() == c.WGPUBufferUsage_Uniform);
+        std.debug.assert((BufferUsage{ .storage = true }).toC() == c.WGPUBufferUsage_Storage);
+        std.debug.assert((BufferUsage{ .indirect = true }).toC() == c.WGPUBufferUsage_Indirect);
+        std.debug.assert((BufferUsage{ .query_resolve = true }).toC() == c.WGPUBufferUsage_QueryResolve);
+        std.debug.assert((BufferUsage{ .texel_buffer = true }).toC() == c.WGPUBufferUsage_TexelBuffer);
+        std.debug.assert(BufferUsage.none.toC() == c.WGPUBufferUsage_None);
+    }
 };
 
 pub const ShaderStage = struct {
@@ -845,8 +1018,8 @@ pub const StencilFaceState = struct {
 };
 
 pub const DepthStencilState = struct {
-    depth_write_enabled: bool,
-    depth_compare: CompareFunction,
+    depth_write_enabled: bool = true,
+    depth_compare: CompareFunction = .less,
     stencil_front: ?StencilFaceState = null,
     stencil_back: ?StencilFaceState = null,
     stencil_read_mask: u32 = 0xFFFFFFFF,
@@ -926,7 +1099,7 @@ pub const BindGroupResourceEntryMeta = struct {
 
 pub const UniformConfig = struct {
     label: []const u8 = "uniform buffer",
-    usage: c.WGPUBufferUsage = BufferUsage.uniform | BufferUsage.copy_dst,
+    usage: BufferUsage = .{ .uniform = true, .copy_dst = true },
 };
 
 pub fn UniformValue(T: type) type {
@@ -939,7 +1112,7 @@ pub fn UniformValue(T: type) type {
             var desc = z_WGPU_BUFFER_DESCRIPTOR_INIT();
             desc.label = toWGPUString(config.label);
             desc.size = @sizeOf(T);
-            desc.usage = @bitCast(config.usage);
+            desc.usage = config.usage.toC();
 
             const buffer = c.wgpuDeviceCreateBuffer(ctx.device, &desc);
             if (buffer == null) {
@@ -965,14 +1138,14 @@ pub fn UniformValue(T: type) type {
 
 pub const StorageConfig = struct {
     label: []const u8 = "storage buffer",
-    usage: c.WGPUBufferUsage = BufferUsage.storage | BufferUsage.copy_dst,
+    usage: BufferUsage = .{ .storage = true, .copy_dst = true },
 };
 
 fn createStorageBuffer(ctx: GPUContext, size: u64, config: StorageConfig) !c.WGPUBuffer {
     var desc = z_WGPU_BUFFER_DESCRIPTOR_INIT();
     desc.label = toWGPUString(config.label);
     desc.size = size;
-    desc.usage = @bitCast(config.usage);
+    desc.usage = config.usage.toC();
 
     const buffer = c.wgpuDeviceCreateBuffer(ctx.device, &desc);
     if (buffer == null) {
@@ -1589,7 +1762,12 @@ pub fn createPipelineFromMesh(
     mesh: Mesh,
     instance_buffers: []const VertexBuffer,
     bind_group_layouts: ?[]const c.WGPUBindGroupLayout,
-    config: struct { color_format: TextureFormat, label: ?[]const u8 = null },
+    config: struct {
+        color_format: TextureFormat,
+        label: ?[]const u8 = null,
+        depth_stencil_state: ?DepthStencilState = null,
+        depth_format: ?TextureFormat = null,
+    },
 ) !c.WGPURenderPipeline {
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_alloc = arena.allocator();
@@ -1635,6 +1813,8 @@ pub fn createPipelineFromMesh(
         .color_format = config.color_format,
         .shader_module = shader_module,
         .vertex_layouts = vertex_layouts.items,
+        .depth_stencil = config.depth_stencil_state,
+        .depth_format = config.depth_format,
     };
 
     return try createPipeline(
@@ -1664,6 +1844,7 @@ pub const DepthStencilAttachment = struct {
     depth_clear_value: f32 = 1.0,
     depth_load_op: LoadOp = .clear,
     depth_store_op: StoreOp = .store,
+    view: c.WGPUTextureView,
 };
 
 pub const ColorAttachment = struct {
@@ -1703,6 +1884,16 @@ pub const RenderPass = struct {
         };
         desc.colorAttachmentCount = 1;
         desc.colorAttachments = &color_attachment;
+
+        if (config.depth_stencil_attachment) |dsa| {
+            var depth_stencil_attachment = z_WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT();
+            depth_stencil_attachment.depthClearValue = dsa.depth_clear_value;
+            depth_stencil_attachment.depthLoadOp = @intFromEnum(dsa.depth_load_op);
+            depth_stencil_attachment.depthStoreOp = @intFromEnum(dsa.depth_store_op);
+            depth_stencil_attachment.view = dsa.view;
+
+            desc.depthStencilAttachment = &depth_stencil_attachment;
+        }
 
         const render_pass_encoder = c.wgpuCommandEncoderBeginRenderPass(encoder, &desc);
 
@@ -1758,21 +1949,29 @@ pub const RenderPass = struct {
     }
 };
 
+pub const TexelData = struct {
+    data: []const u8,
+    format: TextureFormat,
+    width: u32,
+    height: u32,
+};
+
 pub const Texture = struct {
     ptr: c.WGPUTexture,
     width: u32,
     height: u32,
+    format: TextureFormat,
 
     const Self = @This();
 
     pub fn init(
         ctx: GPUContext,
-        data: []const u8,
         label: []const u8,
         width: u32,
         height: u32,
         dimension: TextureDimension,
         format: TextureFormat,
+        usage: TextureUsage,
     ) Self {
         const size: c.WGPUExtent3D = .{
             .width = width,
@@ -1785,32 +1984,50 @@ pub const Texture = struct {
         desc.dimension = @intFromEnum(dimension);
         desc.format = @intFromEnum(format);
         desc.size = size;
-        desc.usage = c.WGPUTextureUsage_TextureBinding | c.WGPUTextureUsage_CopyDst;
+        desc.usage = usage.toC();
 
         const texture = c.wgpuDeviceCreateTexture(ctx.device, &desc);
-
-        var dest = z_WGPU_TEXEL_COPY_TEXTURE_INFO_INIT();
-        dest.texture = texture;
-
-        var layout = z_WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT();
-        layout.offset = 0;
-        layout.bytesPerRow = 4 * width;
-        layout.rowsPerImage = height;
-
-        c.wgpuQueueWriteTexture(
-            ctx.queue,
-            &dest,
-            data.ptr,
-            data.len,
-            &layout,
-            &size,
-        );
 
         return .{
             .ptr = texture,
             .width = width,
             .height = height,
+            .format = format,
         };
+    }
+
+    pub fn writeTexture(
+        self: Self,
+        ctx: GPUContext,
+        data: TexelData,
+        write_size: struct {
+            width: ?u32 = null,
+            height: ?u32 = null,
+            depthOrArrayLayers: u32 = 1,
+        },
+    ) void {
+        var dest = z_WGPU_TEXEL_COPY_TEXTURE_INFO_INIT();
+        dest.texture = self.ptr;
+
+        const extent: c.WGPUExtent3D = .{
+            .width = write_size.width orelse data.width,
+            .height = write_size.height orelse data.height,
+            .depthOrArrayLayers = write_size.depthOrArrayLayers,
+        };
+
+        var layout = z_WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT();
+        layout.offset = 0;
+        layout.bytesPerRow = data.format.sizeOf().? * data.width;
+        layout.rowsPerImage = data.height;
+
+        c.wgpuQueueWriteTexture(
+            ctx.queue,
+            &dest,
+            data.data.ptr,
+            data.data.len,
+            &layout,
+            &extent,
+        );
     }
 
     pub fn createView(self: Self, label: []const u8) c.WGPUTextureView {
