@@ -47,10 +47,10 @@ const depth_span = 0.42; // cards sweep panel_depth +/- this
 // quad silently vanishes.
 const quad_vertices = [_]f32{
     // x     y     u    v
-    -0.5, 0.5,  0.0, 0.0, // 0 tl
+    -0.5, 0.5, 0.0, 0.0, // 0 tl
     -0.5, -0.5, 0.0, 1.0, // 1 bl
-    0.5,  -0.5, 1.0, 1.0, // 2 br
-    0.5,  0.5,  1.0, 0.0, // 3 tr
+    0.5, -0.5, 1.0, 1.0, // 2 br
+    0.5, 0.5, 1.0, 0.0, // 3 tr
 };
 
 // The two triangles that were spelled out longhand above. tl and br each
@@ -126,16 +126,74 @@ fn fillInstances(out: *[instance_count]Instance, t: f32, aspect: f32) void {
     }
 }
 
-pub fn main() !void {
+// --- Browser plumbing ----------------------------------------------------
+//
+// Zig 0.16.0's std.Io.Threaded does not compile for wasm32-emscripten (the
+// emscripten W.STOPSIG shim returns the wrong type), and std.debug reaches for
+// exactly that io to write to stderr. So on web every std path that would touch
+// stderr -- logging, panicking, and the error trace std.start dumps when main
+// returns an error -- has to be replaced with one that goes to the JS console.
+
+/// Emscripten's console bridge, from emscripten/console.h.
+extern fn emscripten_console_error(utf8: [*:0]const u8) void;
+
+pub const std_options: std.Options = if (gpu.is_web) .{ .logFn = webLog } else .{};
+pub const panic = if (gpu.is_web)
+    std.debug.FullPanic(webPanic)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
+
+fn webLog(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const prefix = "[" ++ comptime level.asText() ++ "] " ++
+        (if (scope == .default) "" else @tagName(scope) ++ ": ");
+
+    var buf: [1024]u8 = undefined;
+    const msg: [:0]const u8 = std.fmt.bufPrintZ(&buf, prefix ++ format, args) catch
+        prefix ++ "<message too long>";
+    emscripten_console_error(msg.ptr);
+}
+
+fn webPanic(msg: []const u8, _: ?usize) noreturn {
+    var buf: [1024]u8 = undefined;
+    const truncated = msg[0..@min(msg.len, buf.len - 1)];
+    @memcpy(buf[0..truncated.len], truncated);
+    buf[truncated.len] = 0;
+    emscripten_console_error(@ptrCast(&buf));
+    @trap();
+}
+
+pub fn main() if (gpu.is_web) void else anyerror!void {
+    if (gpu.is_web) {
+        run() catch |err| std.log.err("fatal: {s}", .{@errorName(err)});
+    } else {
+        try run();
+    }
+}
+
+fn run() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
-    const allocator = switch (builtin.mode) {
+    const allocator = if (gpu.is_web)
+        // DebugAllocator wants a page allocator underneath it; on wasm the
+        // simplest correct answer is emscripten's own malloc.
+        std.heap.c_allocator
+    else switch (builtin.mode) {
         .Debug => debug_allocator.allocator(),
         else => std.heap.smp_allocator,
     };
 
-    var threaded: std.Io.Threaded = .init(allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    // std.Io.Threaded doesn't compile for wasm32-emscripten, and there would be
+    // nothing for it to schedule: the web build never blocks on io at all, it
+    // yields through asyncify instead. So the io is never constructed there --
+    // and never touched, which is what makes the `undefined` safe.
+    var threaded: if (gpu.is_web) void else std.Io.Threaded =
+        if (gpu.is_web) {} else .init(allocator, .{});
+    defer if (!gpu.is_web) threaded.deinit();
+    const io: std.Io = if (gpu.is_web) undefined else threaded.io();
 
     // Initialize SDL
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
@@ -349,8 +407,8 @@ pub fn main() !void {
                 c.SDL_EVENT_KEY_DOWN => {
                     if (event.key.key == c.SDLK_SPACE and !event.key.repeat) {
                         depth_enabled = !depth_enabled;
-                        std.debug.print(
-                            "depth test: {s}\n",
+                        std.log.info(
+                            "depth test: {s}",
                             .{if (depth_enabled) "on" else "off (draw order only)"},
                         );
                     }
@@ -391,7 +449,9 @@ pub fn main() !void {
 
         const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
 
-        // Frame-count time: the loop paces itself at ~16ms below.
+        // Frame-count time, assuming a 60Hz display. The loop now paces on the
+        // display itself, so this runs fast on anything quicker -- it wants a
+        // measured delta rather than a constant.
         const t = @as(f32, @floatFromInt(frame)) * 0.016;
         frame +%= 1;
 
@@ -425,6 +485,6 @@ pub fn main() !void {
 
         try target_surface.present();
 
-        try io.sleep(.fromMilliseconds(16), .awake);
+        gpu.waitForNextFrame();
     }
 }

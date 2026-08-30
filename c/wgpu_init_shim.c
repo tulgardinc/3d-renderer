@@ -1,4 +1,4 @@
-#include <dawn/webgpu.h>
+#include <webgpu/webgpu.h>
 
 WGPUDeviceDescriptor z_WGPU_DEVICE_DESCRIPTOR_INIT() {
   return WGPU_DEVICE_DESCRIPTOR_INIT;

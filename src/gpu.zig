@@ -1,9 +1,27 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+pub const is_web = builtin.os.tag == .emscripten;
+
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
     @cInclude("sdl3webgpu.h");
     @cInclude("webgpu/webgpu.h");
 });
+
+// Asyncify sleep
+extern fn emscripten_sleep(ms: u32) void;
+
+// Does requestAnimationFrame
+extern fn z_await_animation_frame() void;
+
+pub fn waitForNextFrame() void {
+    if (is_web) z_await_animation_frame();
+}
+
+fn pollTick(io: std.Io) !void {
+    if (is_web) emscripten_sleep(1) else try io.sleep(.fromMilliseconds(200), .awake);
+}
 
 // Shim externs
 
@@ -122,7 +140,7 @@ pub fn requestAdapterSync(io: std.Io, instance: c.WGPUInstance, surface: c.WGPUS
     c.wgpuInstanceProcessEvents(instance);
 
     while (!cb_data.done) {
-        try io.sleep(.fromMilliseconds(200), .awake);
+        try pollTick(io);
         c.wgpuInstanceProcessEvents(instance);
     }
 
@@ -197,7 +215,7 @@ pub fn requestDeviceSync(io: std.Io, instance: c.WGPUInstance, adapter: c.WGPUAd
     c.wgpuInstanceProcessEvents(instance);
 
     while (!cb_data.done) {
-        try io.sleep(.fromMilliseconds(200), .awake);
+        try pollTick(io);
         c.wgpuInstanceProcessEvents(instance);
     }
 
@@ -313,6 +331,8 @@ pub const Surface = struct {
     }
 
     pub fn present(self: *const Self) !void {
+        if (is_web) return;
+
         if (c.wgpuSurfacePresent(self.surface) == c.WGPUStatus_Error) {
             return error.FailedToPresent;
         }
@@ -366,7 +386,6 @@ pub const LoadOp = enum(c.WGPULoadOp) {
     undefined = c.WGPULoadOp_Undefined,
     load = c.WGPULoadOp_Load,
     clear = c.WGPULoadOp_Clear,
-    expand_resolve_texture = c.WGPULoadOp_ExpandResolveTexture,
 };
 
 pub const StoreOp = enum(c.WGPUStoreOp) {
@@ -479,14 +498,6 @@ pub const TextureFormat = enum(c.WGPUTextureFormat) {
     astc12x10_unorm_srgb = c.WGPUTextureFormat_ASTC12x10UnormSrgb,
     astc12x12_unorm = c.WGPUTextureFormat_ASTC12x12Unorm,
     astc12x12_unorm_srgb = c.WGPUTextureFormat_ASTC12x12UnormSrgb,
-    r8bg8_biplanar420_unorm = c.WGPUTextureFormat_R8BG8Biplanar420Unorm,
-    r10x6bg10x6_biplanar420_unorm = c.WGPUTextureFormat_R10X6BG10X6Biplanar420Unorm,
-    r8bg8a8_triplanar420_unorm = c.WGPUTextureFormat_R8BG8A8Triplanar420Unorm,
-    r8bg8_biplanar422_unorm = c.WGPUTextureFormat_R8BG8Biplanar422Unorm,
-    r8bg8_biplanar444_unorm = c.WGPUTextureFormat_R8BG8Biplanar444Unorm,
-    r10x6bg10x6_biplanar422_unorm = c.WGPUTextureFormat_R10X6BG10X6Biplanar422Unorm,
-    r10x6bg10x6_biplanar444_unorm = c.WGPUTextureFormat_R10X6BG10X6Biplanar444Unorm,
-    external = c.WGPUTextureFormat_External,
 
     // Null means no defined layout
     pub fn sizeOf(self: @This()) ?u32 {
@@ -611,14 +622,6 @@ pub const TextureFormat = enum(c.WGPUTextureFormat) {
             .depth24_plus,
             .depth24_plus_stencil8,
             .depth32_float_stencil8,
-            .r8bg8_biplanar420_unorm,
-            .r10x6bg10x6_biplanar420_unorm,
-            .r8bg8a8_triplanar420_unorm,
-            .r8bg8_biplanar422_unorm,
-            .r8bg8_biplanar444_unorm,
-            .r10x6bg10x6_biplanar422_unorm,
-            .r10x6bg10x6_biplanar444_unorm,
-            .external,
             => null,
         };
     }
@@ -636,9 +639,6 @@ pub const TextureAspect = enum(c.WGPUTextureAspect) {
     all = c.WGPUTextureAspect_All,
     stencil_only = c.WGPUTextureAspect_StencilOnly,
     depth_only = c.WGPUTextureAspect_DepthOnly,
-    plane0_only = c.WGPUTextureAspect_Plane0Only,
-    plane1_only = c.WGPUTextureAspect_Plane1Only,
-    plane2_only = c.WGPUTextureAspect_Plane2Only,
 };
 
 pub const AddressMode = enum(c.WGPUAddressMode) {
@@ -853,8 +853,7 @@ pub const TextureUsage = packed struct(c.WGPUTextureUsage) {
     storage_binding: bool = false,
     render_attachment: bool = false,
     transient_attachment: bool = false,
-    storage_attachment: bool = false,
-    _padding: u57 = 0,
+    _padding: u58 = 0,
 
     pub const none: TextureUsage = .{};
 
@@ -869,7 +868,6 @@ pub const TextureUsage = packed struct(c.WGPUTextureUsage) {
         std.debug.assert((TextureUsage{ .storage_binding = true }).toC() == c.WGPUTextureUsage_StorageBinding);
         std.debug.assert((TextureUsage{ .render_attachment = true }).toC() == c.WGPUTextureUsage_RenderAttachment);
         std.debug.assert((TextureUsage{ .transient_attachment = true }).toC() == c.WGPUTextureUsage_TransientAttachment);
-        std.debug.assert((TextureUsage{ .storage_attachment = true }).toC() == c.WGPUTextureUsage_StorageAttachment);
         std.debug.assert(TextureUsage.none.toC() == c.WGPUTextureUsage_None);
     }
 };
@@ -885,8 +883,7 @@ pub const BufferUsage = packed struct(c.WGPUBufferUsage) {
     storage: bool = false,
     indirect: bool = false,
     query_resolve: bool = false,
-    texel_buffer: bool = false,
-    _padding: u53 = 0,
+    _padding: u54 = 0,
 
     pub const none: BufferUsage = .{};
 
@@ -905,7 +902,6 @@ pub const BufferUsage = packed struct(c.WGPUBufferUsage) {
         std.debug.assert((BufferUsage{ .storage = true }).toC() == c.WGPUBufferUsage_Storage);
         std.debug.assert((BufferUsage{ .indirect = true }).toC() == c.WGPUBufferUsage_Indirect);
         std.debug.assert((BufferUsage{ .query_resolve = true }).toC() == c.WGPUBufferUsage_QueryResolve);
-        std.debug.assert((BufferUsage{ .texel_buffer = true }).toC() == c.WGPUBufferUsage_TexelBuffer);
         std.debug.assert(BufferUsage.none.toC() == c.WGPUBufferUsage_None);
     }
 };
@@ -1197,7 +1193,9 @@ pub fn StorageArray(Element: type) type {
 
         pub fn upload(self: Self, ctx: GPUContext, items: []const Element) !void {
             if (items.len > self.capacity) return error.CapacityExceeded;
-            c.wgpuQueueWriteBuffer(ctx.queue, self.ptr, 0, items.ptr, items.len * stride);
+            // `size` is a size_t, which is 32-bit on wasm while `stride` is a
+            // WebGPU u64 -- so the product has to be narrowed explicitly.
+            c.wgpuQueueWriteBuffer(ctx.queue, self.ptr, 0, items.ptr, @intCast(items.len * stride));
         }
 
         pub fn binding(self: Self) BindGroupEntry.BufferEntry {

@@ -163,21 +163,18 @@ WGPUSurface SDL_GetWGPUSurface(WGPUInstance instance, SDL_Window *window) {
   }
 #elif defined(__EMSCRIPTEN__)
   {
-#ifdef WEBGPU_BACKEND_EMDAWNWEBGPU
-    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector fromCanvasHTMLSelector;
-    fromCanvasHTMLSelector.chain.sType =
-        WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
-#else
-    WGPUSurfaceDescriptorFromCanvasHTMLSelector fromCanvasHTMLSelector;
-    fromCanvasHTMLSelector.chain.sType =
-        WGPUSType_SurfaceDescriptorFromCanvasHTMLSelector;
-#endif
-    fromCanvasHTMLSelector.chain.next = NULL;
-    fromCanvasHTMLSelector.selector = "canvas";
+    // Upstream's version of this branch predates the current webgpu.h, where
+    // `selector` is a WGPUStringView rather than a const char* and the legacy
+    // WGPUSurfaceDescriptorFromCanvasHTMLSelector no longer exists. "#canvas"
+    // is the CSS selector for the canvas SDL's emscripten backend renders into.
+    (void)window;
 
-    WGPUSurfaceDescriptor surfaceDescriptor;
+    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector fromCanvasHTMLSelector =
+        WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
+    fromCanvasHTMLSelector.selector = (WGPUStringView){"#canvas", WGPU_STRLEN};
+
+    WGPUSurfaceDescriptor surfaceDescriptor = WGPU_SURFACE_DESCRIPTOR_INIT;
     surfaceDescriptor.nextInChain = &fromCanvasHTMLSelector.chain;
-    surfaceDescriptor.label = NULL;
 
     return wgpuInstanceCreateSurface(instance, &surfaceDescriptor);
   }
