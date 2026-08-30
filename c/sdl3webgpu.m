@@ -39,10 +39,11 @@
 #include <Foundation/Foundation.h>
 #include <QuartzCore/CAMetalLayer.h>
 #elif defined(SDL_PLATFORM_IOS)
+// Just CAMetalLayer -- SDL owns the view. Deliberately NOT <Metal/Metal.h>:
+// the iOS 26 SDK's Metal headers use post-14 types unguarded and clang
+// promotes that to an error at this deployment target.
 #include <Foundation/Foundation.h>
-#include <Metal/Metal.h>
 #include <QuartzCore/CAMetalLayer.h>
-#include <UIKit/UIKit.h>
 #elif defined(SDL_PLATFORM_WIN32)
 #include <windows.h>
 #endif
@@ -76,18 +77,17 @@ WGPUSurface SDL_GetWGPUSurface(WGPUInstance instance, SDL_Window *window) {
   }
 #elif defined(SDL_PLATFORM_IOS)
   {
-    UIWindow *ui_window = (__bridge UIWindow *)SDL_GetPointerProperty(
-        props, SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);
-    if (!uiwindow)
+    // Upstream hand-rolled a CAMetalLayer sublayer here (with a typo that
+    // means this branch never compiled, and a point-sized drawableSize).
+    // SDL's own Metal view sizes the layer in pixels, sets contentsScale,
+    // and tracks rotation/resize -- so let it own the layer instead.
+    (void)props;
+    SDL_MetalView view = SDL_Metal_CreateView(window);
+    if (!view)
       return NULL;
-
-    UIView *ui_view = ui_window.rootViewController.view;
-    CAMetalLayer *metal_layer = [CAMetalLayer new];
-    metal_layer.opaque = true;
-    metal_layer.frame = ui_view.frame;
-    metal_layer.drawableSize = ui_view.frame.size;
-
-    [ui_view.layer addSublayer:metal_layer];
+    CAMetalLayer *metal_layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(view);
+    if (!metal_layer)
+      return NULL;
 
     WGPUSurfaceSourceMetalLayer fromMetalLayer;
     fromMetalLayer.chain.sType = WGPUSType_SurfaceSourceMetalLayer;

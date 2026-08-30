@@ -28,9 +28,10 @@ const InstanceStorage = QuadShader.Storage.instances;
 // depth attachment clears to 1.0 with `depth_compare = .less`, so smaller z
 // is nearer.
 //
-// Press SPACE to switch to a pipeline with `depth_compare = .always` and
-// depth writes off: same buffer, same draw order, no depth texture in play.
-// The scene collapses back into "last instance wins" and the illusion dies.
+// Press SPACE (tap, on iOS) to switch to a pipeline with `depth_compare =
+// .always` and depth writes off: same buffer, same draw order, no depth
+// texture in play. The scene collapses back into "last instance wins" and the
+// illusion dies.
 
 const card_count = 14;
 const instance_count = card_count + 1; // + the panel
@@ -175,7 +176,10 @@ pub fn main() if (gpu.is_web) void else anyerror!void {
     }
 }
 
-fn run() !void {
+// pub so the iOS root (main_ios.zig) can call it -- on iOS the entry point is
+// C's main via SDL_RunApp, not Zig's std.start, so this file is not the root
+// there and `main` below is never analyzed.
+pub fn run() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
     const allocator = if (gpu.is_web)
         // DebugAllocator wants a page allocator underneath it; on wasm the
@@ -321,7 +325,16 @@ fn run() !void {
         },
     };
 
-    const depth_format: gpu.TextureFormat = .depth16_unorm;
+    // depth16 is all the precision this scene needs -- except on the iOS
+    // *simulator*, whose Metal implementation doesn't support Depth16Unorm (a
+    // documented Metal-simulator gap; real devices are fine). Nothing fails
+    // validation there either: the depth test just reads garbage and rejects
+    // every fragment, leaving a clear-color screen.
+    const depth_format: gpu.TextureFormat =
+        if (builtin.os.tag == .ios and builtin.abi == .simulator)
+            .depth32_float
+        else
+            .depth16_unorm;
 
     var depth_texture = gpu.Texture.init(
         gpu_context,
@@ -412,6 +425,16 @@ fn run() !void {
                             .{if (depth_enabled) "on" else "off (draw order only)"},
                         );
                     }
+                },
+                // Touch stands in for SPACE on iOS. Comptime-gated: macOS
+                // trackpads also emit finger events, which would make every
+                // trackpad touch toggle the depth test on desktop.
+                c.SDL_EVENT_FINGER_DOWN => if (comptime builtin.os.tag == .ios) {
+                    depth_enabled = !depth_enabled;
+                    std.log.info(
+                        "depth test: {s}",
+                        .{if (depth_enabled) "on" else "off (draw order only)"},
+                    );
                 },
                 else => {},
             }
