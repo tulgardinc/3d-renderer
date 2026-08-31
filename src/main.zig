@@ -9,43 +9,48 @@ const Reflected = @import("Mesh");
 const Vertex = extern struct {
     position: [3]f32,
     uv: [2]f32,
+    normal: [3]f32,
 };
 
 /// A shared corner needs a different uv on each face it touches, so the cube is
 /// unwelded to 4 vertices per face. Corners run bottom-left, bottom-right,
 /// top-right, top-left as seen from outside, which makes every face wind
 /// counter-clockwise.
+///
+/// The same unwelding is what lets each face carry its own normal: all four of a
+/// face's vertices get that face's axis, which is what makes a cube shade flat
+/// rather than smooth.
 const vertices = [_]Vertex{
     // +z
-    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 1 } },
-    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 1, 1 } },
-    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 1, 0 } },
-    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 0, 0 } },
+    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 1 }, .normal = .{ 0, 0, 1 } },
+    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 1, 1 }, .normal = .{ 0, 0, 1 } },
+    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 1, 0 }, .normal = .{ 0, 0, 1 } },
+    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 0, 0 }, .normal = .{ 0, 0, 1 } },
     // -z
-    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 0, 1 } },
-    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 1, 1 } },
-    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 1, 0 } },
-    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 0, 0 } },
+    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 0, 1 }, .normal = .{ 0, 0, -1 } },
+    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 1, 1 }, .normal = .{ 0, 0, -1 } },
+    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 1, 0 }, .normal = .{ 0, 0, -1 } },
+    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 0, 0 }, .normal = .{ 0, 0, -1 } },
     // +x
-    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 0, 1 } },
-    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 1, 1 } },
-    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 1, 0 } },
-    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 0, 0 } },
+    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 0, 1 }, .normal = .{ 1, 0, 0 } },
+    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 1, 1 }, .normal = .{ 1, 0, 0 } },
+    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 1, 0 }, .normal = .{ 1, 0, 0 } },
+    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 0, 0 }, .normal = .{ 1, 0, 0 } },
     // -x
-    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 0, 1 } },
-    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 1, 1 } },
-    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 1, 0 } },
-    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 0, 0 } },
+    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 0, 1 }, .normal = .{ -1, 0, 0 } },
+    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 1, 1 }, .normal = .{ -1, 0, 0 } },
+    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 1, 0 }, .normal = .{ -1, 0, 0 } },
+    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 0, 0 }, .normal = .{ -1, 0, 0 } },
     // +y
-    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 0, 1 } },
-    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 1, 1 } },
-    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 1, 0 } },
-    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 0, 0 } },
+    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 0, 1 }, .normal = .{ 0, 1, 0 } },
+    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 1, 1 }, .normal = .{ 0, 1, 0 } },
+    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 1, 0 }, .normal = .{ 0, 1, 0 } },
+    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 0, 0 }, .normal = .{ 0, 1, 0 } },
     // -y
-    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 0, 1 } },
-    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 1, 1 } },
-    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 1, 0 } },
-    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 0 } },
+    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 0, 1 }, .normal = .{ 0, -1, 0 } },
+    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 1, 1 }, .normal = .{ 0, -1, 0 } },
+    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 1, 0 }, .normal = .{ 0, -1, 0 } },
+    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 0 }, .normal = .{ 0, -1, 0 } },
 };
 
 const indices = [_]u16{
@@ -207,6 +212,11 @@ pub fn run() !void {
                     },
                     .{
                         .location = 1,
+                        .format = .f32x3,
+                        .offset = @offsetOf(Vertex, "normal"),
+                    },
+                    .{
+                        .location = 2,
                         .format = .f32x2,
                         .offset = @offsetOf(Vertex, "uv"),
                     },
@@ -217,15 +227,12 @@ pub fn run() !void {
 
     const Shader = gpu.Shader(Reflected);
 
-    const view_matrix_ub = try Shader.Uniform.view_matrix.init(gpu_context, .{});
+    const world_ub = try Shader.Uniform.world.init(gpu_context, .{});
 
     var cam = Camera{};
 
-    const view = cam.getViewMatrix();
     var aspect: f32 = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
     var proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 100);
-    var view_proj = proj.mul(view);
-    view_matrix_ub.upload(gpu_context, view_proj.toArray());
 
     const checker_tex = gpu.Texture.init(
         gpu_context,
@@ -262,11 +269,11 @@ pub fn run() !void {
                 .tint = l.Vec4(f32).init(1, 0, 0, 1).toArray(),
             },
             .{
-                .model = (CubeInstance{ .pos = .init(0, 0, 0), .rot = 0 }).modelMatrix().toArray(),
+                .model = (CubeInstance{ .pos = .init(0, 0, 0), .rot = std.math.degreesToRadians(15) }).modelMatrix().toArray(),
                 .tint = l.Vec4(f32).init(0, 1, 0, 1).toArray(),
             },
             .{
-                .model = (CubeInstance{ .pos = .init(2, 0, 0), .rot = 0 }).modelMatrix().toArray(),
+                .model = (CubeInstance{ .pos = .init(2, 0, 0), .rot = std.math.degreesToRadians(30) }).modelMatrix().toArray(),
                 .tint = l.Vec4(f32).init(0, 0, 1, 1).toArray(),
             },
         },
@@ -276,7 +283,7 @@ pub fn run() !void {
         allocator,
         gpu_context,
         .{
-            .view_matrix = view_matrix_ub.binding(),
+            .world = world_ub.binding(),
             .texture = checker_view,
             .smp = sampler,
             .instances = instances.binding(),
@@ -384,11 +391,15 @@ pub fn run() !void {
             depth_view = depth_texture.createView("depth view");
 
             aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
-            proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 5);
+            proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 100);
         }
 
-        view_proj = proj.mul(cam.getViewMatrix());
-        view_matrix_ub.upload(gpu_context, view_proj.toArray());
+        const view_proj = proj.mul(cam.getViewMatrix());
+        world_ub.upload(gpu_context, .{
+            .vp_matrix = view_proj.toArray(),
+            .light_dir = l.Vec3(f32).init(2, 3, 1).normalize().toArray(),
+            .ambient = 0.01,
+        });
 
         const encoder = gpu_context.getEncoder();
         defer c.wgpuCommandEncoderRelease(encoder);
