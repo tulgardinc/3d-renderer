@@ -103,6 +103,32 @@ pub fn main() if (gpu.is_web) void else anyerror!void {
     }
 }
 
+const Camera = struct {
+    pos: l.Vec3(f32) = .init(0, 0, 3),
+    rot: l.Vec2(f32) = .init(0, 0),
+
+    const Self = @This();
+
+    pub fn forward(self: Self) l.Vec3(f32) {
+        return .init(@cos(self.rot.x) * @sin(self.rot.y), -@sin(self.rot.x), -@cos(self.rot.x) * @cos(self.rot.y));
+    }
+
+    pub fn getViewMatrix(self: Self) l.Mat4x4(f32) {
+        return l.Mat4x4(f32).lookAt(self.pos, self.pos.add(self.forward()), l.Vec3(f32).up());
+    }
+};
+
+const CubeInstance = struct {
+    pos: l.Vec3(f32),
+    rot: f32,
+
+    const Self = @This();
+
+    pub fn modelMatrix(self: Self) l.Mat4x4(f32) {
+        return l.Mat4x4(f32).translation(self.pos).mul(.rotation(.up(), self.rot));
+    }
+};
+
 pub fn run() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
     const allocator = if (gpu.is_web)
@@ -138,6 +164,8 @@ pub fn run() !void {
     var width: i32 = 0;
     var height: i32 = 0;
     _ = c.SDL_GetWindowSizeInPixels(window, &width, &height);
+
+    _ = c.SDL_SetWindowRelativeMouseMode(window, true);
 
     const instance = try gpu.GPUInstance.init();
     const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
@@ -191,10 +219,11 @@ pub fn run() !void {
 
     const view_matrix_ub = try Shader.Uniform.view_matrix.init(gpu_context, .{});
 
-    const cam_pos = l.Vec3(f32).init(0, 2, 3);
-    const view = l.Mat4x4(f32).lookAt(cam_pos, l.Vec3(f32).splat(0), l.Vec3(f32).init(0, 1, 0));
+    var cam = Camera{};
+
+    const view = cam.getViewMatrix();
     var aspect: f32 = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
-    var proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 5);
+    var proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 100);
     var view_proj = proj.mul(view);
     view_matrix_ub.upload(gpu_context, view_proj.toArray());
 
@@ -223,6 +252,26 @@ pub fn run() !void {
     const sampler = gpu.createSampler(gpu_context, "checker sampler");
     defer c.wgpuSamplerRelease(sampler);
 
+    const instances = try Shader.Storage.instances.initCapacity(gpu_context, 3, .{});
+    defer instances.deinit();
+    try instances.upload(
+        gpu_context,
+        &.{
+            .{
+                .model = (CubeInstance{ .pos = .init(-2, 0, 0), .rot = 0 }).modelMatrix().toArray(),
+                .tint = l.Vec4(f32).init(1, 0, 0, 1).toArray(),
+            },
+            .{
+                .model = (CubeInstance{ .pos = .init(0, 0, 0), .rot = 0 }).modelMatrix().toArray(),
+                .tint = l.Vec4(f32).init(0, 1, 0, 1).toArray(),
+            },
+            .{
+                .model = (CubeInstance{ .pos = .init(2, 0, 0), .rot = 0 }).modelMatrix().toArray(),
+                .tint = l.Vec4(f32).init(0, 0, 1, 1).toArray(),
+            },
+        },
+    );
+
     const bg = try Shader.BindGroup(0).init(
         allocator,
         gpu_context,
@@ -230,6 +279,7 @@ pub fn run() !void {
             .view_matrix = view_matrix_ub.binding(),
             .texture = checker_view,
             .smp = sampler,
+            .instances = instances.binding(),
         },
     );
     defer bg.deinit();
@@ -253,7 +303,7 @@ pub fn run() !void {
         .bind_groups = &.{bg.group},
         .mesh = cube_mesh,
         .pipeline = pipeline,
-        .instances = .initCount(1),
+        .instances = .initCount(3),
     };
 
     var depth_texture = gpu.Texture.init(
@@ -277,8 +327,37 @@ pub fn run() !void {
         while (c.SDL_PollEvent(&event)) {
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
+                c.SDL_EVENT_KEY_DOWN => {
+                    if (event.key.scancode == c.SDL_SCANCODE_ESCAPE) {
+                        _ = c.SDL_SetWindowRelativeMouseMode(window, !c.SDL_GetWindowRelativeMouseMode(window));
+                    }
+                },
+                c.SDL_EVENT_MOUSE_MOTION => {
+                    cam.rot.y += event.motion.xrel * 0.001;
+                    cam.rot.x += event.motion.yrel * 0.001;
+                },
                 else => {},
             }
+        }
+
+        const active_keys = c.SDL_GetKeyboardState(null);
+        const cam_speed = 0.1;
+        if (active_keys[c.SDL_SCANCODE_W]) {
+            cam.pos = cam.pos.add(cam.forward().scale(cam_speed));
+        } else if (active_keys[c.SDL_SCANCODE_S]) {
+            cam.pos = cam.pos.add(cam.forward().scale(-cam_speed));
+        }
+        if (active_keys[c.SDL_SCANCODE_D]) {
+            const right = cam.forward().cross(.up()).normalize().scale(cam_speed);
+            cam.pos = cam.pos.add(right);
+        } else if (active_keys[c.SDL_SCANCODE_A]) {
+            const left = cam.forward().cross(.up()).normalize().scale(-cam_speed);
+            cam.pos = cam.pos.add(left);
+        }
+        if (active_keys[c.SDL_SCANCODE_E]) {
+            cam.pos = cam.pos.add(l.Vec3(f32).up().scale(cam_speed));
+        } else if (active_keys[c.SDL_SCANCODE_Q]) {
+            cam.pos = cam.pos.add(l.Vec3(f32).up().scale(-cam_speed));
         }
 
         var cur_width: i32 = 0;
@@ -306,9 +385,10 @@ pub fn run() !void {
 
             aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
             proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 5);
-            view_proj = proj.mul(view);
-            view_matrix_ub.upload(gpu_context, view_proj.toArray());
         }
+
+        view_proj = proj.mul(cam.getViewMatrix());
+        view_matrix_ub.upload(gpu_context, view_proj.toArray());
 
         const encoder = gpu_context.getEncoder();
         defer c.wgpuCommandEncoderRelease(encoder);

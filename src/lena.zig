@@ -94,6 +94,18 @@ pub fn Vec3(T: type) type {
             return .{ .x = x, .y = y, .z = z };
         }
 
+        pub fn forward() Self {
+            return .{ .x = 0, .y = 0, .z = -1 };
+        }
+
+        pub fn right() Self {
+            return .{ .x = 1, .y = 0, .z = 0 };
+        }
+
+        pub fn up() Self {
+            return .{ .x = 0, .y = 1, .z = 0 };
+        }
+
         pub fn splat(s: T) Self {
             return fromSimd(@splat(s));
         }
@@ -125,11 +137,11 @@ pub fn Vec3(T: type) type {
         pub fn cross(a: Self, b: Self) Self {
             const va = a.toSimd();
             const vb = b.toSimd();
-            const left = @shuffle(T, va, undefined, @Vector(3, i32){ 1, 2, 0 }) *
+            const sleft = @shuffle(T, va, undefined, @Vector(3, i32){ 1, 2, 0 }) *
                 @shuffle(T, vb, undefined, @Vector(3, i32){ 2, 0, 1 });
-            const right = @shuffle(T, va, undefined, @Vector(3, i32){ 2, 0, 1 }) *
+            const sright = @shuffle(T, va, undefined, @Vector(3, i32){ 2, 0, 1 }) *
                 @shuffle(T, vb, undefined, @Vector(3, i32){ 1, 2, 0 });
-            return fromSimd(left - right);
+            return fromSimd(sleft - sright);
         }
 
         pub fn length(a: Self) T {
