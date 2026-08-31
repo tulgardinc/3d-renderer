@@ -338,11 +338,11 @@ pub fn Mat4x4(T: type) type {
             };
         }
 
-        pub fn toArray(self: Self) [4]Vec4(T) {
+        pub fn toArray(self: Self) [4][4]T {
             return @bitCast(self);
         }
 
-        pub fn asArray(self: *Self) *[4]Vec4(T) {
+        pub fn asArray(self: *Self) *[4][4](T) {
             return @ptrCast(self);
         }
     };

@@ -2,216 +2,66 @@ const std = @import("std");
 const gpu = @import("gpu");
 const builtin = @import("builtin");
 const c = gpu.c;
+const l = @import("lena.zig");
 
-const la = @import("lena.zig");
-const Vec3 = la.Vec3(f32);
-const Vec4 = la.Vec4(f32);
-const Mat4 = la.Mat4x4(f32);
-
-const Reflected = @import("Scene3D");
-const SceneShader = gpu.Shader(Reflected);
-
-const Camera = Reflected.Camera;
-const Instance = Reflected.Instance;
-const CameraUniform = SceneShader.Uniform.camera;
-const InstanceStorage = SceneShader.Storage.instances;
-
-const orbiter_count = 8;
-const pillar_count = 4;
-const instance_count = 1 + 1 + orbiter_count + pillar_count;
-
-const ground_extent = 12.0;
-const orbit_radius = 3.6;
-const pillar_radius = 5.4;
-
-const light_dir = Vec3.init(0.45, 1.0, 0.32);
+const Reflected = @import("Mesh");
 
 const Vertex = extern struct {
-    pos: [3]f32,
-    normal: [3]f32,
+    position: [3]f32,
     uv: [2]f32,
 };
 
-const Face = struct { normal: [3]f32, right: [3]f32, up: [3]f32 };
-
-const cube_faces = [_]Face{
-    .{ .normal = .{ 1, 0, 0 }, .right = .{ 0, 0, -1 }, .up = .{ 0, 1, 0 } },
-    .{ .normal = .{ -1, 0, 0 }, .right = .{ 0, 0, 1 }, .up = .{ 0, 1, 0 } },
-    .{ .normal = .{ 0, 1, 0 }, .right = .{ 1, 0, 0 }, .up = .{ 0, 0, -1 } },
-    .{ .normal = .{ 0, -1, 0 }, .right = .{ 1, 0, 0 }, .up = .{ 0, 0, 1 } },
-    .{ .normal = .{ 0, 0, 1 }, .right = .{ 1, 0, 0 }, .up = .{ 0, 1, 0 } },
-    .{ .normal = .{ 0, 0, -1 }, .right = .{ -1, 0, 0 }, .up = .{ 0, 1, 0 } },
+/// A shared corner needs a different uv on each face it touches, so the cube is
+/// unwelded to 4 vertices per face. Corners run bottom-left, bottom-right,
+/// top-right, top-left as seen from outside, which makes every face wind
+/// counter-clockwise.
+const vertices = [_]Vertex{
+    // +z
+    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 1 } },
+    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 1, 1 } },
+    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 1, 0 } },
+    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 0, 0 } },
+    // -z
+    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 0, 1 } },
+    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 1, 1 } },
+    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 1, 0 } },
+    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 0, 0 } },
+    // +x
+    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 0, 1 } },
+    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 1, 1 } },
+    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 1, 0 } },
+    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 0, 0 } },
+    // -x
+    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 0, 1 } },
+    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 1, 1 } },
+    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 1, 0 } },
+    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 0, 0 } },
+    // +y
+    .{ .position = .{ -0.5, 0.5, 0.5 }, .uv = .{ 0, 1 } },
+    .{ .position = .{ 0.5, 0.5, 0.5 }, .uv = .{ 1, 1 } },
+    .{ .position = .{ 0.5, 0.5, -0.5 }, .uv = .{ 1, 0 } },
+    .{ .position = .{ -0.5, 0.5, -0.5 }, .uv = .{ 0, 0 } },
+    // -y
+    .{ .position = .{ -0.5, -0.5, -0.5 }, .uv = .{ 0, 1 } },
+    .{ .position = .{ 0.5, -0.5, -0.5 }, .uv = .{ 1, 1 } },
+    .{ .position = .{ 0.5, -0.5, 0.5 }, .uv = .{ 1, 0 } },
+    .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 0 } },
 };
 
-const CubeMesh = struct {
-    vertices: [cube_faces.len * 4]Vertex,
-    indices: [cube_faces.len * 6]u16,
+const indices = [_]u16{
+    0,  1,  2,  0,  2,  3,
+    4,  5,  6,  4,  6,  7,
+    8,  9,  10, 8,  10, 11,
+    12, 13, 14, 12, 14, 15,
+    16, 17, 18, 16, 18, 19,
+    20, 21, 22, 20, 22, 23,
 };
 
-const cube: CubeMesh = blk: {
-    var verts: [cube_faces.len * 4]Vertex = undefined;
-    var indices: [cube_faces.len * 6]u16 = undefined;
-
-    for (cube_faces, 0..) |f, fi| {
-        const signs = [4][2]f32{
-            .{ -1, 1 },
-            .{ 1, 1 },
-            .{ 1, -1 },
-            .{ -1, -1 },
-        };
-        const uvs = [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
-
-        for (signs, uvs, 0..) |s, uv, ci| {
-            var pos: [3]f32 = undefined;
-            for (0..3) |axis| {
-                pos[axis] = (f.normal[axis] + s[0] * f.right[axis] + s[1] * f.up[axis]) * 0.5;
-            }
-            verts[fi * 4 + ci] = .{ .pos = pos, .normal = f.normal, .uv = uv };
-        }
-
-        const base: u16 = @intCast(fi * 4);
-        indices[fi * 6 + 0] = base + 0;
-        indices[fi * 6 + 1] = base + 3;
-        indices[fi * 6 + 2] = base + 2;
-        indices[fi * 6 + 3] = base + 2;
-        indices[fi * 6 + 4] = base + 1;
-        indices[fi * 6 + 5] = base + 0;
-    }
-
-    break :blk .{ .vertices = verts, .indices = indices };
+/// 2x2 rgba8unorm checkerboard, row-major.
+const checker_pixels = [_][4]u8{
+    .{ 255, 255, 255, 255 }, .{ 40, 40, 40, 255 },
+    .{ 40, 40, 40, 255 },    .{ 255, 255, 255, 255 },
 };
-
-const checker_size = 16;
-
-const checker_texture = blk: {
-    var texels: [checker_size * checker_size * 4]u8 = undefined;
-    for (0..checker_size) |y| {
-        for (0..checker_size) |x| {
-            const light = (x + y) % 2 == 0;
-            const v: u8 = if (light) 235 else 170;
-            const i = (y * checker_size + x) * 4;
-            texels[i + 0] = v;
-            texels[i + 1] = v;
-            texels[i + 2] = v;
-            texels[i + 3] = 255;
-        }
-    }
-    break :blk texels;
-};
-
-const cube_uv_scale: [2]f32 = @splat(2.0 / @as(f32, checker_size));
-const ground_uv_scale: [2]f32 = @splat(1.0);
-
-fn object(
-    translate: Vec3,
-    axis: Vec3,
-    angle: f32,
-    scale: Vec3,
-    color: [4]f32,
-    uv_scale: [2]f32,
-) Instance {
-    const rotation = Mat4.rotation(axis, angle);
-
-    const model = Mat4.translation(translate)
-        .mul(rotation)
-        .mul(Mat4.scale(scale));
-
-    const normal = rotation.mul(Mat4.scale(.init(
-        1.0 / scale.x,
-        1.0 / scale.y,
-        1.0 / scale.z,
-    )));
-
-    return .{
-        .model = @bitCast(model),
-        .normal = @bitCast(normal),
-        .color = color,
-        .uv_scale = uv_scale,
-    };
-}
-
-fn fillInstances(out: *[instance_count]Instance, t: f32) void {
-    out[0] = object(
-        .init(0, -0.25, 0),
-        .init(0, 1, 0),
-        0,
-        .init(ground_extent, 0.5, ground_extent),
-        .{ 0.62, 0.64, 0.70, 1.0 },
-        ground_uv_scale,
-    );
-
-    out[1] = object(
-        .init(0, 1.35, 0),
-        .init(0.3, 1.0, 0.15),
-        t * 0.55,
-        Vec3.splat(1.9),
-        .{ 0.95, 0.72, 0.28, 1.0 },
-        cube_uv_scale,
-    );
-
-    for (0..orbiter_count) |i| {
-        const fi: f32 = @floatFromInt(i);
-        const phase = fi * (std.math.tau / @as(f32, orbiter_count));
-        const theta = t * 0.4 + phase;
-
-        const hue = fi / @as(f32, orbiter_count) * std.math.tau;
-
-        out[2 + i] = object(
-            .init(
-                orbit_radius * @cos(theta),
-                0.85 + 0.45 * @sin(t * 1.1 + phase),
-                orbit_radius * @sin(theta),
-            ),
-            .init(0.2, 1.0, 0.4),
-            t * 1.3 + phase,
-            Vec3.splat(0.8),
-            .{
-                0.45 + 0.45 * @sin(hue),
-                0.45 + 0.45 * @sin(hue + 2.094),
-                0.45 + 0.45 * @sin(hue + 4.188),
-                1.0,
-            },
-            cube_uv_scale,
-        );
-    }
-
-    for (0..pillar_count) |i| {
-        const fi: f32 = @floatFromInt(i);
-        const theta = fi * (std.math.tau / @as(f32, pillar_count)) + std.math.pi / 4.0;
-        const height = 2.2 + fi * 0.7;
-
-        out[2 + orbiter_count + i] = object(
-            .init(
-                pillar_radius * @cos(theta),
-                height / 2.0,
-                pillar_radius * @sin(theta),
-            ),
-            .init(0, 1, 0),
-            theta,
-            .init(0.7, height, 0.7),
-            .{ 0.36, 0.44, 0.58, 1.0 },
-            cube_uv_scale,
-        );
-    }
-}
-
-fn cameraFor(t: f32, aspect: f32) Camera {
-    const eye = Vec3.init(
-        9.5 * @cos(t * 0.22),
-        3.4 + 1.7 * @sin(t * 0.16),
-        9.5 * @sin(t * 0.22),
-    );
-    const target = Vec3.init(0, 1.1, 0);
-
-    const view = Mat4.lookAt(eye, target, .init(0, 1, 0));
-    const projection = Mat4.perspective(std.math.degreesToRadians(55.0), aspect, 0.1, 120.0);
-
-    return .{
-        .view_proj = @bitCast(projection.mul(view)),
-        .eye = eye.toArray(),
-        .light_dir = light_dir.normalize().toArray(),
-    };
-}
 
 extern fn emscripten_console_error(utf8: [*:0]const u8) void;
 
@@ -296,78 +146,26 @@ pub fn run() !void {
     var target_surface = gpu.Surface.init(gpu_context, surface);
     target_surface.configure(gpu_context, @intCast(width), @intCast(height));
 
-    const texture = gpu.Texture.init(
-        gpu_context,
-        "checker",
-        checker_size,
-        checker_size,
-        .@"2d",
-        .rgba8_unorm,
-        .{ .copy_dst = true, .texture_binding = true },
-    );
-    defer texture.deinit();
-
-    texture.writeTexture(gpu_context, .{
-        .data = &checker_texture,
-        .format = .rgba8_unorm,
-        .width = checker_size,
-        .height = checker_size,
-    }, .{});
-
-    const checker_view = texture.createView("checker view");
-    defer c.wgpuTextureViewRelease(checker_view);
-
-    const sampler = gpu.createSampler(gpu_context, "checker sampler");
-    defer c.wgpuSamplerRelease(sampler);
-
-    const camera_uniform = try CameraUniform.init(gpu_context, .{ .label = "camera" });
-    defer camera_uniform.deinit();
-
-    var frame_group = try SceneShader.BindGroup(0).init(
-        allocator,
-        gpu_context,
-        .{
-            .camera = camera_uniform.binding(),
-            .smp = sampler,
-            .tex = checker_view,
-        },
-    );
-    defer frame_group.deinit();
-
-    const instance_storage = try InstanceStorage.initCapacity(
-        gpu_context,
-        instance_count,
-        .{ .label = "scene instances" },
-    );
-    defer instance_storage.deinit();
-
-    var instance_group = try SceneShader.BindGroup(1).init(
-        allocator,
-        gpu_context,
-        .{ .instances = instance_storage.binding() },
-    );
-    defer instance_group.deinit();
-
     const vertex_buffer = try gpu.createBuffer(
         gpu_context,
-        std.mem.sliceAsBytes(&cube.vertices),
+        std.mem.sliceAsBytes(&vertices),
         "cube vertices",
         .{ .vertex = true, .copy_dst = true },
     );
 
     const index_buffer = try gpu.createBuffer(
         gpu_context,
-        std.mem.sliceAsBytes(&cube.indices),
+        std.mem.sliceAsBytes(&indices),
         "cube indices",
         .{ .index = true, .copy_dst = true },
     );
 
     const cube_mesh: gpu.Mesh = .{
-        .vertex_count = cube.vertices.len,
+        .vertex_count = vertices.len,
         .indices = .{
             .buffer = index_buffer,
             .format = .u16,
-            .index_count = cube.indices.len,
+            .index_count = indices.len,
         },
         .buffers = &.{
             .{
@@ -377,15 +175,10 @@ pub fn run() !void {
                     .{
                         .location = 0,
                         .format = .f32x3,
-                        .offset = @offsetOf(Vertex, "pos"),
+                        .offset = @offsetOf(Vertex, "position"),
                     },
                     .{
                         .location = 1,
-                        .format = .f32x3,
-                        .offset = @offsetOf(Vertex, "normal"),
-                    },
-                    .{
-                        .location = 2,
                         .format = .f32x2,
                         .offset = @offsetOf(Vertex, "uv"),
                     },
@@ -394,25 +187,52 @@ pub fn run() !void {
         },
     };
 
-    const depth_format: gpu.TextureFormat =
-        if (builtin.os.tag == .ios and builtin.abi == .simulator)
-            .depth32_float
-        else
-            .depth16_unorm;
+    const Shader = gpu.Shader(Reflected);
 
-    var depth_texture = gpu.Texture.init(
+    const view_matrix_ub = try Shader.Uniform.view_matrix.init(gpu_context, .{});
+
+    const cam_pos = l.Vec3(f32).init(0, 2, 3);
+    const view = l.Mat4x4(f32).lookAt(cam_pos, l.Vec3(f32).splat(0), l.Vec3(f32).init(0, 1, 0));
+    var aspect: f32 = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    var proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 5);
+    var view_proj = proj.mul(view);
+    view_matrix_ub.upload(gpu_context, view_proj.toArray());
+
+    const checker_tex = gpu.Texture.init(
         gpu_context,
-        "depth",
-        @intCast(width),
-        @intCast(height),
+        "checker texture",
+        2,
+        2,
         .@"2d",
-        depth_format,
-        .{ .render_attachment = true },
+        .rgba8_unorm,
+        .{ .copy_dst = true, .texture_binding = true },
     );
-    defer depth_texture.deinit();
+    defer checker_tex.deinit();
 
-    var depth_view = depth_texture.createView("depth texture view");
-    defer c.wgpuTextureViewRelease(depth_view);
+    const checker_texel = gpu.TexelData{
+        .width = 2,
+        .height = 2,
+        .format = .rgba8_unorm,
+        .data = std.mem.asBytes(&checker_pixels),
+    };
+    checker_tex.writeTexture(gpu_context, checker_texel, .{});
+
+    const checker_view = checker_tex.createView("checker view");
+    defer c.wgpuTextureViewRelease(checker_view);
+
+    const sampler = gpu.createSampler(gpu_context, "checker sampler");
+    defer c.wgpuSamplerRelease(sampler);
+
+    const bg = try Shader.BindGroup(0).init(
+        allocator,
+        gpu_context,
+        .{
+            .view_matrix = view_matrix_ub.binding(),
+            .texture = checker_view,
+            .smp = sampler,
+        },
+    );
+    defer bg.deinit();
 
     const pipeline = try gpu.createPipelineFromMesh(
         Reflected,
@@ -420,27 +240,36 @@ pub fn run() !void {
         gpu_context,
         cube_mesh,
         &.{},
-        &.{ frame_group.layout, instance_group.layout },
+        &.{bg.layout},
         .{
-            .label = "scene",
+            .label = "mesh",
             .color_format = target_surface.format,
-            .depth_format = depth_format,
-            .depth_stencil_state = .{
-                .depth_write_enabled = true,
-                .depth_compare = .less,
-            },
+            .depth_stencil_state = .{},
+            .depth_format = .depth32_float,
         },
     );
 
-    const scene: gpu.DrawObject = .{
-        .bind_groups = &.{ frame_group.group, instance_group.group },
+    const draw_object: gpu.DrawObject = .{
+        .bind_groups = &.{bg.group},
         .mesh = cube_mesh,
         .pipeline = pipeline,
-        .instances = .initCount(instance_count),
+        .instances = .initCount(1),
     };
 
-    var instance_data: [instance_count]Instance = undefined;
-    var frame: u32 = 0;
+    var depth_texture = gpu.Texture.init(
+        gpu_context,
+        "depth texture",
+        @intCast(width),
+        @intCast(height),
+        .@"2d",
+        .depth32_float,
+        .{
+            .copy_dst = true,
+            .render_attachment = true,
+        },
+    );
+
+    var depth_view = depth_texture.createView("depth view");
 
     var running = true;
     while (running) {
@@ -459,36 +288,30 @@ pub fn run() !void {
         if (cur_width != width or cur_height != height) {
             width = cur_width;
             height = cur_height;
-
             target_surface.configure(gpu_context, @intCast(width), @intCast(height));
-
-            c.wgpuTextureViewRelease(depth_view);
-            depth_texture.deinit();
 
             depth_texture = gpu.Texture.init(
                 gpu_context,
-                "depth",
+                "depth texture",
                 @intCast(width),
                 @intCast(height),
                 .@"2d",
-                depth_format,
-                .{ .render_attachment = true },
+                .depth32_float,
+                .{
+                    .copy_dst = true,
+                    .render_attachment = true,
+                },
             );
-            depth_view = depth_texture.createView("depth texture view");
+            depth_view = depth_texture.createView("depth view");
+
+            aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+            proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 5);
+            view_proj = proj.mul(view);
+            view_matrix_ub.upload(gpu_context, view_proj.toArray());
         }
 
         const encoder = gpu_context.getEncoder();
         defer c.wgpuCommandEncoderRelease(encoder);
-
-        const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
-
-        const t = @as(f32, @floatFromInt(frame)) * 0.016;
-        frame +%= 1;
-
-        camera_uniform.upload(gpu_context, cameraFor(t, aspect));
-
-        fillInstances(&instance_data, t);
-        try instance_storage.upload(gpu_context, &instance_data);
 
         const target_texture_view = try target_surface.getCurrentView();
         defer c.wgpuTextureViewRelease(target_texture_view);
@@ -500,13 +323,10 @@ pub fn run() !void {
                 .color_attachment = .{ .clear_value = .{ .r = 0.05, .g = 0.06, .b = 0.09 } },
                 .depth_stencil_attachment = .{
                     .view = depth_view,
-                    .depth_clear_value = 1.0,
-                    .depth_load_op = .clear,
-                    .depth_store_op = .store,
                 },
             },
         );
-        rp.draw(scene);
+        rp.draw(draw_object);
         rp.end();
 
         const buffer = gpu.finishEncoder(encoder);

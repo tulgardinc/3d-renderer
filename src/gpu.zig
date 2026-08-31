@@ -1452,7 +1452,7 @@ pub fn ShaderBindGroup(Reflected: type, comptime index: u32) type {
             };
         }
 
-        pub fn deinit(self: *Self) void {
+        pub fn deinit(self: Self) void {
             c.wgpuBindGroupRelease(self.group.ptr);
             c.wgpuBindGroupLayoutRelease(self.layout);
         }

@@ -1201,12 +1201,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
-    const max_group = bindings[bindings.len - 1].group;
+    // Bindings are sorted by group, so the last one carries the max. A shader
+    // with no bindings at all still needs (empty) Uniforms/Resources tables.
+    const group_count = if (bindings.len == 0) 0 else bindings[bindings.len - 1].group + 1;
 
     // Uniforms
     try w.print("pub const Uniforms: []const ?[]const gpu.BindGroupUniformEntryMeta = &.{{ ", .{});
 
-    for (0..max_group + 1) |group| {
+    for (0..group_count) |group| {
         var found_uniform = false;
         for (bindings) |binding| {
             if (binding.group != group or binding.resource != .uniform_buffer) continue;
@@ -1227,7 +1229,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Resources
     try w.print("pub const Resources: []const ?[]const gpu.BindGroupResourceEntryMeta = &.{{", .{});
-    for (0..max_group + 1) |group| {
+    for (0..group_count) |group| {
         var found_resource = false;
         for (bindings) |binding| {
             if (binding.group != group or binding.resource == .uniform_buffer) continue;
@@ -1275,7 +1277,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // layout
     try w.print("pub const layouts: []const ?[]const gpu.BindGroupLayoutEntry = &.{{\n", .{});
-    for (0..max_group + 1) |group| {
+    for (0..group_count) |group| {
         try w.print("&.{{ \n", .{});
         var found_group = false;
         for (bindings) |binding| {
