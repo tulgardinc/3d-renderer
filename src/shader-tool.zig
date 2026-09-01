@@ -1159,14 +1159,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     try w.print("\n", .{});
 
+    try w.print("pub const vertex_meta: []const gpu.VertexInputMeta = &.{{\n", .{});
     if (vertex_index) |i| {
-        const params = entries[i].vertex.parameters;
-        try w.print("pub const vertex_meta: []const gpu.VertexInputMeta = &.{{\n", .{});
-        for (params) |param| {
-            try w.print(".{{ .name = .{s}, .location = {any} }},\n", .{ param.name, param.location });
+        for (entries[i].vertex.parameters) |param| {
+            try w.print(".{{ .name = \"{s}\", .location = {d} }},\n", .{ param.name, param.location });
         }
-        try w.print("}};\n\n", .{});
     }
+    try w.print("}};\n\n", .{});
 
     var emitted_structs: std.StringHashMapUnmanaged(void) = .empty;
     for (bindings) |binding| {

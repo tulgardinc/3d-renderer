@@ -200,29 +200,11 @@ pub fn run() !void {
             .format = .u16,
             .index_count = indices.len,
         },
-        .buffers = &.{
-            .{
-                .ptr = vertex_buffer,
-                .stride = @sizeOf(Vertex),
-                .attributes = &.{
-                    .{
-                        .location = 0,
-                        .format = .f32x3,
-                        .offset = @offsetOf(Vertex, "position"),
-                    },
-                    .{
-                        .location = 1,
-                        .format = .f32x3,
-                        .offset = @offsetOf(Vertex, "normal"),
-                    },
-                    .{
-                        .location = 2,
-                        .format = .f32x2,
-                        .offset = @offsetOf(Vertex, "uv"),
-                    },
-                },
-            },
-        },
+        .buffers = &.{.of(Vertex, vertex_buffer, .{
+            .position = .f32x3,
+            .uv = .f32x2,
+            .normal = .f32x3,
+        })},
     };
 
     const Shader = gpu.Shader(Reflected);

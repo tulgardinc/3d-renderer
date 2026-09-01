@@ -707,62 +707,6 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
     pub const ComponentType = enum { u8, i8, u16, i16, f16, f32, u32, i32 };
     pub const CompositionType = enum { scalar, vec2, vec3, vec4 };
 
-    pub fn getFormComponents(component_type: []const u8, composition_type: []const u8) @This() {
-        const ct = std.meta.stringToEnum(ComponentType, component_type) orelse @panic("unknown component type");
-        const comp = std.meta.stringToEnum(CompositionType, composition_type) orelse @panic("unknown composition type");
-
-        return switch (ct) {
-            .u8 => switch (comp) {
-                .scalar => .u8,
-                .vec2 => .u8x2,
-                .vec3 => @panic("no u8x3 vertex format"),
-                .vec4 => .u8x4,
-            },
-            .i8 => switch (comp) {
-                .scalar => .i8,
-                .vec2 => .i8x2,
-                .vec3 => @panic("no i8x3 vertex format"),
-                .vec4 => .i8x4,
-            },
-            .u16 => switch (comp) {
-                .scalar => .u16,
-                .vec2 => .u16x2,
-                .vec3 => @panic("no u16x3 vertex format"),
-                .vec4 => .u16x4,
-            },
-            .i16 => switch (comp) {
-                .scalar => .i16,
-                .vec2 => .i16x2,
-                .vec3 => @panic("no i16x3 vertex format"),
-                .vec4 => .i16x4,
-            },
-            .f16 => switch (comp) {
-                .scalar => .f16,
-                .vec2 => .f16x2,
-                .vec3 => @panic("no f16x3 vertex format"),
-                .vec4 => .f16x4,
-            },
-            .f32 => switch (comp) {
-                .scalar => .f32,
-                .vec2 => .f32x2,
-                .vec3 => .f32x3,
-                .vec4 => .f32x4,
-            },
-            .u32 => switch (comp) {
-                .scalar => .u32,
-                .vec2 => .u32x2,
-                .vec3 => .u32x3,
-                .vec4 => .u32x4,
-            },
-            .i32 => switch (comp) {
-                .scalar => .i32,
-                .vec2 => .i32x2,
-                .vec3 => .i32x3,
-                .vec4 => .i32x4,
-            },
-        };
-    }
-
     pub fn byteSize(self: @This()) u64 {
         return switch (self) {
             .undefined => 0,
@@ -972,11 +916,6 @@ pub const BindingType = union(BindingResourceTypes) {
         has_dynamic_offset: bool,
         min_binding_size: u64,
     };
-};
-
-pub const VertexInput = struct {
-    location: u32,
-    format: VertexFormat,
 };
 
 pub const BindGroupLayoutEntry = struct {
@@ -1510,18 +1449,6 @@ pub fn createBindGroupLayout(allocator: std.mem.Allocator, ctx: GPUContext, entr
     return layout;
 }
 
-pub fn createBindGroupLayouts(
-    allocator: std.mem.Allocator,
-    ctx: GPUContext,
-    groups: []const []const BindGroupLayoutEntry,
-) ![]const c.WGPUBindGroupLayout {
-    var bg_layouts = try allocator.alloc(c.WGPUBindGroupLayout, groups.len);
-    for (groups, 0..) |entries, i| {
-        bg_layouts[i] = try createBindGroupLayout(allocator, ctx, entries);
-    }
-    return bg_layouts;
-}
-
 pub fn createShader(
     ctx: GPUContext,
     src: []const u8,
@@ -1735,12 +1662,61 @@ pub const VertexBuffer = struct {
     stride: u32,
     attributes: []const AttributeDesc,
 
+    const Self = @This();
+
     pub const AttributeDesc = struct {
-        location: u32,
+        name: []const u8,
         format: VertexFormat,
         offset: u32,
     };
+
+    pub fn of(comptime T: type, buffer: c.WGPUBuffer, comptime formats: anytype) Self {
+        return .{
+            .ptr = buffer,
+            .stride = @sizeOf(T),
+            .attributes = comptime attributesOf(T, formats),
+        };
+    }
 };
+
+fn attributesOf(comptime T: type, comptime formats: anytype) []const VertexBuffer.AttributeDesc {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or info.@"struct".layout != .@"extern") {
+        @compileError(@typeName(T) ++ " must be an extern struct to describe a vertex");
+    }
+    if (@sizeOf(T) % 4 != 0 or @sizeOf(T) > 2048) {
+        @compileError(std.fmt.comptimePrint(
+            "{s} has stride {d}, which must be a multiple of 4 and at most 2048",
+            .{ @typeName(T), @sizeOf(T) },
+        ));
+    }
+
+    const entries = @typeInfo(@TypeOf(formats)).@"struct".fields;
+    var attrs: [entries.len]VertexBuffer.AttributeDesc = undefined;
+    for (entries, &attrs) |entry, *attr| {
+        if (!@hasField(T, entry.name)) {
+            @compileError(@typeName(T) ++ " has no field named '" ++ entry.name ++ "'");
+        }
+        const format: VertexFormat = @field(formats, entry.name);
+        const offset: u64 = @offsetOf(T, entry.name);
+        if (offset % @min(@as(u64, 4), format.byteSize()) != 0) {
+            @compileError(std.fmt.comptimePrint(
+                "{s}.{s} sits at offset {d}, which {s} cannot be read from",
+                .{ @typeName(T), entry.name, offset, @tagName(format) },
+            ));
+        }
+        if (offset + format.byteSize() > @sizeOf(T)) {
+            @compileError(std.fmt.comptimePrint(
+                "{s} as {s} at offset {d} runs past the {d} byte stride of {s}",
+                .{ entry.name, @tagName(format), offset, @sizeOf(T), @typeName(T) },
+            ));
+        }
+        attr.* = .{ .name = entry.name, .format = format, .offset = offset };
+    }
+
+    const final = attrs;
+    return &final;
+}
 
 pub const Mesh = struct {
     buffers: []const VertexBuffer,
@@ -1773,6 +1749,13 @@ pub const Mesh = struct {
     };
 };
 
+fn indexOfVertexInput(Reflected: type, name: []const u8) ?usize {
+    for (Reflected.vertex_meta, 0..) |meta, i| {
+        if (std.mem.eql(u8, meta.name, name)) return i;
+    }
+    return null;
+}
+
 pub fn createPipelineFromMesh(
     Reflected: type,
     allocator: std.mem.Allocator,
@@ -1792,39 +1775,37 @@ pub fn createPipelineFromMesh(
     defer arena.deinit();
     const shader_module = try createShader(ctx, Reflected.SOURCE, "vert color");
 
+    var supplied = [_]bool{false} ** Reflected.vertex_meta.len;
+
     var vertex_layouts: std.ArrayList(VertexBufferLayout) = .empty;
-    for (mesh.buffers) |buf| {
-        const stride = buf.stride;
-        var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
-        for (buf.attributes) |attr| {
-            try vertex_attributes.append(arena_alloc, .{
-                .offset = attr.offset,
-                .format = attr.format,
-                .shader_location = attr.location,
+    for ([_][]const VertexBuffer{ mesh.buffers, instance_buffers }, 0..) |buffers, kind| {
+        for (buffers) |buf| {
+            var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
+            for (buf.attributes) |attr| {
+                const index = indexOfVertexInput(Reflected, attr.name) orelse continue;
+                supplied[index] = true;
+                try vertex_attributes.append(arena_alloc, .{
+                    .offset = attr.offset,
+                    .format = attr.format,
+                    .shader_location = Reflected.vertex_meta[index].location,
+                });
+            }
+            try vertex_layouts.append(arena_alloc, .{
+                .attributes = vertex_attributes.items,
+                .array_stride = buf.stride,
+                .step_mode = if (kind == 0) .vertex else .instance,
             });
         }
-        try vertex_layouts.append(arena_alloc, .{
-            .attributes = vertex_attributes.items,
-            .array_stride = stride,
-            .step_mode = .vertex,
-        });
     }
 
-    for (instance_buffers) |buf| {
-        const stride = buf.stride;
-        var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
-        for (buf.attributes) |attr| {
-            try vertex_attributes.append(arena_alloc, .{
-                .offset = attr.offset,
-                .format = attr.format,
-                .shader_location = attr.location,
-            });
+    for (supplied, Reflected.vertex_meta) |found, meta| {
+        if (!found) {
+            std.log.err(
+                "{s} reads vertex input '{s}' at location {d}, which no buffer supplies",
+                .{ Reflected.NAME, meta.name, meta.location },
+            );
+            return error.MissingVertexInput;
         }
-        try vertex_layouts.append(arena_alloc, .{
-            .attributes = vertex_attributes.items,
-            .array_stride = stride,
-            .step_mode = .instance,
-        });
     }
 
     const pipeline_descriptor: PipelineDescriptor = .{
