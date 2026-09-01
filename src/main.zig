@@ -209,6 +209,9 @@ pub fn run() !void {
 
     const Shader = gpu.Shader(Reflected);
 
+    const shader = try Shader.init(allocator, gpu_context);
+    defer shader.deinit();
+
     const world_ub = try Shader.Uniform.world.init(gpu_context, .{});
 
     var cam = Camera{};
@@ -261,7 +264,8 @@ pub fn run() !void {
         },
     );
 
-    const bg = try Shader.BindGroup(0).init(
+    const bg = try shader.createBindGroup(
+        0,
         allocator,
         gpu_context,
         .{
@@ -271,15 +275,14 @@ pub fn run() !void {
             .instances = instances.binding(),
         },
     );
-    defer bg.deinit();
+    defer c.wgpuBindGroupRelease(bg);
 
     const pipeline = try gpu.createPipelineFromMesh(
-        Reflected,
         allocator,
         gpu_context,
+        shader,
         cube_mesh,
         &.{},
-        &.{bg.layout},
         .{
             .label = "mesh",
             .color_format = target_surface.format,
@@ -289,7 +292,7 @@ pub fn run() !void {
     );
 
     const draw_object: gpu.DrawObject = .{
-        .bind_groups = &.{bg.group},
+        .bind_groups = &.{.{ .group = 0, .bind_group = bg }},
         .mesh = cube_mesh,
         .pipeline = pipeline,
         .instances = .initCount(3),

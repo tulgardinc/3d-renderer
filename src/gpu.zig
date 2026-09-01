@@ -1264,14 +1264,86 @@ fn StorageNamespace(Reflected: type) type {
     return @Struct(.auto, null, &names, &types, &attrs);
 }
 
+/// Owns the GPU objects a shader determines on its own: its module, and one
+/// layout per bind group it declares. Both are fixed by the shader source, so
+/// there is exactly one of each per shader type and nothing to cache.
 pub fn Shader(Reflected: type) type {
     return struct {
+        module: c.WGPUShaderModule,
+        group_layouts: [group_count]?c.WGPUBindGroupLayout,
+
+        const Self = @This();
+        const group_count = Reflected.layouts.len;
+
         pub const reflected = Reflected;
         pub const Uniform: UniformNamespace(Reflected) = .{};
         pub const Storage: StorageNamespace(Reflected) = .{};
 
-        pub fn BindGroup(comptime index: u32) type {
-            return ShaderBindGroup(Reflected, index);
+        pub fn Resources(comptime index: u32) type {
+            return ShaderBindGroup(Reflected, index).Resources;
+        }
+
+        pub fn init(allocator: std.mem.Allocator, ctx: GPUContext) !Self {
+            const module = try createShader(ctx, Reflected.SOURCE, Reflected.NAME);
+            errdefer c.wgpuShaderModuleRelease(module);
+
+            var group_layouts: [group_count]?c.WGPUBindGroupLayout = @splat(null);
+            errdefer for (group_layouts) |maybe| {
+                if (maybe) |bgl| c.wgpuBindGroupLayoutRelease(bgl);
+            };
+
+            for (Reflected.layouts, &group_layouts) |maybe_entries, *slot| {
+                const entries = maybe_entries orelse continue;
+                slot.* = try createBindGroupLayout(allocator, ctx, entries);
+            }
+
+            return .{ .module = module, .group_layouts = group_layouts };
+        }
+
+        pub fn deinit(self: Self) void {
+            for (self.group_layouts) |maybe| {
+                if (maybe) |bgl| c.wgpuBindGroupLayoutRelease(bgl);
+            }
+            c.wgpuShaderModuleRelease(self.module);
+        }
+
+        pub fn layout(self: Self, comptime index: u32) c.WGPUBindGroupLayout {
+            if (comptime Reflected.layouts[index] == null) {
+                @compileError(std.fmt.comptimePrint(
+                    "'{s}' does not define bind group {d}",
+                    .{ Reflected.NAME, index },
+                ));
+            }
+            return self.group_layouts[index].?;
+        }
+
+        pub fn pipelineLayouts(self: Self) ![group_count]c.WGPUBindGroupLayout {
+            var dense: [group_count]c.WGPUBindGroupLayout = undefined;
+            for (self.group_layouts, &dense, 0..) |maybe, *slot, i| {
+                slot.* = maybe orelse {
+                    std.log.err(
+                        "'{s}' declares bind groups but leaves group {d} undefined",
+                        .{ Reflected.NAME, i },
+                    );
+                    return error.UndefinedBindGroup;
+                };
+            }
+            return dense;
+        }
+
+        pub fn createBindGroup(
+            self: Self,
+            comptime index: u32,
+            allocator: std.mem.Allocator,
+            ctx: GPUContext,
+            resources: Resources(index),
+        ) !c.WGPUBindGroup {
+            return ShaderBindGroup(Reflected, index).create(
+                allocator,
+                ctx,
+                self.layout(index),
+                resources,
+            );
         }
     };
 }
@@ -1340,13 +1412,14 @@ pub fn ShaderBindGroup(Reflected: type, comptime index: u32) type {
     };
 
     return struct {
-        resources: ResourcesStruct,
-        layout: c.WGPUBindGroupLayout,
-        group: BindGroup,
+        pub const Resources = ResourcesStruct;
 
-        const Self = @This();
-
-        pub fn init(allocator: std.mem.Allocator, ctx: GPUContext, resources: ResourcesStruct) !Self {
+        pub fn create(
+            allocator: std.mem.Allocator,
+            ctx: GPUContext,
+            group_layout: c.WGPUBindGroupLayout,
+            resources: ResourcesStruct,
+        ) !c.WGPUBindGroup {
             var group_entries: [uniform_count + resource_count]BindGroupEntry = undefined;
             var group_entries_index: usize = 0;
 
@@ -1377,23 +1450,10 @@ pub fn ShaderBindGroup(Reflected: type, comptime index: u32) type {
                 }
             }
 
-            const group_layout = try createBindGroupLayout(allocator, ctx, Reflected.layouts[index].?);
-
-            const group = try createBindGroup(allocator, ctx, .{
+            return createBindGroup(allocator, ctx, .{
                 .layout = group_layout,
                 .entries = &group_entries,
             });
-
-            return .{
-                .resources = resources,
-                .layout = group_layout,
-                .group = .{ .ptr = group, .index = index },
-            };
-        }
-
-        pub fn deinit(self: Self) void {
-            c.wgpuBindGroupRelease(self.group.ptr);
-            c.wgpuBindGroupLayoutRelease(self.layout);
         }
     };
 }
@@ -1749,31 +1809,36 @@ pub const Mesh = struct {
     };
 };
 
-fn indexOfVertexInput(Reflected: type, name: []const u8) ?usize {
-    for (Reflected.vertex_meta, 0..) |meta, i| {
+fn indexOfVertexInput(vertex_meta: []const VertexInputMeta, name: []const u8) ?usize {
+    for (vertex_meta, 0..) |meta, i| {
         if (std.mem.eql(u8, meta.name, name)) return i;
     }
     return null;
 }
 
+pub const PipelineConfig = struct {
+    color_format: TextureFormat,
+    label: ?[]const u8 = null,
+    depth_stencil_state: ?DepthStencilState = null,
+    depth_format: ?TextureFormat = null,
+    primitive_topology: PrimitiveTopology = .triangle_list,
+    blend: ?BlendState = null,
+    cull_mode: CullMode = .back,
+};
+
 pub fn createPipelineFromMesh(
-    Reflected: type,
     allocator: std.mem.Allocator,
     ctx: GPUContext,
+    shader: anytype,
     mesh: Mesh,
     instance_buffers: []const VertexBuffer,
-    bind_group_layouts: ?[]const c.WGPUBindGroupLayout,
-    config: struct {
-        color_format: TextureFormat,
-        label: ?[]const u8 = null,
-        depth_stencil_state: ?DepthStencilState = null,
-        depth_format: ?TextureFormat = null,
-    },
+    config: PipelineConfig,
 ) !c.WGPURenderPipeline {
+    const Reflected = @TypeOf(shader).reflected;
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_alloc = arena.allocator();
     defer arena.deinit();
-    const shader_module = try createShader(ctx, Reflected.SOURCE, "vert color");
 
     var supplied = [_]bool{false} ** Reflected.vertex_meta.len;
 
@@ -1782,7 +1847,7 @@ pub fn createPipelineFromMesh(
         for (buffers) |buf| {
             var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
             for (buf.attributes) |attr| {
-                const index = indexOfVertexInput(Reflected, attr.name) orelse continue;
+                const index = indexOfVertexInput(Reflected.vertex_meta, attr.name) orelse continue;
                 supplied[index] = true;
                 try vertex_attributes.append(arena_alloc, .{
                     .offset = attr.offset,
@@ -1810,32 +1875,41 @@ pub fn createPipelineFromMesh(
 
     const pipeline_descriptor: PipelineDescriptor = .{
         .color_format = config.color_format,
-        .shader_module = shader_module,
+        .shader_module = shader.module,
         .vertex_layouts = vertex_layouts.items,
         .depth_stencil = config.depth_stencil_state,
         .depth_format = config.depth_format,
+        .primitive_topology = config.primitive_topology,
+        .blend = config.blend,
+        .cull_mode = config.cull_mode,
     };
+
+    const group_layouts = try shader.pipelineLayouts();
 
     return try createPipeline(
         allocator,
         ctx,
-        if (config.label) |label| label else "Pipeline",
+        if (config.label) |label| label else Reflected.NAME,
         pipeline_descriptor,
         Reflected.VS,
         Reflected.FS,
-        bind_group_layouts,
+        &group_layouts,
     );
 }
 
-pub const BindGroup = struct {
-    ptr: c.WGPUBindGroup,
-    index: u32,
+/// A bind group paired with the slot it should be bound to for one draw. The
+/// slot is the caller's choice, not a property of the bind group: the same
+/// handle is valid in any group whose layout is group-equivalent to the one it
+/// was built from.
+pub const BoundGroup = struct {
+    group: u32,
+    bind_group: c.WGPUBindGroup,
 };
 
 pub const DrawObject = struct {
     mesh: Mesh,
     pipeline: c.WGPURenderPipeline,
-    bind_groups: []const BindGroup,
+    bind_groups: []const BoundGroup,
     instances: Instances,
 };
 
@@ -1906,8 +1980,8 @@ pub const RenderPass = struct {
         for (draw_object.bind_groups) |bg| {
             c.wgpuRenderPassEncoderSetBindGroup(
                 self.render_pass,
-                bg.index,
-                bg.ptr,
+                bg.group,
+                bg.bind_group,
                 0,
                 null,
             );
