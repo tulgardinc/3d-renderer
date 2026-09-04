@@ -4,7 +4,8 @@ const builtin = @import("builtin");
 const c = gpu.c;
 const l = @import("lena.zig");
 
-const Reflected = @import("Mesh");
+const Mesh = @import("Mesh");
+const Shadow = @import("Shadow");
 
 const Vertex = extern struct {
     position: [3]f32,
@@ -123,14 +124,29 @@ const Camera = struct {
     }
 };
 
+// always facing 0,0,0
+const DirectionalLight = struct {
+    pos: l.Vec3(f32) = .init(30, 30, 20),
+    ambient: f32 = 0.03,
+    texture_size: f32 = 512,
+
+    const Self = @This();
+
+    pub fn getVPMatrix(self: Self) l.Mat4x4(f32) {
+        const proj = l.Mat4x4(f32).orthographic(-2, 2, 2, -2, 0.01, 50);
+        return proj.mul(.lookAt(self.pos, .splat(0), .up()));
+    }
+};
+
 const CubeInstance = struct {
-    pos: l.Vec3(f32),
-    rot: f32,
+    scale: l.Vec3(f32) = .splat(1),
+    pos: l.Vec3(f32) = .splat(0),
+    rot: f32 = 0,
 
     const Self = @This();
 
     pub fn modelMatrix(self: Self) l.Mat4x4(f32) {
-        return l.Mat4x4(f32).translation(self.pos).mul(.rotation(.up(), self.rot));
+        return l.Mat4x4(f32).translation(self.pos).mul(.rotation(.up(), self.rot)).mul(.scale(self.scale));
     }
 };
 
@@ -207,17 +223,21 @@ pub fn run() !void {
         })},
     };
 
-    const Shader = gpu.Shader(Reflected);
+    const MeshShader = gpu.Shader(Mesh);
+    const ShadowShader = gpu.Shader(Shadow);
 
-    const shader = try Shader.init(allocator, gpu_context);
-    defer shader.deinit();
+    const mesh_shader = try MeshShader.init(allocator, gpu_context);
+    defer mesh_shader.deinit();
 
-    const world_ub = try Shader.Uniform.world.init(gpu_context, .{});
+    const shadow_shader = try ShadowShader.init(allocator, gpu_context);
+    defer shadow_shader.deinit();
+
+    const world_ub = try MeshShader.Uniform.world.init(gpu_context, .{});
 
     var cam = Camera{};
 
-    var aspect: f32 = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
-    var proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 100);
+    var cam_aspect: f32 = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+    var cam_proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), cam_aspect, 0.01, 100);
 
     const checker_tex = gpu.Texture.init(
         gpu_context,
@@ -226,6 +246,7 @@ pub fn run() !void {
         2,
         .@"2d",
         .rgba8_unorm,
+        .{},
         .{ .copy_dst = true, .texture_binding = true },
     );
     defer checker_tex.deinit();
@@ -241,10 +262,10 @@ pub fn run() !void {
     const checker_view = checker_tex.createView("checker view");
     defer c.wgpuTextureViewRelease(checker_view);
 
-    const sampler = gpu.createSampler(gpu_context, "checker sampler");
+    const sampler = gpu.createSampler(gpu_context, .{});
     defer c.wgpuSamplerRelease(sampler);
 
-    const instances = try Shader.Storage.instances.initCapacity(gpu_context, 3, .{});
+    const instances = try MeshShader.Storage.instances.initCapacity(gpu_context, 4, .{});
     defer instances.deinit();
     try instances.upload(
         gpu_context,
@@ -261,26 +282,87 @@ pub fn run() !void {
                 .model = (CubeInstance{ .pos = .init(2, 0, 0), .rot = std.math.degreesToRadians(30) }).modelMatrix().toArray(),
                 .tint = l.Vec4(f32).init(0, 0, 1, 1).toArray(),
             },
+            .{
+                .model = (CubeInstance{ .pos = .init(0, -1, 0), .scale = .init(8, 1, 8) }).modelMatrix().toArray(),
+                .tint = l.Vec4(f32).init(1, 1, 1, 1).toArray(),
+            },
         },
     );
 
-    const bg = try shader.createBindGroup(
+    const dir_light = DirectionalLight{};
+    const dir_light_ub = try ShadowShader.Uniform.light_vp.init(gpu_context, .{});
+
+    const shadow_map = gpu.Texture.init(
+        gpu_context,
+        "shadow map",
+        @intCast(2048),
+        @intCast(2048),
+        .@"2d",
+        .depth32_float,
+        .{},
+        .{
+            .texture_binding = true,
+            .render_attachment = true,
+        },
+    );
+    defer shadow_map.deinit();
+
+    const shadow_map_view = shadow_map.createView("shadow view");
+    defer c.wgpuTextureViewRelease(shadow_map_view);
+
+    const shadow_smp = gpu.createSampler(
+        gpu_context,
+        .{
+            .compare = .less_equal,
+            .min_filter = .linear,
+            .mag_filter = .linear,
+        },
+    );
+
+    const mesh_bg = try mesh_shader.createBindGroup(
         0,
         allocator,
         gpu_context,
         .{
             .world = world_ub.binding(),
             .texture = checker_view,
+            .shadow_map = shadow_map_view,
+            .shadow_smp = shadow_smp,
             .smp = sampler,
             .instances = instances.binding(),
         },
     );
-    defer c.wgpuBindGroupRelease(bg);
+    defer c.wgpuBindGroupRelease(mesh_bg);
 
-    const pipeline = try gpu.createPipelineFromMesh(
+    const light_bg = try shadow_shader.createBindGroup(
+        0,
         allocator,
         gpu_context,
-        shader,
+        .{
+            .light_vp = dir_light_ub.binding(),
+            .instances = instances.binding(),
+        },
+    );
+    defer c.wgpuBindGroupRelease(light_bg);
+
+    const shadow_pipeline = try gpu.createPipelineFromMesh(
+        allocator,
+        gpu_context,
+        shadow_shader,
+        cube_mesh,
+        &.{},
+        .{
+            .label = "shadow",
+            .depth_stencil_state = .{},
+            .depth_format = .depth32_float,
+        },
+    );
+    defer c.wgpuRenderPipelineRelease(shadow_pipeline);
+
+    const render_pipeline = try gpu.createPipelineFromMesh(
+        allocator,
+        gpu_context,
+        mesh_shader,
         cube_mesh,
         &.{},
         .{
@@ -288,14 +370,24 @@ pub fn run() !void {
             .color_format = target_surface.format,
             .depth_stencil_state = .{},
             .depth_format = .depth32_float,
+            .fragment_entry = "fs",
+            .sample_count = 4,
         },
     );
+    defer c.wgpuRenderPipelineRelease(render_pipeline);
 
-    const draw_object: gpu.DrawObject = .{
-        .bind_groups = &.{.{ .group = 0, .bind_group = bg }},
+    const render_do: gpu.DrawObject = .{
+        .bind_groups = &.{.{ .group = 0, .bind_group = mesh_bg }},
         .mesh = cube_mesh,
-        .pipeline = pipeline,
-        .instances = .initCount(3),
+        .pipeline = render_pipeline,
+        .instances = .initCount(instances.capacity),
+    };
+
+    const shadow_do: gpu.DrawObject = .{
+        .bind_groups = &.{.{ .group = 0, .bind_group = light_bg }},
+        .mesh = cube_mesh,
+        .pipeline = shadow_pipeline,
+        .instances = .initCount(instances.capacity),
     };
 
     var depth_texture = gpu.Texture.init(
@@ -305,13 +397,34 @@ pub fn run() !void {
         @intCast(height),
         .@"2d",
         .depth32_float,
+        .{ .sample_count = 4 },
         .{
-            .copy_dst = true,
             .render_attachment = true,
         },
     );
+    defer depth_texture.deinit();
 
     var depth_view = depth_texture.createView("depth view");
+    defer c.wgpuTextureViewRelease(depth_view);
+
+    var msaa_texture = gpu.Texture.init(
+        gpu_context,
+        "msaa texture",
+        @intCast(width),
+        @intCast(height),
+        .@"2d",
+        target_surface.format,
+        .{ .sample_count = 4 },
+        .{
+            .render_attachment = true,
+        },
+    );
+    defer msaa_texture.deinit();
+
+    var msaa_view = msaa_texture.createView("msaa view");
+    defer c.wgpuTextureViewRelease(msaa_view);
+
+    dir_light_ub.upload(gpu_context, dir_light.getVPMatrix().toArray());
 
     var running = true;
     while (running) {
@@ -361,6 +474,9 @@ pub fn run() !void {
             height = cur_height;
             target_surface.configure(gpu_context, @intCast(width), @intCast(height));
 
+            c.wgpuTextureViewRelease(depth_view);
+            depth_texture.deinit();
+
             depth_texture = gpu.Texture.init(
                 gpu_context,
                 "depth texture",
@@ -368,6 +484,7 @@ pub fn run() !void {
                 @intCast(height),
                 .@"2d",
                 .depth32_float,
+                .{ .sample_count = 4 },
                 .{
                     .copy_dst = true,
                     .render_attachment = true,
@@ -375,34 +492,64 @@ pub fn run() !void {
             );
             depth_view = depth_texture.createView("depth view");
 
-            aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
-            proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), aspect, 0.01, 100);
+            c.wgpuTextureViewRelease(msaa_view);
+            msaa_texture.deinit();
+
+            msaa_texture = gpu.Texture.init(
+                gpu_context,
+                "msaa texture",
+                @intCast(width),
+                @intCast(height),
+                .@"2d",
+                target_surface.format,
+                .{ .sample_count = 4 },
+                .{
+                    .render_attachment = true,
+                },
+            );
+            msaa_view = msaa_texture.createView("msaa view");
+
+            cam_aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+            cam_proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), cam_aspect, 0.01, 100);
         }
 
-        const view_proj = proj.mul(cam.getViewMatrix());
+        const view_proj = cam_proj.mul(cam.getViewMatrix());
         world_ub.upload(gpu_context, .{
             .vp_matrix = view_proj.toArray(),
-            .light_dir = l.Vec3(f32).init(2, 3, 1).normalize().toArray(),
+            .light_vp = dir_light.getVPMatrix().toArray(),
+            .light_pos = dir_light.pos.toArray(),
             .ambient = 0.01,
         });
 
         const encoder = gpu_context.getEncoder();
         defer c.wgpuCommandEncoderRelease(encoder);
 
-        const target_texture_view = try target_surface.getCurrentView();
-        defer c.wgpuTextureViewRelease(target_texture_view);
+        const color_view = try target_surface.getCurrentView();
+        defer c.wgpuTextureViewRelease(color_view);
+
+        const shadow_pass = gpu.RenderPass.init(encoder, .{
+            .depth_stencil_attachment = .{
+                .view = shadow_map_view,
+            },
+        });
+        shadow_pass.draw(shadow_do);
+        shadow_pass.end();
 
         const rp = gpu.RenderPass.init(
             encoder,
-            target_texture_view,
             .{
-                .color_attachment = .{ .clear_value = .{ .r = 0.05, .g = 0.06, .b = 0.09 } },
+                .color_attachment = .{
+                    .clear_value = .{ .r = 0.05, .g = 0.06, .b = 0.09 },
+                    .view = msaa_view,
+                    .resolve_target = color_view,
+                    .store_op = .discard,
+                },
                 .depth_stencil_attachment = .{
                     .view = depth_view,
                 },
             },
         );
-        rp.draw(draw_object);
+        rp.draw(render_do);
         rp.end();
 
         const buffer = gpu.finishEncoder(encoder);

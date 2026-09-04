@@ -976,13 +976,14 @@ pub const BlendState = struct {
 };
 
 pub const PipelineDescriptor = struct {
-    color_format: TextureFormat,
+    color_format: ?TextureFormat,
     shader_module: c.WGPUShaderModule,
     vertex_layouts: []const VertexBufferLayout = &.{},
     depth_format: ?TextureFormat = null,
     primitive_topology: PrimitiveTopology = .triangle_list,
     depth_stencil: ?DepthStencilState = null,
     blend: ?BlendState = null,
+    sample_count: u32 = 1,
     cull_mode: CullMode = .back,
 };
 
@@ -1536,7 +1537,7 @@ pub fn createPipeline(
     ctx: GPUContext,
     label: []const u8,
     descriptor: PipelineDescriptor,
-    vertex_entry: ?[]const u8,
+    vertex_entry: []const u8,
     fragment_entry: ?[]const u8,
     bind_group_layouts: ?[]const c.WGPUBindGroupLayout,
 ) !c.WGPURenderPipeline {
@@ -1559,33 +1560,31 @@ pub fn createPipeline(
         desc.layout = layout;
     }
 
-    if (vertex_entry) |ve| {
-        var vertex_state = z_WGPU_VERTEX_STATE_INIT();
-        vertex_state.module = descriptor.shader_module;
-        vertex_state.entryPoint = toWGPUString(ve);
+    var vertex_state = z_WGPU_VERTEX_STATE_INIT();
+    vertex_state.module = descriptor.shader_module;
+    vertex_state.entryPoint = toWGPUString(vertex_entry);
 
-        const buffers = try temp.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layouts.len);
-        for (descriptor.vertex_layouts, 0..) |vertex_layout, li| {
-            buffers[li] = z_WGPU_VERTEX_BUFFER_LAYOUT_INIT();
-            buffers[li].stepMode = @intFromEnum(vertex_layout.step_mode);
-            buffers[li].arrayStride = vertex_layout.array_stride;
-            buffers[li].attributeCount = vertex_layout.attributes.len;
-            var attributes = try temp.alloc(c.WGPUVertexAttribute, vertex_layout.attributes.len);
-            for (0..vertex_layout.attributes.len) |ai| {
-                const attribute = vertex_layout.attributes[ai];
-                attributes[ai] = z_WGPU_VERTEX_ATTRIBUTE_INIT();
-                attributes[ai].offset = attribute.offset;
-                attributes[ai].format = @intFromEnum(attribute.format);
-                attributes[ai].shaderLocation = attribute.shader_location;
-            }
-            buffers[li].attributes = attributes.ptr;
+    const buffers = try temp.alloc(c.WGPUVertexBufferLayout, descriptor.vertex_layouts.len);
+    for (descriptor.vertex_layouts, 0..) |vertex_layout, li| {
+        buffers[li] = z_WGPU_VERTEX_BUFFER_LAYOUT_INIT();
+        buffers[li].stepMode = @intFromEnum(vertex_layout.step_mode);
+        buffers[li].arrayStride = vertex_layout.array_stride;
+        buffers[li].attributeCount = vertex_layout.attributes.len;
+        var attributes = try temp.alloc(c.WGPUVertexAttribute, vertex_layout.attributes.len);
+        for (0..vertex_layout.attributes.len) |ai| {
+            const attribute = vertex_layout.attributes[ai];
+            attributes[ai] = z_WGPU_VERTEX_ATTRIBUTE_INIT();
+            attributes[ai].offset = attribute.offset;
+            attributes[ai].format = @intFromEnum(attribute.format);
+            attributes[ai].shaderLocation = attribute.shader_location;
         }
-
-        vertex_state.bufferCount = descriptor.vertex_layouts.len;
-        vertex_state.buffers = buffers.ptr;
-
-        desc.vertex = vertex_state;
+        buffers[li].attributes = attributes.ptr;
     }
+
+    vertex_state.bufferCount = descriptor.vertex_layouts.len;
+    vertex_state.buffers = buffers.ptr;
+
+    desc.vertex = vertex_state;
 
     // TODO handle constants
 
@@ -1597,7 +1596,7 @@ pub fn createPipeline(
         fragment_state.targetCount = 1;
 
         var target_state = z_WGPU_COLOR_TARGET_STATE_INIT();
-        target_state.format = @intFromEnum(descriptor.color_format);
+        target_state.format = @intFromEnum(descriptor.color_format.?);
 
         var blend_state = z_WGPU_BLEND_STATE_INIT();
         if (descriptor.blend) |b| {
@@ -1655,7 +1654,8 @@ pub fn createPipeline(
         desc.depthStencil = &depth_stencil_state;
     }
 
-    const multisample_state = z_WGPU_MULTISAMPLE_STATE_INIT();
+    var multisample_state = z_WGPU_MULTISAMPLE_STATE_INIT();
+    multisample_state.count = descriptor.sample_count;
     desc.multisample = multisample_state;
 
     const pipeline = c.wgpuDeviceCreateRenderPipeline(ctx.device, &desc);
@@ -1817,13 +1817,17 @@ fn indexOfVertexInput(vertex_meta: []const VertexInputMeta, name: []const u8) ?u
 }
 
 pub const PipelineConfig = struct {
-    color_format: TextureFormat,
+    color_format: ?TextureFormat = null,
     label: ?[]const u8 = null,
     depth_stencil_state: ?DepthStencilState = null,
     depth_format: ?TextureFormat = null,
     primitive_topology: PrimitiveTopology = .triangle_list,
     blend: ?BlendState = null,
     cull_mode: CullMode = .back,
+    sample_count: u32 = 1,
+    vertex_entry: ?[]const u8 = null,
+    fragment_entry: ?[]const u8 = null,
+    compute_entry: ?[]const u8 = null,
 };
 
 pub fn createPipelineFromMesh(
@@ -1840,19 +1844,30 @@ pub fn createPipelineFromMesh(
     const arena_alloc = arena.allocator();
     defer arena.deinit();
 
-    var supplied = [_]bool{false} ** Reflected.vertex_meta.len;
+    const vs_entries = Reflected.VS orelse return error.NoVertexShadersDefined;
+    const vertex_entry = config.vertex_entry orelse if (vs_entries.len == 1) vs_entries[0].fn_name else return error.VertexEntryUnresolved;
 
     var vertex_layouts: std.ArrayList(VertexBufferLayout) = .empty;
+    if (Reflected.VS == null) @compileError("Shader doesn't define a vertex function");
+    const vertex_meta = blk: {
+        inline for (Reflected.VS.?) |vs| {
+            if (std.mem.eql(u8, vertex_entry, vs.fn_name)) {
+                break :blk vs;
+            }
+        }
+        unreachable;
+    };
+    var supplied = [_]bool{false} ** vertex_meta.params.len;
     for ([_][]const VertexBuffer{ mesh.buffers, instance_buffers }, 0..) |buffers, kind| {
         for (buffers) |buf| {
             var vertex_attributes: std.ArrayList(VertexBufferLayout.VertexAttribute) = .empty;
             for (buf.attributes) |attr| {
-                const index = indexOfVertexInput(Reflected.vertex_meta, attr.name) orelse continue;
+                const index = indexOfVertexInput(vertex_meta.params, attr.name) orelse continue;
                 supplied[index] = true;
                 try vertex_attributes.append(arena_alloc, .{
                     .offset = attr.offset,
                     .format = attr.format,
-                    .shader_location = Reflected.vertex_meta[index].location,
+                    .shader_location = vertex_meta.params[index].location,
                 });
             }
             try vertex_layouts.append(arena_alloc, .{
@@ -1863,7 +1878,7 @@ pub fn createPipelineFromMesh(
         }
     }
 
-    for (supplied, Reflected.vertex_meta) |found, meta| {
+    for (supplied, vertex_meta.params) |found, meta| {
         if (!found) {
             std.log.err(
                 "{s} reads vertex input '{s}' at location {d}, which no buffer supplies",
@@ -1882,6 +1897,7 @@ pub fn createPipelineFromMesh(
         .primitive_topology = config.primitive_topology,
         .blend = config.blend,
         .cull_mode = config.cull_mode,
+        .sample_count = config.sample_count,
     };
 
     const group_layouts = try shader.pipelineLayouts();
@@ -1891,8 +1907,8 @@ pub fn createPipelineFromMesh(
         ctx,
         if (config.label) |label| label else Reflected.NAME,
         pipeline_descriptor,
-        Reflected.VS,
-        Reflected.FS,
+        vertex_entry,
+        config.fragment_entry,
         &group_layouts,
     );
 }
@@ -1921,13 +1937,15 @@ pub const DepthStencilAttachment = struct {
 };
 
 pub const ColorAttachment = struct {
+    view: c.WGPUTextureView,
     clear_value: Color = .{ .r = 0.2, .g = 0.2, .b = 0.2, .a = 1.0 },
     load_op: LoadOp = .clear,
     store_op: StoreOp = .store,
+    resolve_target: c.WGPUTextureView = null,
 };
 
 pub const RenderPassConfig = struct {
-    color_attachment: ColorAttachment = .{},
+    color_attachment: ?ColorAttachment = null,
     depth_stencil_attachment: ?DepthStencilAttachment = null,
     label: []const u8 = "render pass",
 };
@@ -1939,24 +1957,26 @@ pub const RenderPass = struct {
 
     pub fn init(
         encoder: c.WGPUCommandEncoder,
-        target_view: c.WGPUTextureView,
         config: RenderPassConfig,
     ) Self {
         var desc = z_WGPU_RENDER_PASS_DESCRIPTOR_INIT();
         desc.label = toWGPUString(config.label);
 
-        var color_attachment = z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
-        color_attachment.view = target_view;
-        color_attachment.loadOp = @intFromEnum(config.color_attachment.load_op);
-        color_attachment.storeOp = @intFromEnum(config.color_attachment.store_op);
-        color_attachment.clearValue = c.WGPUColor{
-            .r = config.color_attachment.clear_value.r,
-            .g = config.color_attachment.clear_value.g,
-            .b = config.color_attachment.clear_value.b,
-            .a = config.color_attachment.clear_value.a,
-        };
-        desc.colorAttachmentCount = 1;
-        desc.colorAttachments = &color_attachment;
+        if (config.color_attachment) |ca| {
+            var color_attachment = z_WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT();
+            color_attachment.view = ca.view;
+            color_attachment.loadOp = @intFromEnum(ca.load_op);
+            color_attachment.storeOp = @intFromEnum(ca.store_op);
+            color_attachment.clearValue = c.WGPUColor{
+                .r = ca.clear_value.r,
+                .g = ca.clear_value.g,
+                .b = ca.clear_value.b,
+                .a = ca.clear_value.a,
+            };
+            color_attachment.resolveTarget = ca.resolve_target;
+            desc.colorAttachmentCount = 1;
+            desc.colorAttachments = &color_attachment;
+        }
 
         if (config.depth_stencil_attachment) |dsa| {
             var depth_stencil_attachment = z_WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT();
@@ -2056,6 +2076,10 @@ pub const Texture = struct {
 
     const Self = @This();
 
+    const TextureConfig = struct {
+        sample_count: u32 = 1,
+    };
+
     pub fn init(
         ctx: GPUContext,
         label: []const u8,
@@ -2063,6 +2087,7 @@ pub const Texture = struct {
         height: u32,
         dimension: TextureDimension,
         format: TextureFormat,
+        config: TextureConfig,
         usage: TextureUsage,
     ) Self {
         const size: c.WGPUExtent3D = .{
@@ -2076,6 +2101,7 @@ pub const Texture = struct {
         desc.dimension = @intFromEnum(dimension);
         desc.format = @intFromEnum(format);
         desc.size = size;
+        desc.sampleCount = config.sample_count;
         desc.usage = usage.toC();
 
         const texture = c.wgpuDeviceCreateTexture(ctx.device, &desc);
@@ -2134,8 +2160,18 @@ pub const Texture = struct {
     }
 };
 
-pub fn createSampler(ctx: GPUContext, label: []const u8) c.WGPUSampler {
+const SamplerConfig = struct {
+    label: ?[]const u8 = null,
+    compare: ?CompareFunction = null,
+    mag_filter: FilterMode = .undefined,
+    min_filter: FilterMode = .undefined,
+};
+
+pub fn createSampler(ctx: GPUContext, config: SamplerConfig) c.WGPUSampler {
     var desc = z_WGPU_SAMPLER_DESCRIPTOR_INIT();
-    desc.label = toWGPUString(label);
+    if (config.label) |label| desc.label = toWGPUString(label);
+    if (config.compare) |cmp| desc.compare = @intFromEnum(cmp);
+    desc.magFilter = @intFromEnum(config.mag_filter);
+    desc.minFilter = @intFromEnum(config.min_filter);
     return c.wgpuDeviceCreateSampler(ctx.device, &desc);
 }

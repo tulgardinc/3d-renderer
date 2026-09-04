@@ -1,3 +1,6 @@
+// Column major
+// -z forward +y up
+
 pub fn checkNumeric(T: type) void {
     switch (@typeInfo(T)) {
         .int, .float => {},
@@ -231,9 +234,6 @@ pub fn Vec4(T: type) type {
     };
 }
 
-/// Conventions: column-major storage (flat order matches
-/// WGSL mat4x4), column vectors (transform = M * v, compose right-to-left),
-/// right-handed view space with -z forward and +y up, clip depth [0, 1] (WebGPU).
 pub fn Mat4x4(T: type) type {
     checkNumeric(T);
     return extern struct {

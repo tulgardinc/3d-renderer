@@ -295,17 +295,15 @@ const VertexInput = struct {
     location: u32,
 };
 
-const ShaderEntry = union(EntryTypes) {
-    vertex: struct {
+const ShaderEntries = struct {
+    vertex: []const VertexDef,
+    fragment: []const []const u8,
+    compute: []const []const u8,
+
+    const VertexDef = struct {
         name: []const u8,
         parameters: []const VertexInput,
-    },
-    fragment: struct {
-        name: []const u8,
-    },
-    compute: struct {
-        name: []const u8,
-    },
+    };
 };
 
 const ViewDimension = enum {
@@ -741,11 +739,13 @@ pub fn getEntryFunctions(
     root: c.TSNode,
     cursor: ?*c.TSQueryCursor,
     struct_map: StructMap,
-) ![]const ShaderEntry {
+) !ShaderEntries {
     var error_offset: u32 = 0;
     var error_type = c.TSQueryErrorNone;
 
-    var entry_functions: std.ArrayList(ShaderEntry) = .empty;
+    var vertex_fns: std.ArrayList(ShaderEntries.VertexDef) = .empty;
+    var fragment_fns: std.ArrayList([]const u8) = .empty;
+    var compute_fns: std.ArrayList([]const u8) = .empty;
 
     inline for (std.meta.fields(EntryTypes)) |enum_field| {
         const entry_type: EntryTypes = @enumFromInt(enum_field.value);
@@ -804,11 +804,9 @@ pub fn getEntryFunctions(
                     }
 
                     if (name) |n| {
-                        try entry_functions.append(arena, .{
-                            .vertex = .{
-                                .name = n,
-                                .parameters = params.items,
-                            },
+                        try vertex_fns.append(arena, .{
+                            .name = n,
+                            .parameters = params.items,
                         });
                     }
                 }
@@ -818,9 +816,7 @@ pub fn getEntryFunctions(
                     const name_node = capture(match, query, "fn_name").?;
                     const name = nodeText(src, name_node);
 
-                    try entry_functions.append(arena, .{
-                        .fragment = .{ .name = name },
-                    });
+                    try fragment_fns.append(arena, name);
                 }
             },
             .compute => {
@@ -828,15 +824,17 @@ pub fn getEntryFunctions(
                     const name_node = capture(match, query, "fn_name").?;
                     const name = nodeText(src, name_node);
 
-                    try entry_functions.append(arena, .{
-                        .compute = .{ .name = name },
-                    });
+                    try compute_fns.append(arena, name);
                 }
             },
         }
     }
 
-    return entry_functions.items;
+    return .{
+        .vertex = vertex_fns.items,
+        .fragment = fragment_fns.items,
+        .compute = compute_fns.items,
+    };
 }
 
 pub fn getStructProperties(
@@ -1089,11 +1087,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
-    dprint("=== ENTRY FUNCTIONS ===\n", .{});
     const entries = try getEntryFunctions(allocator, src, root, cursor, struct_map);
-    for (entries) |e| {
-        dprint("{f}\n", .{std.json.fmt(e, .{})});
-    }
 
     dprint("=== BINDINGS ===\n", .{});
     const bindings = try getBindingDeclerations(allocator, src, root, cursor);
@@ -1137,35 +1131,50 @@ pub fn main(init: std.process.Init.Minimal) !void {
         dprint("group: {any}, bind: {any}\n", .{ b.group, b.binding });
     }
 
-    const visibility: []const u8 = blk: {
-        for (entries) |i| {
-            if (i == .compute) break :blk "gpu.ShaderStage.compute";
-        }
-        break :blk "gpu.ShaderStage.vertex | gpu.ShaderStage.fragment";
-    };
+    const visibility: []const u8 = "gpu.ShaderStage.vertex | gpu.ShaderStage.fragment | gpu.ShaderStage.compute";
 
     var aw = std.Io.Writer.Allocating.init(allocator);
     const w = &aw.writer;
     try w.print("const gpu = @import(\"gpu\");\n\n", .{});
 
-    var vertex_index: ?usize = null;
-    for (entries, 0..) |item, i| {
-        if (item == .vertex) vertex_index = i;
-        const name = switch (item) {
-            inline else => |x| x.name,
-        };
-        const upper_name = try std.ascii.allocUpperString(allocator, name);
-        try w.print("pub const {s}: []const u8 = \"{s}\";\n", .{ upper_name, name });
+    try w.print("pub const FS: ?[]const []const u8 = ", .{});
+    if (entries.fragment.len == 0) {
+        try w.print("null;\n", .{});
+    } else {
+        try w.print(".{{ ", .{});
+        for (entries.fragment) |f| {
+            try w.print("\"{s}\", ", .{f});
+        }
+        try w.print("}};\n", .{});
     }
+
+    try w.print("pub const CS: ?[]const []const u8 = ", .{});
+    if (entries.compute.len == 0) {
+        try w.print("null;\n", .{});
+    } else {
+        try w.print(".{{ ", .{});
+        for (entries.compute) |cmp| {
+            try w.print("\"{s}\", ", .{cmp});
+        }
+        try w.print("}};\n", .{});
+    }
+
     try w.print("\n", .{});
 
-    try w.print("pub const vertex_meta: []const gpu.VertexInputMeta = &.{{\n", .{});
-    if (vertex_index) |i| {
-        for (entries[i].vertex.parameters) |param| {
-            try w.print(".{{ .name = \"{s}\", .location = {d} }},\n", .{ param.name, param.location });
+    try w.print("pub const VS: ?[]const struct {{ fn_name: []const u8,  params: []const gpu.VertexInputMeta }} = ", .{});
+    if (entries.vertex.len == 0) {
+        try w.print("null;\n", .{});
+    } else {
+        try w.print("&.{{\n", .{});
+        for (entries.vertex) |v| {
+            try w.print("\n.{{ .fn_name = \"{s}\", .params = &.{{\n", .{v.name});
+            for (v.parameters) |p| {
+                try w.print(".{{ .name = \"{s}\", .location = {d} }},\n", .{ p.name, p.location });
+            }
+            try w.print("}}, }},\n", .{});
         }
+        try w.print("}};\n\n", .{});
     }
-    try w.print("}};\n\n", .{});
 
     var emitted_structs: std.StringHashMapUnmanaged(void) = .empty;
     for (bindings) |binding| {
@@ -1307,7 +1316,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     },
                 ),
                 .sampler => |smp| {
-                    const smp_type = if (smp == .sampler) ".filtering" else ".sampler_comparison";
+                    const smp_type = if (smp == .sampler) ".filtering" else ".comparison";
                     try w.print(".{{ .sampler = {s} }} }},", .{smp_type});
                 },
                 .texture => |tex| switch (tex) {
@@ -1319,7 +1328,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     },
                     .depth_texture => |depth| {
                         try w.print(
-                            ".{{ .texture = .{{ .sample_type = {s}, .view_dimension = .depth, .multi_sampled = {any}  }} }} }},",
+                            ".{{ .texture = .{{ .sample_type = .depth, .view_dimension = {s}, .multi_sampled = {any}  }} }} }},",
                             .{ depth.getString(), depth == .texture_depth_multisampled_2d },
                         );
                     },

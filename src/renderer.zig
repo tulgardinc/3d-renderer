@@ -1,7 +1,6 @@
 const std = @import("std");
 const gpu = @import("gpu.zig");
 const c = gpu.c;
-const sys = @import("gpu-system.zig");
 
 gpu_instance: gpu.GPUInstance,
 gpu_context: gpu.GPUContext,
