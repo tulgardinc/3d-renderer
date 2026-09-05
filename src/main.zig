@@ -13,14 +13,36 @@ const Vertex = extern struct {
     normal: [3]f32,
 };
 
-/// A shared corner needs a different uv on each face it touches, so the cube is
-/// unwelded to 4 vertices per face. Corners run bottom-left, bottom-right,
-/// top-right, top-left as seen from outside, which makes every face wind
-/// counter-clockwise.
-///
-/// The same unwelding is what lets each face carry its own normal: all four of a
-/// face's vertices get that face's axis, which is what makes a cube shade flat
-/// rather than smooth.
+const DrawCmd = struct {
+    transparent: bool,
+    pipeline: usize,
+    material: usize,
+    mesh: usize,
+    depth: f32 = 0,
+
+    instance: Mesh.Instance,
+
+    pub fn lessThan(_: void, a: DrawCmd, b: DrawCmd) bool {
+        if (a.transparent != b.transparent) return !a.transparent;
+        if (a.transparent) return a.depth > b.depth;
+        if (a.pipeline != b.pipeline) return a.pipeline < b.pipeline;
+        if (a.material != b.material) return a.material < b.material;
+        return a.mesh < b.mesh;
+    }
+};
+
+/// A run of sort-adjacent commands with identical state: one draw call.
+/// `first`/`count` index the flat instance array uploaded this frame.
+const Batch = struct {
+    transparent: bool,
+    pipeline: usize,
+    material: usize,
+    mesh: usize,
+    first: u32,
+    count: u32,
+};
+
+/// Corners run bottom-left, bottom-right, top-right, top-left as seen from outside
 const vertices = [_]Vertex{
     // +z
     .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 1 }, .normal = .{ 0, 0, 1 } },
@@ -63,10 +85,17 @@ const indices = [_]u16{
     20, 21, 22, 20, 22, 23,
 };
 
-/// 2x2 rgba8unorm checkerboard, row-major.
+const instance_count: u32 = 4;
+
+// 2x2 rgba8unorm checkerboard, row-major.
 const checker_pixels = [_][4]u8{
     .{ 255, 255, 255, 255 }, .{ 40, 40, 40, 255 },
     .{ 40, 40, 40, 255 },    .{ 255, 255, 255, 255 },
+};
+
+// 1x1 white texture
+const simple_pixel = [_][4]u8{
+    .{ 255, 255, 255, 255 },
 };
 
 extern fn emscripten_console_error(utf8: [*:0]const u8) void;
@@ -127,7 +156,7 @@ const Camera = struct {
 // always facing 0,0,0
 const DirectionalLight = struct {
     pos: l.Vec3(f32) = .init(30, 30, 20),
-    ambient: f32 = 0.03,
+    ambient: f32 = 0.05,
     texture_size: f32 = 512,
 
     const Self = @This();
@@ -262,32 +291,33 @@ pub fn run() !void {
     const checker_view = checker_tex.createView("checker view");
     defer c.wgpuTextureViewRelease(checker_view);
 
+    const white_tex = gpu.Texture.init(
+        gpu_context,
+        "white texture",
+        1,
+        1,
+        .@"2d",
+        .rgba8_unorm,
+        .{},
+        .{ .copy_dst = true, .texture_binding = true },
+    );
+    defer white_tex.deinit();
+
+    white_tex.writeTexture(gpu_context, .{
+        .width = 1,
+        .height = 1,
+        .format = .rgba8_unorm,
+        .data = std.mem.asBytes(&simple_pixel),
+    }, .{});
+
+    const white_view = white_tex.createView("white view");
+    defer c.wgpuTextureViewRelease(white_view);
+
     const sampler = gpu.createSampler(gpu_context, .{});
     defer c.wgpuSamplerRelease(sampler);
 
-    const instances = try MeshShader.Storage.instances.initCapacity(gpu_context, 4, .{});
-    defer instances.deinit();
-    try instances.upload(
-        gpu_context,
-        &.{
-            .{
-                .model = (CubeInstance{ .pos = .init(-2, 0, 0), .rot = 0 }).modelMatrix().toArray(),
-                .tint = l.Vec4(f32).init(1, 0, 0, 1).toArray(),
-            },
-            .{
-                .model = (CubeInstance{ .pos = .init(0, 0, 0), .rot = std.math.degreesToRadians(15) }).modelMatrix().toArray(),
-                .tint = l.Vec4(f32).init(0, 1, 0, 1).toArray(),
-            },
-            .{
-                .model = (CubeInstance{ .pos = .init(2, 0, 0), .rot = std.math.degreesToRadians(30) }).modelMatrix().toArray(),
-                .tint = l.Vec4(f32).init(0, 0, 1, 1).toArray(),
-            },
-            .{
-                .model = (CubeInstance{ .pos = .init(0, -1, 0), .scale = .init(8, 1, 8) }).modelMatrix().toArray(),
-                .tint = l.Vec4(f32).init(1, 1, 1, 1).toArray(),
-            },
-        },
-    );
+    const instance_storage = try MeshShader.Storage.instances.initCapacity(gpu_context, 8, .{});
+    defer instance_storage.deinit();
 
     const dir_light = DirectionalLight{};
     const dir_light_ub = try ShadowShader.Uniform.light_vp.init(gpu_context, .{});
@@ -319,20 +349,51 @@ pub fn run() !void {
         },
     );
 
-    const mesh_bg = try mesh_shader.createBindGroup(
+    const frame_bg = try mesh_shader.createBindGroup(
         0,
         allocator,
         gpu_context,
         .{
             .world = world_ub.binding(),
-            .texture = checker_view,
             .shadow_map = shadow_map_view,
             .shadow_smp = shadow_smp,
-            .smp = sampler,
-            .instances = instances.binding(),
         },
     );
-    defer c.wgpuBindGroupRelease(mesh_bg);
+    defer c.wgpuBindGroupRelease(frame_bg);
+
+    // Two materials sharing render_pipeline: the sort has to group by pipeline
+    // first, then by material bind group within it.
+    const checker_bg = try mesh_shader.createBindGroup(
+        1,
+        allocator,
+        gpu_context,
+        .{
+            .texture = checker_view,
+            .smp = sampler,
+        },
+    );
+    defer c.wgpuBindGroupRelease(checker_bg);
+
+    const white_bg = try mesh_shader.createBindGroup(
+        1,
+        allocator,
+        gpu_context,
+        .{
+            .texture = white_view,
+            .smp = sampler,
+        },
+    );
+    defer c.wgpuBindGroupRelease(white_bg);
+
+    const instances_bg = try mesh_shader.createBindGroup(
+        2,
+        allocator,
+        gpu_context,
+        .{
+            .instances = instance_storage.binding(),
+        },
+    );
+    defer c.wgpuBindGroupRelease(instances_bg);
 
     const light_bg = try shadow_shader.createBindGroup(
         0,
@@ -340,7 +401,7 @@ pub fn run() !void {
         gpu_context,
         .{
             .light_vp = dir_light_ub.binding(),
-            .instances = instances.binding(),
+            .instances = instance_storage.binding(),
         },
     );
     defer c.wgpuBindGroupRelease(light_bg);
@@ -376,19 +437,39 @@ pub fn run() !void {
     );
     defer c.wgpuRenderPipelineRelease(render_pipeline);
 
-    const render_do: gpu.DrawObject = .{
-        .bind_groups = &.{.{ .group = 0, .bind_group = mesh_bg }},
-        .mesh = cube_mesh,
-        .pipeline = render_pipeline,
-        .instances = .initCount(instances.capacity),
-    };
+    const transparent_pipeline = try gpu.createPipelineFromMesh(
+        allocator,
+        gpu_context,
+        mesh_shader,
+        cube_mesh,
+        &.{},
+        .{
+            .label = "transparent",
+            .color_format = target_surface.format,
+            .depth_stencil_state = .{
+                .depth_write_enabled = false,
+            },
+            .depth_format = .depth32_float,
+            .fragment_entry = "fs",
+            .sample_count = 4,
+            .blend = .{
+                .color = .{
+                    .operation = .add,
+                    .src_factor = .src_alpha,
+                    .dst_factor = .one_minus_src_alpha,
+                },
+                .alpha = .{
+                    .operation = .add,
+                    .src_factor = .one,
+                    .dst_factor = .one_minus_src_alpha,
+                },
+            },
+        },
+    );
+    defer c.wgpuRenderPipelineRelease(transparent_pipeline);
 
-    const shadow_do: gpu.DrawObject = .{
-        .bind_groups = &.{.{ .group = 0, .bind_group = light_bg }},
-        .mesh = cube_mesh,
-        .pipeline = shadow_pipeline,
-        .instances = .initCount(instances.capacity),
-    };
+
+
 
     var depth_texture = gpu.Texture.init(
         gpu_context,
@@ -426,8 +507,103 @@ pub fn run() !void {
 
     dir_light_ub.upload(gpu_context, dir_light.getVPMatrix().toArray());
 
+    var draw_cmds: std.ArrayList(DrawCmd) = .empty;
+    defer draw_cmds.deinit(allocator);
+
+    var flat_instances: std.ArrayList(Mesh.Instance) = .empty;
+    defer flat_instances.deinit(allocator);
+
+    var batches: std.ArrayList(Batch) = .empty;
+    defer batches.deinit(allocator);
+
     var running = true;
     while (running) {
+        draw_cmds.clearRetainingCapacity();
+
+        try draw_cmds.append(
+            allocator,
+            .{
+                .transparent = false,
+                .pipeline = @intFromPtr(render_pipeline),
+                .material = @intFromPtr(checker_bg),
+                .mesh = @intFromPtr(&cube_mesh),
+                .instance = .{
+                    .model = (CubeInstance{ .pos = .init(2, 0, 0), .rot = std.math.degreesToRadians(30) }).modelMatrix().toArray(),
+                    .tint = l.Vec4(f32).init(0, 0, 1, 1).toArray(),
+                },
+            },
+        );
+
+        try draw_cmds.append(
+            allocator,
+            .{
+                .transparent = false,
+                .pipeline = @intFromPtr(render_pipeline),
+                .material = @intFromPtr(white_bg),
+                .mesh = @intFromPtr(&cube_mesh),
+                .instance = .{
+                    .model = (CubeInstance{ .pos = .init(4, 0, 0), .rot = std.math.degreesToRadians(45) }).modelMatrix().toArray(),
+                    .tint = l.Vec4(f32).init(1, 0.5, 0, 1).toArray(),
+                },
+            },
+        );
+
+        try draw_cmds.append(
+            allocator,
+            .{
+                .transparent = true,
+                .pipeline = @intFromPtr(transparent_pipeline),
+                .material = @intFromPtr(checker_bg),
+                .mesh = @intFromPtr(&cube_mesh),
+                .instance = .{
+                    .model = (CubeInstance{ .pos = .init(0, 0, 0), .rot = std.math.degreesToRadians(15) }).modelMatrix().toArray(),
+                    .tint = l.Vec4(f32).init(0, 1, 0, 0.3).toArray(),
+                },
+            },
+        );
+
+        try draw_cmds.append(
+            allocator,
+            .{
+                .transparent = false,
+                .pipeline = @intFromPtr(render_pipeline),
+                .material = @intFromPtr(checker_bg),
+                .mesh = @intFromPtr(&cube_mesh),
+                .instance = .{
+                    .model = (CubeInstance{ .pos = .init(0, -1, 0), .scale = .init(8, 1, 8) }).modelMatrix().toArray(),
+                    .tint = l.Vec4(f32).init(1, 1, 1, 1).toArray(),
+                },
+            },
+        );
+
+        try draw_cmds.append(
+            allocator,
+            .{
+                .transparent = false,
+                .pipeline = @intFromPtr(render_pipeline),
+                .material = @intFromPtr(white_bg),
+                .mesh = @intFromPtr(&cube_mesh),
+                .instance = .{
+                    .model = (CubeInstance{ .pos = .init(-4, 0, 0), .rot = std.math.degreesToRadians(60) }).modelMatrix().toArray(),
+                    .tint = l.Vec4(f32).init(0.6, 0, 1, 1).toArray(),
+                },
+            },
+        );
+
+        try draw_cmds.append(
+            allocator,
+            .{
+                .transparent = true,
+                .pipeline = @intFromPtr(transparent_pipeline),
+                .material = @intFromPtr(checker_bg),
+                .mesh = @intFromPtr(&cube_mesh),
+                .instance = .{
+                    .model = (CubeInstance{ .pos = .init(-2, 0, 0), .rot = 0 }).modelMatrix().toArray(),
+                    .tint = l.Vec4(f32).init(1, 0, 0, 0.3).toArray(),
+                },
+            },
+        );
+
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -486,7 +662,6 @@ pub fn run() !void {
                 .depth32_float,
                 .{ .sample_count = 4 },
                 .{
-                    .copy_dst = true,
                     .render_attachment = true,
                 },
             );
@@ -518,8 +693,48 @@ pub fn run() !void {
             .vp_matrix = view_proj.toArray(),
             .light_vp = dir_light.getVPMatrix().toArray(),
             .light_pos = dir_light.pos.toArray(),
-            .ambient = 0.01,
+            .ambient = dir_light.ambient,
         });
+
+        // Flush: everything is recorded and the camera is final, so order can
+        // be decided. Depth is distance along the view direction, read from the
+        // model matrix's translation column.
+        for (draw_cmds.items) |*cmd| {
+            const pos = l.Vec3(f32).init(cmd.instance.model[3][0], cmd.instance.model[3][1], cmd.instance.model[3][2]);
+            cmd.depth = pos.sub(cam.pos).dot(cam.forward());
+        }
+
+        std.mem.sort(DrawCmd, draw_cmds.items, {}, DrawCmd.lessThan);
+
+        // Flatten: one walk emits the contiguous instance array and the batch
+        // list together. A command extends the last batch only if every state
+        // key matches -- depth deliberately excluded, it orders but never splits.
+        flat_instances.clearRetainingCapacity();
+        batches.clearRetainingCapacity();
+        for (draw_cmds.items) |cmd| {
+            const extends = batches.items.len > 0 and blk: {
+                const b = batches.items[batches.items.len - 1];
+                break :blk b.transparent == cmd.transparent and
+                    b.pipeline == cmd.pipeline and
+                    b.material == cmd.material and
+                    b.mesh == cmd.mesh;
+            };
+            if (extends) {
+                batches.items[batches.items.len - 1].count += 1;
+            } else {
+                try batches.append(allocator, .{
+                    .transparent = cmd.transparent,
+                    .pipeline = cmd.pipeline,
+                    .material = cmd.material,
+                    .mesh = cmd.mesh,
+                    .first = @intCast(flat_instances.items.len),
+                    .count = 1,
+                });
+            }
+            try flat_instances.append(allocator, cmd.instance);
+        }
+
+        try instance_storage.upload(gpu_context, flat_instances.items);
 
         const encoder = gpu_context.getEncoder();
         defer c.wgpuCommandEncoderRelease(encoder);
@@ -532,7 +747,15 @@ pub fn run() !void {
                 .view = shadow_map_view,
             },
         });
-        shadow_pass.draw(shadow_do);
+        for (batches.items) |batch| {
+            if (batch.transparent) break;
+            shadow_pass.draw(.{
+                .bind_groups = &.{.{ .group = 0, .bind_group = light_bg }},
+                .mesh = @as(*const gpu.Mesh, @ptrFromInt(batch.mesh)).*,
+                .pipeline = shadow_pipeline,
+                .instances = .initCount(batch.first, batch.count),
+            });
+        }
         shadow_pass.end();
 
         const rp = gpu.RenderPass.init(
@@ -549,7 +772,18 @@ pub fn run() !void {
                 },
             },
         );
-        rp.draw(render_do);
+        for (batches.items) |batch| {
+            rp.draw(.{
+                .bind_groups = &.{
+                    .{ .group = 0, .bind_group = frame_bg },
+                    .{ .group = 1, .bind_group = @ptrFromInt(batch.material) },
+                    .{ .group = 2, .bind_group = instances_bg },
+                },
+                .mesh = @as(*const gpu.Mesh, @ptrFromInt(batch.mesh)).*,
+                .pipeline = @ptrFromInt(batch.pipeline),
+                .instances = .initCount(batch.first, batch.count),
+            });
+        }
         rp.end();
 
         const buffer = gpu.finishEncoder(encoder);

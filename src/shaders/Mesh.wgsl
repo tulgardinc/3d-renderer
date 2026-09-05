@@ -24,12 +24,17 @@ struct Instance {
     tint: vec4<f32>,
 };
 
+// group 0: per-pass globals, bound once per pass
 @group(0) @binding(0) var<uniform> world: World;
-@group(0) @binding(1) var texture: texture_2d<f32>;
-@group(0) @binding(2) var smp: sampler;
-@group(0) @binding(3) var<storage, read> instances: array<Instance>;
-@group(0) @binding(4) var shadow_map: texture_depth_2d;
-@group(0) @binding(5) var shadow_smp: sampler_comparison;
+@group(0) @binding(1) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_smp: sampler_comparison;
+
+// group 1: the material -- this bind group IS a material's GPU identity
+@group(1) @binding(0) var texture: texture_2d<f32>;
+@group(1) @binding(1) var smp: sampler;
+
+// group 2: the per-frame instance stream, bound once per pass
+@group(2) @binding(0) var<storage, read> instances: array<Instance>;
 
 fn shadow_factor(pos_light: vec4<f32>) -> f32 {
     let p = pos_light.xyz / pos_light.w;
@@ -61,6 +66,9 @@ fn vs(in: VertexInput, @builtin(instance_index) ii: u32) -> VertexOutput {
 
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
-    var lightness = world.ambient + max(dot(normalize(in.normal), normalize(world.light_pos)), 0) * shadow_factor(in.pos_light);
-    return textureSample(texture, smp, in.uv) * in.col * lightness;
+    let self_lightness = max(dot(normalize(in.normal), normalize(world.light_pos)), 0);
+    let shadow_factor = shadow_factor(in.pos_light);
+    var lightness = world.ambient + self_lightness * shadow_factor;
+    let tex = textureSample(texture, smp, in.uv) * in.col;
+    return vec4<f32>(tex.xyz * lightness, in.col.a);
 }

@@ -1711,9 +1711,10 @@ pub fn createBindGroup(
 pub const Instances = struct {
     buffers: []const VertexBuffer,
     count: u32,
+    first_instance: u32 = 0,
 
-    pub fn initCount(count: u32) @This() {
-        return .{ .buffers = &.{}, .count = count };
+    pub fn initCount(first: u32, count: u32) @This() {
+        return .{ .buffers = &.{}, .count = count, .first_instance = first };
     }
 };
 
@@ -1913,10 +1914,6 @@ pub fn createPipelineFromMesh(
     );
 }
 
-/// A bind group paired with the slot it should be bound to for one draw. The
-/// slot is the caller's choice, not a property of the bind group: the same
-/// handle is valid in any group whose layout is group-equivalent to the one it
-/// was built from.
 pub const BoundGroup = struct {
     group: u32,
     bind_group: c.WGPUBindGroup,
@@ -2023,7 +2020,7 @@ pub const RenderPass = struct {
                 buffer_index,
                 buf.ptr,
                 0,
-                draw_object.instances.count * buf.stride,
+                (draw_object.instances.first_instance + draw_object.instances.count) * buf.stride,
             );
             buffer_index += 1;
         }
@@ -2042,7 +2039,7 @@ pub const RenderPass = struct {
                 draw_object.instances.count,
                 0,
                 0,
-                0,
+                draw_object.instances.first_instance,
             );
         } else {
             c.wgpuRenderPassEncoderDraw(
@@ -2050,7 +2047,7 @@ pub const RenderPass = struct {
                 draw_object.mesh.vertex_count,
                 draw_object.instances.count,
                 0,
-                0,
+                draw_object.instances.first_instance,
             );
         }
     }
