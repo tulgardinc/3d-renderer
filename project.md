@@ -20,8 +20,7 @@ app (main.zig)  →  renderer.zig  →  gpu.zig  →  WebGPU
   (`Shader(Reflected)` from build-time WGSL reflection/codegen). Usable
   standalone. Every call takes the context explicitly; no globals.
 - **renderer.zig** — the opinionated layer. Owns instance/device/queue/surface,
-  resize, frame/pass structure, the pipeline cache, the batcher, materials, and
-  built-in primitive meshes. Consumes gpu.zig; re-exports `c` and `is_web` so
+  resize, frame/pass structure, materials, and built-in primitive meshes. Consumes gpu.zig; re-exports `c` and `is_web` so
   the app needs no direct gpu import for platform glue. Apps may still use
   gpu.zig directly for raw resources (e.g. `gpu.Texture.init`).
 - **app** — owns its camera, its loop, its assets, and submits immediate-mode
@@ -77,8 +76,8 @@ Key decisions, in order of precedence:
 4. **Meshes are plain CPU data.** `Mesh` = vertex bytes + named attribute
    layout + topology + optional indices. `PrimitiveMeshes` is a namespace of
    constants (cube, quad, ...); loaded models produce the same type. No
-   registration: the renderer uploads and caches GPU buffers on first draw,
-   keyed on mesh identity (data pointer; `id` field as escape hatch).
+   registration step: hand any `Mesh` to `draw` and it renders; upload is the
+   renderer's concern, not the app's.
 5. **No manual camera math in the app.** `Renderer.Camera` is a value type
    (pos, yaw, pitch, projection: perspective or orthographic, fov/near/far,
    `forward()`/`right()` helpers). The app mutates it; `setCamera` snapshots
@@ -102,25 +101,20 @@ skipped, wrong shapes are compile errors:
 No lights submitted ⇒ ambient-only black: forgetting the light call looks
 obviously dark, not mysteriously broken.
 
-## Core: three general structures, no feature subsystems
+## No feature subsystems
 
 Transparency, depth variants, MSAA, topology, wireframe, additive particles —
-none of these get dedicated code. They fall out of giving three core structures
-their full general shape from day one (retrofitting the narrow versions is the
-expensive path):
+none of these are features with dedicated code or API. They are combinations
+of general options that always compose:
 
-1. **Pipeline cache** keyed on the complete truth of what a pipeline is:
-   `(shader, vertex layout, pass-target formats + sample count, RenderState)`.
-   `RenderState` = blend, depth test/write, cull, topology; carried by
-   material (topology by mesh). Every "variant" is a cache miss, not a feature.
-2. **Sort-key batcher.** The draw queue is `(sort key, draw record)`; flush =
-   sort, then instance-batch consecutive runs of identical (mesh, material).
-   Opaque key = (pipeline, material, mesh) → grouping + minimal state changes.
-   Transparent key = (transparent bit, back-to-front depth). One code path;
-   the renderer never contains the word "transparent" outside key computation.
-3. **Transient target cache**: renderer-owned textures keyed on
-   (size, format, samples) — the window depth buffer, MSAA color + resolve.
-   MSAA's only explicit code is intermediate allocation + resolve at pass end.
+- Materials carry `RenderState`: blend, depth test/write, cull.
+- Meshes carry topology.
+- Passes carry their targets and a sample count.
+- Intermediate targets the app never asked to manage (window depth buffer,
+  MSAA color) are the renderer's to allocate and resolve, invisibly.
+
+Any combination of shader, state, and target just works; a new look is a field
+on something the app already has, never a renderer change.
 
 Plus two init-time conveniences: a 1×1 white default texture (tint-only
 materials work) and an error-magenta fallback material (shader failure renders
@@ -146,15 +140,15 @@ Priority order for prototyping value:
 
 1. **Debug draw**: `debug.line/wireCube/axes/sphere`, depth-tested or on-top.
 2. **Text overlay**: baked bitmap font, `debug.text(pos, fmt, args)`.
-3. **WGSL hot reload** (dev-only): watch files, rebuild pipelines, fall back
-   to error-magenta on compile failure. Reloads shader *bodies* only —
-   interface changes require recompile (reflection is comptime).
-4. **Shadow map helper**: owns map texture + sun camera + the double-submit
-   loop; one-line ergonomics, built on the six primitives.
+3. **WGSL hot reload** (dev-only): edited shaders take effect without a
+   restart, falling back to error-magenta on compile failure. Shader *bodies*
+   only — interface changes require recompile.
+4. **Shadow map helper**: owns the map texture and sun camera; one-line
+   ergonomics, built entirely on the six public primitives.
 5. **Sprites / 2D pass** (ortho + quads + transparency).
-6. **Skybox** (cube + depth-equal trick).
-7. **Fullscreen post pass** (fullscreen triangle + material) — with off-screen
-   targets this unlocks tonemapping/vignette/fades.
+6. **Skybox**.
+7. **Fullscreen post pass** — with off-screen targets this unlocks
+   tonemapping/vignette/fades.
 8. **Screenshot readback** (gpu-layer utility).
 
 Outside the library entirely: model loading (glTF → `Mesh` + textures) is a
