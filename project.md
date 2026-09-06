@@ -151,6 +151,11 @@ Priority order for prototyping value:
    tonemapping/vignette/fades.
 8. **Screenshot readback** (gpu-layer utility).
 
+Worth exploring later (design notes live in Claude's project memory,
+`project_baking_escape_hatch.md`): an opt-in `bake`/`drawList` helper over
+render bundles as the scaling escape hatch for big static scenes, growable
+into hybrid GPU-driven culling — without touching the core immediate API.
+
 Outside the library entirely: model loading (glTF → `Mesh` + textures) is a
 separate loader module; the CPU-data mesh design is the seam.
 
