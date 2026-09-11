@@ -343,25 +343,36 @@ pub const Surface = struct {
     }
 };
 
+pub const BufferConfig = struct {
+    label: []const u8 = "buffer",
+};
+
 pub fn createBuffer(
     ctx: GPUContext,
-    contents: []const u8,
-    label: []const u8,
+    size: u32,
     usage: BufferUsage,
+    config: BufferConfig,
 ) !c.WGPUBuffer {
     var desc = z_WGPU_BUFFER_DESCRIPTOR_INIT();
-    desc.label = toWGPUString(label);
-    desc.size = contents.len;
+    desc.label = toWGPUString(config.label);
+    desc.size = size;
     desc.usage = usage.toC();
 
     const buffer = c.wgpuDeviceCreateBuffer(ctx.device, &desc);
     if (buffer == null) {
-        std.log.err("ResourceManager: wgpuDeviceCreateBuffer failed for '{s}'", .{label});
+        std.log.err("ResourceManager: wgpuDeviceCreateBuffer failed for '{s}'", .{config.label});
         return error.BufferCreationFailed;
     }
-
-    c.wgpuQueueWriteBuffer(ctx.queue, buffer, 0, contents.ptr, contents.len);
     return buffer;
+}
+
+pub fn writeBuffer(
+    ctx: GPUContext,
+    buffer: c.WGPUBuffer,
+    offset: u32,
+    data: anytype,
+) void {
+    c.wgpuQueueWriteBuffer(ctx.queue, buffer, offset, std.mem.asBytes(data), @sizeOf(@TypeOf(data)));
 }
 
 pub const PresentMode = enum(c.WGPUPresentMode) {
@@ -634,6 +645,16 @@ pub const TextureDimension = enum(c.WGPUTextureDimension) {
     @"3d" = c.WGPUTextureDimension_3D,
 };
 
+pub const TextureViewDimension = enum(c.WGPUTextureViewDimension) {
+    undefined = c.WGPUTextureViewDimension_Undefined,
+    @"1d" = c.WGPUTextureViewDimension_1D,
+    @"2d" = c.WGPUTextureViewDimension_2D,
+    @"2d_array" = c.WGPUTextureViewDimension_2DArray,
+    cube = c.WGPUTextureViewDimension_Cube,
+    cube_array = c.WGPUTextureViewDimension_CubeArray,
+    @"3d" = c.WGPUTextureViewDimension_3D,
+};
+
 pub const TextureAspect = enum(c.WGPUTextureAspect) {
     undefined = c.WGPUTextureAspect_Undefined,
     all = c.WGPUTextureAspect_All,
@@ -892,14 +913,6 @@ pub const BindingType = union(BindingResourceTypes) {
         write_only = c.WGPUStorageTextureAccess_WriteOnly,
         read_only = c.WGPUStorageTextureAccess_ReadOnly,
         read_write = c.WGPUStorageTextureAccess_ReadWrite,
-    };
-    const TextureViewDimension = enum(c.WGPUTextureViewDimension) {
-        @"1d" = c.WGPUTextureViewDimension_1D,
-        @"2d" = c.WGPUTextureViewDimension_2D,
-        @"2d_array" = c.WGPUTextureViewDimension_2DArray,
-        cube = c.WGPUTextureViewDimension_Cube,
-        cube_array = c.WGPUTextureViewDimension_CubeArray,
-        @"3d" = c.WGPUTextureViewDimension_3D,
     };
     const TextureBindingInfo = struct {
         sample_type: TextureSampleBT,
@@ -2145,9 +2158,29 @@ pub const Texture = struct {
         );
     }
 
-    pub fn createView(self: Self, label: []const u8) c.WGPUTextureView {
+    pub const ViewConfig = struct {
+        label: ?[]const u8 = null,
+        format: ?TextureFormat = null,
+        dimension: ?TextureViewDimension = null,
+        base_mip_level: ?u32 = null,
+        mip_level_count: ?u32 = null,
+        base_array_layer: ?u32 = null,
+        array_layer_count: ?u32 = null,
+        aspect: ?TextureAspect = null,
+        usage: ?TextureUsage = null,
+    };
+
+    pub fn createView(self: Self, config: ViewConfig) c.WGPUTextureView {
         var desc = z_WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT();
-        desc.label = toWGPUString(label);
+        if (config.label) |v| desc.label = toWGPUString(v);
+        if (config.format) |v| desc.format = @intFromEnum(v);
+        if (config.dimension) |v| desc.dimension = @intFromEnum(v);
+        if (config.base_mip_level) |v| desc.baseMipLevel = v;
+        if (config.mip_level_count) |v| desc.mipLevelCount = v;
+        if (config.base_array_layer) |v| desc.baseArrayLayer = v;
+        if (config.array_layer_count) |v| desc.arrayLayerCount = v;
+        if (config.aspect) |v| desc.aspect = @intFromEnum(v);
+        if (config.usage) |v| desc.usage = v.toC();
 
         return c.wgpuTextureCreateView(self.ptr, &desc);
     }
@@ -2157,7 +2190,7 @@ pub const Texture = struct {
     }
 };
 
-const SamplerConfig = struct {
+pub const SamplerConfig = struct {
     label: ?[]const u8 = null,
     compare: ?CompareFunction = null,
     mag_filter: FilterMode = .undefined,
@@ -2172,3 +2205,8 @@ pub fn createSampler(ctx: GPUContext, config: SamplerConfig) c.WGPUSampler {
     desc.minFilter = @intFromEnum(config.min_filter);
     return c.wgpuDeviceCreateSampler(ctx.device, &desc);
 }
+
+pub const VertexLayout = struct {
+    stride: u32,
+    attrbiutes: []const VertexBuffer.AttributeDesc,
+};

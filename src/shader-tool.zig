@@ -1141,7 +1141,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (entries.fragment.len == 0) {
         try w.print("null;\n", .{});
     } else {
-        try w.print(".{{ ", .{});
+        try w.print("&.{{ ", .{});
         for (entries.fragment) |f| {
             try w.print("\"{s}\", ", .{f});
         }
@@ -1152,7 +1152,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (entries.compute.len == 0) {
         try w.print("null;\n", .{});
     } else {
-        try w.print(".{{ ", .{});
+        try w.print("&.{{ ", .{});
         for (entries.compute) |cmp| {
             try w.print("\"{s}\", ", .{cmp});
         }

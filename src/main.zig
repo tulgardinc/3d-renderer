@@ -288,7 +288,7 @@ pub fn run() !void {
     };
     checker_tex.writeTexture(gpu_context, checker_texel, .{});
 
-    const checker_view = checker_tex.createView("checker view");
+    const checker_view = checker_tex.createView(.{ .label = "checker view" });
     defer c.wgpuTextureViewRelease(checker_view);
 
     const white_tex = gpu.Texture.init(
@@ -310,7 +310,7 @@ pub fn run() !void {
         .data = std.mem.asBytes(&simple_pixel),
     }, .{});
 
-    const white_view = white_tex.createView("white view");
+    const white_view = white_tex.createView(.{ .label = "white view" });
     defer c.wgpuTextureViewRelease(white_view);
 
     const sampler = gpu.createSampler(gpu_context, .{});
@@ -337,7 +337,7 @@ pub fn run() !void {
     );
     defer shadow_map.deinit();
 
-    const shadow_map_view = shadow_map.createView("shadow view");
+    const shadow_map_view = shadow_map.createView(.{ .label = "shadow view" });
     defer c.wgpuTextureViewRelease(shadow_map_view);
 
     const shadow_smp = gpu.createSampler(
@@ -468,9 +468,6 @@ pub fn run() !void {
     );
     defer c.wgpuRenderPipelineRelease(transparent_pipeline);
 
-
-
-
     var depth_texture = gpu.Texture.init(
         gpu_context,
         "depth texture",
@@ -485,7 +482,7 @@ pub fn run() !void {
     );
     defer depth_texture.deinit();
 
-    var depth_view = depth_texture.createView("depth view");
+    var depth_view = depth_texture.createView(.{ .label = "depth view" });
     defer c.wgpuTextureViewRelease(depth_view);
 
     var msaa_texture = gpu.Texture.init(
@@ -502,7 +499,7 @@ pub fn run() !void {
     );
     defer msaa_texture.deinit();
 
-    var msaa_view = msaa_texture.createView("msaa view");
+    var msaa_view = msaa_texture.createView(.{ .label = "msaa view" });
     defer c.wgpuTextureViewRelease(msaa_view);
 
     dir_light_ub.upload(gpu_context, dir_light.getVPMatrix().toArray());
@@ -665,7 +662,7 @@ pub fn run() !void {
                     .render_attachment = true,
                 },
             );
-            depth_view = depth_texture.createView("depth view");
+            depth_view = depth_texture.createView(.{ .label = "depth view" });
 
             c.wgpuTextureViewRelease(msaa_view);
             msaa_texture.deinit();
@@ -682,7 +679,7 @@ pub fn run() !void {
                     .render_attachment = true,
                 },
             );
-            msaa_view = msaa_texture.createView("msaa view");
+            msaa_view = msaa_texture.createView(.{ .label = "msaa view" });
 
             cam_aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
             cam_proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), cam_aspect, 0.01, 100);
@@ -696,9 +693,6 @@ pub fn run() !void {
             .ambient = dir_light.ambient,
         });
 
-        // Flush: everything is recorded and the camera is final, so order can
-        // be decided. Depth is distance along the view direction, read from the
-        // model matrix's translation column.
         for (draw_cmds.items) |*cmd| {
             const pos = l.Vec3(f32).init(cmd.instance.model[3][0], cmd.instance.model[3][1], cmd.instance.model[3][2]);
             cmd.depth = pos.sub(cam.pos).dot(cam.forward());
@@ -706,9 +700,6 @@ pub fn run() !void {
 
         std.mem.sort(DrawCmd, draw_cmds.items, {}, DrawCmd.lessThan);
 
-        // Flatten: one walk emits the contiguous instance array and the batch
-        // list together. A command extends the last batch only if every state
-        // key matches -- depth deliberately excluded, it orders but never splits.
         flat_instances.clearRetainingCapacity();
         batches.clearRetainingCapacity();
         for (draw_cmds.items) |cmd| {
