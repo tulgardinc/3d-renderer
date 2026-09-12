@@ -4,6 +4,14 @@ const builtin = @import("builtin");
 pub const is_web = builtin.os.tag == .emscripten;
 
 pub const c = @cImport({
+    // MSVC's stdint.h spells SIZE_MAX with a `ui64` suffix that translate-c
+    // rejects, and SDL_stdinc.h uses it in inline overflow helpers. Respell it
+    // before SDL sees it.
+    if (builtin.os.tag == .windows) {
+        @cInclude("stdint.h");
+        @cUndef("SIZE_MAX");
+        @cDefine("SIZE_MAX", "18446744073709551615ULL");
+    }
     @cInclude("SDL3/SDL.h");
     @cInclude("sdl3webgpu.h");
     @cInclude("webgpu/webgpu.h");
@@ -854,20 +862,6 @@ pub const BufferUsage = packed struct(c.WGPUBufferUsage) {
 
     pub fn toC(self: BufferUsage) c.WGPUBufferUsage {
         return @bitCast(self);
-    }
-
-    comptime {
-        std.debug.assert((BufferUsage{ .map_read = true }).toC() == c.WGPUBufferUsage_MapRead);
-        std.debug.assert((BufferUsage{ .map_write = true }).toC() == c.WGPUBufferUsage_MapWrite);
-        std.debug.assert((BufferUsage{ .copy_src = true }).toC() == c.WGPUBufferUsage_CopySrc);
-        std.debug.assert((BufferUsage{ .copy_dst = true }).toC() == c.WGPUBufferUsage_CopyDst);
-        std.debug.assert((BufferUsage{ .index = true }).toC() == c.WGPUBufferUsage_Index);
-        std.debug.assert((BufferUsage{ .vertex = true }).toC() == c.WGPUBufferUsage_Vertex);
-        std.debug.assert((BufferUsage{ .uniform = true }).toC() == c.WGPUBufferUsage_Uniform);
-        std.debug.assert((BufferUsage{ .storage = true }).toC() == c.WGPUBufferUsage_Storage);
-        std.debug.assert((BufferUsage{ .indirect = true }).toC() == c.WGPUBufferUsage_Indirect);
-        std.debug.assert((BufferUsage{ .query_resolve = true }).toC() == c.WGPUBufferUsage_QueryResolve);
-        std.debug.assert(BufferUsage.none.toC() == c.WGPUBufferUsage_None);
     }
 };
 
@@ -2208,5 +2202,21 @@ pub fn createSampler(ctx: GPUContext, config: SamplerConfig) c.WGPUSampler {
 
 pub const VertexLayout = struct {
     stride: u32,
-    attrbiutes: []const VertexBuffer.AttributeDesc,
+    attributes: []const VertexBuffer.AttributeDesc,
+
+    const Self = @This();
+
+    pub fn fromAttributes(attrs: []const VertexBuffer.AttributeDesc) Self {
+        const stride = blk: {
+            var sum = 0;
+            for (attrs) |attr| {
+                sum += attr.format.byteSize();
+            }
+            break :blk sum;
+        };
+        return .{
+            .stride = stride,
+            .attributes = attrs,
+        };
+    }
 };

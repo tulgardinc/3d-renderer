@@ -32,7 +32,25 @@ pub fn build(b: *std.Build) void {
     // codegen step to wasm and the build could never invoke it.
     const host = b.graph.host;
 
-    const tint_path = b.path("./lib/macos/tint_info").getPath(b);
+    // Windows is the fourth shape: same static-Dawn link as macOS, but
+    // against Google's prebuilt MSVC `webgpu_dawn.lib` + the SDL3 VC devel
+    // import lib, provisioned into lib/windows/ (see the check below).
+    // The Dawn archive is MSVC-built, so the target must be the msvc ABI.
+    // Zig's Windows default is `-gnu`, so rather than making everyone (and
+    // ZLS's build runner, which passes no -Dtarget) spell it out, coerce it.
+    const is_windows = target.result.os.tag == .windows;
+    if (is_windows and target.result.abi != .msvc) {
+        var query = target.query;
+        query.abi = .msvc;
+        target = b.resolveTargetQuery(query);
+    }
+
+    // tint_info is a build-time tool run by the shader tool, so it comes from
+    // the host's Dawn drop, not the target's.
+    const tint_path = b.path(if (host.result.os.tag == .windows)
+        "./lib/windows/tint_info.exe"
+    else
+        "./lib/macos/tint_info").getPath(b);
     const shaders_dir = b.path("./src/shaders/").getPath(b);
     var options = b.addOptions();
     options.addOption([]const u8, "tint_path", tint_path);
@@ -100,6 +118,37 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // DLLs Dawn's D3D12 backend dlopens from next to the executable at
+    // runtime (it deliberately never falls back to the system copies), plus
+    // SDL3 itself. Installed alongside renderer.exe below.
+    const windows_runtime_dlls = [_][]const u8{
+        "SDL3.dll",
+        "d3dcompiler_47.dll",
+        "dxcompiler.dll",
+        "dxil.dll",
+    };
+
+    if (is_windows) {
+        const link_inputs = [_][]const u8{ "webgpu_dawn.lib", "SDL3.lib", "tint_info.exe" };
+        for (link_inputs ++ windows_runtime_dlls) |name| {
+            const p = b.pathJoin(&.{ b.path("lib/windows").getPath(b), name });
+            std.Io.Dir.accessAbsolute(b.graph.io, p, .{}) catch {
+                std.debug.panic(
+                    \\Windows prebuilt not found at:
+                    \\  {s}
+                    \\Provision lib/windows/ from:
+                    \\  webgpu_dawn.lib, tint_info.exe -- lib/ and bin/ of google/dawn release
+                    \\    v20260828.215121's Dawn-<sha>-windows-latest-Release.tar.gz
+                    \\  SDL3.lib, SDL3.dll -- lib/x64/ of libsdl-org/SDL release 3.4.14's
+                    \\    SDL3-devel-3.4.14-VC.zip
+                    \\  dxcompiler.dll, dxil.dll -- bin/x64/ of microsoft/DirectXShaderCompiler
+                    \\    release v1.9.2607's dxc_2026_07_29.zip
+                    \\  d3dcompiler_47.dll -- Windows SDK, Windows Kits/10/Redist/D3D/x64/
+                , .{p});
+            };
+        }
+    }
+
     const tree_sitter = b.addLibrary(.{
         .name = "tree_sitter",
         .linkage = .static,
@@ -159,8 +208,9 @@ pub fn build(b: *std.Build) void {
         // Dawn is C++; the emdawnwebgpu port brings its own runtime. On iOS
         // Zig's bundled libcxx doesn't compile (mbstate_t detection), so the
         // SDK's libc++.tbd is linked below instead -- the right runtime for
-        // the platform anyway.
-        .link_libcpp = !is_web and !is_ios,
+        // the platform anyway. On Windows Dawn was built against MSVC's STL,
+        // so msvcprt is linked below rather than Zig's libc++.
+        .link_libcpp = !is_web and !is_ios and !is_windows,
         // std.debug's Mach-O self-inspection calls a dyld API the iOS SDK
         // doesn't export (__dyld_get_image_header_containing_address), which
         // fails the link. Stripping debug info drops that code path -- at the
@@ -209,7 +259,7 @@ pub fn build(b: *std.Build) void {
         // Native: SDL3 + Dawn + sdl3webgpu.h. Web: only sdl3webgpu.h is taken
         // from here, the rest is shadowed by the port paths above.
         mod.addIncludePath(b.path("include/"));
-        if (!is_web and !is_ios) mod.addFrameworkPath(b.path("lib/sdl3/"));
+        if (!is_web and !is_ios and !is_windows) mod.addFrameworkPath(b.path("lib/sdl3/"));
     }
 
     if (is_web) {
@@ -231,6 +281,29 @@ pub fn build(b: *std.Build) void {
         // + CAMetalLayer), unlike the plain-C emscripten branch.
         app_mod.addCSourceFile(.{ .file = b.path("c/sdl3webgpu.m") });
         app_mod.addCSourceFile(.{ .file = b.path("c/wgpu_init_shim.c") });
+    } else if (is_windows) {
+        app_mod.addObjectFile(b.path("lib/windows/webgpu_dawn.lib"));
+        // By path, not -lSDL3: with SDL3.dll in the same directory the
+        // library search picks the DLL over the import lib and lld rejects it.
+        app_mod.addObjectFile(b.path("lib/windows/SDL3.lib"));
+
+        // Same -x c trick as the web build: the Win32 branch of sdl3webgpu.m
+        // is plain C and there is no Objective-C on Windows.
+        app_mod.addCSourceFile(.{
+            .file = b.path("c/sdl3webgpu.m"),
+            .flags = &.{ "-x", "c" },
+        });
+        app_mod.addCSourceFile(.{ .file = b.path("c/wgpu_init_shim.c") });
+        app_mod.addCSourceFile(.{ .file = b.path("c/msvc_stl_shim.c") });
+
+        // MSVC C++ runtime (dynamic, matching Dawn's /MD Release build) plus
+        // what Dawn's cmake config lists as its link interface. The C runtime
+        // must be dynamic too (exe.linkage below) or the ucrt import symbols
+        // Dawn references stay unresolved.
+        app_mod.linkSystemLibrary("msvcprt", .{});
+        app_mod.linkSystemLibrary("user32", .{});
+        app_mod.linkSystemLibrary("onecore_apiset", .{});
+        app_mod.linkSystemLibrary("dxguid", .{});
     } else {
         app_mod.addObjectFile(b.path("lib/macos/libwebgpu_dawn.a"));
         app_mod.linkFramework("SDL3", .{});
@@ -264,6 +337,8 @@ pub fn build(b: *std.Build) void {
         const exe = b.addExecutable(.{
             .name = "renderer",
             .root_module = app_mod,
+            // Dynamic CRT on Windows (see the Windows link block above).
+            .linkage = if (is_windows) .dynamic else null,
         });
         b.installArtifact(exe);
         break :blk &exe.step;
@@ -328,11 +403,21 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    const install_fw = b.addInstallDirectory(.{
-        .source_dir = b.path("lib/sdl3/SDL3.framework/"),
-        .install_dir = .bin,
-        .install_subdir = "SDL3.framework",
-    });
+    // Runtime dependencies next to the executable: the SDL3 framework bundle
+    // on macOS, SDL3 + the D3D shader compiler DLLs on Windows.
+    const install_fw = b.step("runtime-libs", "Copy runtime libraries next to the executable");
+    if (is_windows) {
+        for (windows_runtime_dlls) |name| {
+            const src = b.path(b.fmt("lib/windows/{s}", .{name}));
+            install_fw.dependOn(&b.addInstallBinFile(src, name).step);
+        }
+    } else {
+        install_fw.dependOn(&b.addInstallDirectory(.{
+            .source_dir = b.path("lib/sdl3/SDL3.framework/"),
+            .install_dir = .bin,
+            .install_subdir = "SDL3.framework",
+        }).step);
+    }
 
     const run_step = b.step("run", "Run the app");
 
@@ -551,8 +636,8 @@ pub fn build(b: *std.Build) void {
         const run_cmd = b.addRunArtifact(exe);
         run_step.dependOn(&run_cmd.step);
 
-        b.getInstallStep().dependOn(&install_fw.step);
-        run_cmd.step.dependOn(&install_fw.step);
+        b.getInstallStep().dependOn(install_fw);
+        run_cmd.step.dependOn(install_fw);
         run_cmd.step.dependOn(b.getInstallStep());
 
         if (b.args) |args| {

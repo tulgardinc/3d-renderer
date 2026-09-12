@@ -1,5 +1,5 @@
 const std = @import("std");
-const gpu = @import("gpu.zig");
+const gpu = @import("gpu");
 const c = gpu.c;
 
 gpu_context: gpu.GPUContext,
@@ -16,7 +16,7 @@ meshes: std.ArrayList(MeshRecord),
 world_uniforms: c.WGPUBuffer,
 material_unfiorms: std.ArrayList(c.WGPUBuffer),
 
-index_buffer: c.WGPUBuffer,
+index_buffer: GPUArena,
 
 const Self = @This();
 
@@ -26,10 +26,73 @@ pub const MeshID = enum(u32) {};
 pub const ShaderID = enum(u32) {};
 pub const VertexBufferID = enum(u32) {};
 
+const GPUArena = struct {
+    ptr: c.WGPUBuffer,
+    len: u32,
+    cap: u32,
+    usage: gpu.BufferUsage,
+
+    // forces copy dst and copy src on
+    pub const ArenaUsage = packed struct(c.WGPUBufferUsage) {
+        map_read: bool = false,
+        map_write: bool = false,
+        _forced0: u1 = 1,
+        _forced1: u1 = 1,
+        index: bool = false,
+        vertex: bool = false,
+        uniform: bool = false,
+        storage: bool = false,
+        indirect: bool = false,
+        query_resolve: bool = false,
+        _padding: u54 = 0,
+    };
+
+    pub fn init(ctx: gpu.GPUContext, capacity: u32, usage: ArenaUsage) !@This() {
+        const buffer = try gpu.createBuffer(ctx, capacity, @bitCast(usage), .{ .label = "arena" });
+        return .{
+            .ptr = buffer,
+            .cap = capacity,
+            .len = 0,
+            .usage = usage,
+        };
+    }
+
+    pub fn append(self: *@This(), ctx: gpu.GPUContext, data: []const u8) !void {
+        if (self.len + data.len > self.cap) {
+            const encoder = ctx.getEncoder();
+            const new_size = @max(self.cap * 2, self.cap + data.len);
+            const new_buffer = try gpu.createBuffer(ctx, new_size, self.usage, .{ .label = "arena" });
+            c.wgpuCommandEncoderCopyBufferToBuffer(
+                encoder,
+                self.ptr,
+                0,
+                new_buffer,
+                0,
+                new_buffer.len,
+            );
+            const cmds = gpu.finishEncoder(encoder);
+            c.wgpuQueueSubmit(self.gpu_context.queue, 1, cmds);
+            c.wgpuCommandEncoderRelease(encoder);
+            c.wgpuCommandBufferRelease(cmds);
+            c.wgpuBufferRelease(self.buffer);
+            self.buffer = new_buffer;
+            self.cap = new_size;
+        }
+        gpu.writeBuffer(ctx, self.buffer, self.len, data);
+        self.len += data.len;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        c.wgpuBufferRelease(self.ptr);
+        self.* = undefined;
+    }
+};
+
 pub const MaterialRecord = struct {
     shaderID: ShaderID,
     // bind group 1
     bind_group: c.WGPUBindGroup,
+    base_vertex: u32,
 
     uniforms: []const gpu.BindGroupEntry.BufferEntry,
 
@@ -49,17 +112,20 @@ pub const ShaderRecord = struct {
 };
 
 pub const VertexBufferRecord = struct {
-    layout: gpu.VertexLayout,
+    arena: GPUArena,
 
-    buffer: c.WGPUBuffer,
-    cap: u32,
-    len: u32,
+    stride: u32,
+    attributes: []const gpu.VertexBuffer.AttributeDesc,
 };
 
 pub const MeshRecord = struct {
-    buffers: []const VertexBufferID,
+    buffer: VertexBufferID,
     base_vertex: u32,
     vertex_count: u32,
+    indices: ?struct {
+        base_index: u32,
+        index_count: u32,
+    },
 };
 
 pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type) !ShaderID {
@@ -83,25 +149,39 @@ pub fn attributeSort(_: anytype, a: gpu.VertexBuffer.AttributeDesc, b: gpu.Verte
     return std.mem.order(u8, a.name, b.name).compare(.lt);
 }
 
+pub fn attributesEql(a: []gpu.VertexBuffer.AttributeDesc, b: []gpu.VertexBuffer.AttributeDesc) bool {
+    if (a.len != b.len) return false;
+    for (0..a.len) |i| {
+        if (a[i].format != b[i].format) return false;
+        if (!std.mem.eql(u8, a[i].name, b[i].name)) return false;
+    }
+    return true;
+}
+
 pub fn getOrCreateVertexBuffer(self: *Self, allocator: std.mem.Allocator, desc: gpu.VertexLayout) !VertexBufferID {
-    var canon_layout = desc;
-    std.mem.sort(gpu.VertexBuffer.AttributeDesc, &canon_layout, {}, attributeSort);
+    const MAX_ATTR_COUNT = 20;
+    var attrs: [MAX_ATTR_COUNT]gpu.VertexBuffer.AttributeDesc = undefined;
+    std.mem.copyForwards(gpu.VertexBuffer.AttributeDesc, attrs[0..], desc.attributes);
+    std.mem.sort(gpu.VertexBuffer.AttributeDesc, attrs[0..desc.attributes.len], {}, attributeSort);
     for (self.vertex_buffers.items, 0..) |vb, i| {
-        if (std.mem.eql(u8, std.mem.asBytes(vb.layout), std.mem.asBytes(canon_layout))) {
-            return VertexBufferID(i);
+        if (attributesEql(vb.layout.attributes, attrs[0..desc.attributes.len])) {
+            return @intFromEnum(i);
         }
     }
-    const buffer = try gpu.createBuffer(self.gpu_context, 4096, .{
-        .copy_dst = true,
-        .vertex = true,
-    });
+    const owned_attrs = try allocator.dupe(gpu.VertexBuffer.AttributeDesc, attrs[0..desc.attributes.len]);
+    var offset = 0;
+    for (owned_attrs) |attr| {
+        attr.offset = offset;
+        offset += attr.format.byteSize();
+    }
+    const stride = offset;
+    const arena: GPUArena = try .init(self.gpu_context, 4096, .{ .storage = true });
     try self.vertex_buffers.append(allocator, .{
-        .layout = desc,
-        .buffer = buffer,
-        .len = 0,
-        .cap = 4096,
+        .arena = arena,
+        .attributes = owned_attrs,
+        .stride = stride,
     });
-    return VertexBufferID(self.vertex_buffers.items.len - 1);
+    return @intFromEnum(self.vertex_buffers.items.len - 1);
 }
 
 pub fn DrawParams(Instance: type) type {
@@ -216,44 +296,79 @@ pub fn MaterialParams(Reflected: type) type {
     );
 }
 
-pub fn appendToVertexBuffer(self: *Self, index: VertexBufferID, vertex_data: []const u8) void {
-    var vertex_buffer = &self.vertex_buffers.items[index];
-    if (vertex_data.len + vertex_buffer.len > vertex_buffer.cap) {
-        const new_buffer = try gpu.createBuffer(
-            self.gpu_context,
-            vertex_buffer.cap * 2,
-            .{ .copy_dst = true, .vertex = true },
-            .{},
-        );
-        const encoder = self.gpu_context.getEncoder();
-        c.wgpuCommandEncoderCopyBufferToBuffer(
-            encoder,
-            vertex_buffer.buffer,
-            0,
-            new_buffer,
-            0,
-            vertex_buffer.len,
-        );
-        const cmds = gpu.finishEncoder(encoder);
-        c.wgpuQueueSubmit(self.gpu_context.queue, 1, cmds);
-        c.wgpuCommandEncoderRelease(encoder);
-        c.wgpuCommandBufferRelease(cmds);
-        c.wgpuBufferRelease(vertex_buffer.buffer);
-        vertex_buffer.buffer = new_buffer;
-    }
-    gpu.writeBuffer(self.gpu_context, vertex_buffer.buffer, vertex_buffer.len, vertex_data);
-}
-
-pub fn mesh(self: *Self, allocator: std.mem.Allocator, mesh: struct {
-    layouts: []const gpu.VertexLayout,
+pub const MeshData = struct {
+    streams: []const Stream,
     indices: ?[]const u32 = null,
     vertex_count: u32,
-}) !MeshID {
-    var buffers = try allocator.alloc(VertexBufferID, mesh.layouts.len);
-    for (mesh.layouts, 0..) |l, i| {
-        const vb_id = try self.getOrCreateVertexBuffer(allocator, l);
-        // self.appendToVertexBuffer(vb_id, )
+
+    pub const Stream = struct {
+        layout: gpu.VertexLayout,
+        data: []const u8,
+    };
+};
+
+pub fn mesh(self: *Self, allocator: std.mem.Allocator, mesh_data: MeshData) !MeshID {
+    const MAX_ATTR_COUNT = 20;
+    const vb_id = blk: {
+        if (mesh_data.streams.len == 1) {
+            break :blk try getOrCreateVertexBuffer(self, allocator, mesh_data.streams[0].layout);
+        } else {
+            var attrs: [MAX_ATTR_COUNT]gpu.VertexBuffer.AttributeDesc = undefined;
+            var attr_count = 0;
+            var total_stride = 0;
+            for (mesh_data.streams) |s| {
+                std.mem.copyForwards(gpu.VertexBuffer, attrs[attr_count..], s.layout.attrbiutes[0..]);
+                attr_count += s.layout.attrbiutes.len;
+                total_stride += s.layout.stride;
+            }
+            break :blk try getOrCreateVertexBuffer(self, allocator, .{
+                .stride = total_stride,
+                .attributes = attrs[0..attr_count],
+            });
+        }
+    };
+    const indices = blk: {
+        if (mesh_data.indices) |idx| {
+            const base = self.index_buffer.len / @sizeOf(u32);
+            try self.index_buffer.append(self.gpu_context, std.mem.sliceAsBytes(idx));
+            break :blk .{
+                .base_index = base,
+                .index_count = idx.len,
+            };
+        }
+        break :blk null;
+    };
+    var vertex_buffer = &self.vertex_buffers.items[vb_id];
+    const stride = vertex_buffer.stride;
+    const canon_attr = vertex_buffer.attributes;
+    var vertex_data = try allocator.alloc(u8, stride * mesh_data.vertex_count);
+    defer allocator.free(vertex_data);
+    // TODO: optimize via partial eval
+    for (0..mesh_data.vertex_count) |vi| {
+        for (canon_attr) |ca| {
+            for (mesh_data.streams) |s| {
+                for (s.layout.attributes) |a| {
+                    if (std.mem.eql(u8, ca.name, a.name)) {
+                        std.mem.copyForwards(
+                            u8,
+                            vertex_data[(vi * stride + ca.offset)..],
+                            s.data[(vi * s.layout.stride + a.offset)..(vi * s.layout.stride + a.offset + a.format.byteSize())],
+                        );
+                    }
+                }
+            }
+        }
     }
+    const base_vertex = vertex_buffer.arena.len / stride;
+    try vertex_buffer.arena.append(self.gpu_context, vertex_data);
+    const mesh_id = self.meshes.items.len;
+    try self.meshes.append(allocator, .{
+        .buffer = vb_id,
+        .base_vertex = base_vertex,
+        .vertex_count = mesh_data.vertex_count,
+        .indices = indices,
+    });
+    return @intFromEnum(mesh_id);
 }
 
 pub fn material(

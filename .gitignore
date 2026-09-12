@@ -1,8 +1,7 @@
-lib/
+/lib/
 .zig-cache/
 zig-out/
 tmp/
 src/shaders/compiled-copy/
-
 
 3D Renderer Docs/

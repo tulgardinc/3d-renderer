@@ -7,6 +7,8 @@ const l = @import("lena.zig");
 const Mesh = @import("Mesh");
 const Shadow = @import("Shadow");
 
+const r = @import("renderer.zig");
+
 const Vertex = extern struct {
     position: [3]f32,
     uv: [2]f32,
