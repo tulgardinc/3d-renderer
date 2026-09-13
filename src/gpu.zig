@@ -374,13 +374,27 @@ pub fn createBuffer(
     return buffer;
 }
 
+/// Writes one value (passed by value) at `offset`.
 pub fn writeBuffer(
     ctx: GPUContext,
     buffer: c.WGPUBuffer,
     offset: u32,
     data: anytype,
 ) void {
-    c.wgpuQueueWriteBuffer(ctx.queue, buffer, offset, std.mem.asBytes(data), @sizeOf(@TypeOf(data)));
+    const bytes = std.mem.asBytes(&data);
+    c.wgpuQueueWriteBuffer(ctx.queue, buffer, offset, bytes.ptr, bytes.len);
+}
+
+/// Writes a byte range at `offset`. WebGPU requires both the offset and the
+/// size to be multiples of 4.
+pub fn writeBufferBytes(
+    ctx: GPUContext,
+    buffer: c.WGPUBuffer,
+    offset: u64,
+    bytes: []const u8,
+) void {
+    std.debug.assert(offset % 4 == 0 and bytes.len % 4 == 0);
+    c.wgpuQueueWriteBuffer(ctx.queue, buffer, offset, bytes.ptr, bytes.len);
 }
 
 pub const PresentMode = enum(c.WGPUPresentMode) {
@@ -735,6 +749,10 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
 
     pub const ComponentType = enum { u8, i8, u16, i16, f16, f32, u32, i32 };
     pub const CompositionType = enum { scalar, vec2, vec3, vec4 };
+    /// The WGSL scalar class a vertex input reading this format must declare.
+    /// WebGPU validates only this; the component count may differ (missing
+    /// components read (0, 0, 0, 1), extra ones are dropped).
+    pub const BaseType = enum { float, uint, sint };
 
     pub fn byteSize(self: @This()) u64 {
         return switch (self) {
@@ -747,7 +765,202 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
             .f32x4, .u32x4, .i32x4 => 16,
         };
     }
+
+    pub fn componentType(self: @This()) ComponentType {
+        return switch (self) {
+            .undefined => unreachable,
+            .u8, .u8x2, .u8x4, .unorm8, .unorm8x2, .unorm8x4, .unorm8x4bgra => .u8,
+            .i8, .i8x2, .i8x4, .snorm8, .snorm8x2, .snorm8x4 => .i8,
+            .u16, .u16x2, .u16x4, .unorm16, .unorm16x2, .unorm16x4 => .u16,
+            .i16, .i16x2, .i16x4, .snorm16, .snorm16x2, .snorm16x4 => .i16,
+            .f16, .f16x2, .f16x4 => .f16,
+            .f32, .f32x2, .f32x3, .f32x4 => .f32,
+            .u32, .u32x2, .u32x3, .u32x4, .unorm10_10_10_2 => .u32,
+            .i32, .i32x2, .i32x3, .i32x4 => .i32,
+        };
+    }
+
+    pub fn componentCount(self: @This()) u8 {
+        return switch (self) {
+            .undefined => 0,
+            .u8, .i8, .unorm8, .snorm8, .u16, .i16, .unorm16, .snorm16, .f16, .f32, .u32, .i32 => 1,
+            .u8x2, .i8x2, .unorm8x2, .snorm8x2, .u16x2, .i16x2, .unorm16x2, .snorm16x2, .f16x2, .f32x2, .u32x2, .i32x2 => 2,
+            .f32x3, .u32x3, .i32x3 => 3,
+            .u8x4, .i8x4, .unorm8x4, .snorm8x4, .u16x4, .i16x4, .unorm16x4, .snorm16x4, .f16x4, .f32x4, .u32x4, .i32x4, .unorm10_10_10_2, .unorm8x4bgra => 4,
+        };
+    }
+
+    pub fn isNormalized(self: @This()) bool {
+        return switch (self) {
+            .unorm8, .unorm8x2, .unorm8x4, .snorm8, .snorm8x2, .snorm8x4, .unorm16, .unorm16x2, .unorm16x4, .snorm16, .snorm16x2, .snorm16x4, .unorm10_10_10_2, .unorm8x4bgra => true,
+            else => false,
+        };
+    }
+
+    pub fn baseType(self: @This()) BaseType {
+        if (self.isNormalized()) return .float;
+        return switch (self.componentType()) {
+            .f16, .f32 => .float,
+            .u8, .u16, .u32 => .uint,
+            .i8, .i16, .i32 => .sint,
+        };
+    }
+
+    /// Decodes one attribute's bytes into four floats the way the input
+    /// assembler presents them to a `vec4` input: missing components read
+    /// (0, 0, 0, 1). Integer formats convert numerically (exact up to 2^24).
+    pub fn decode(self: @This(), bytes: []const u8) [4]f32 {
+        std.debug.assert(bytes.len >= self.byteSize());
+        var out: [4]f32 = .{ 0, 0, 0, 1 };
+        switch (self) {
+            .unorm10_10_10_2 => {
+                const bits = std.mem.readInt(u32, bytes[0..4], .little);
+                out[0] = @as(f32, @floatFromInt(bits & 0x3ff)) / 1023.0;
+                out[1] = @as(f32, @floatFromInt((bits >> 10) & 0x3ff)) / 1023.0;
+                out[2] = @as(f32, @floatFromInt((bits >> 20) & 0x3ff)) / 1023.0;
+                out[3] = @as(f32, @floatFromInt(bits >> 30)) / 3.0;
+            },
+            .unorm8x4bgra => {
+                out[0] = @as(f32, @floatFromInt(bytes[2])) / 255.0;
+                out[1] = @as(f32, @floatFromInt(bytes[1])) / 255.0;
+                out[2] = @as(f32, @floatFromInt(bytes[0])) / 255.0;
+                out[3] = @as(f32, @floatFromInt(bytes[3])) / 255.0;
+            },
+            else => {
+                const normalized = self.isNormalized();
+                for (0..self.componentCount()) |i| {
+                    out[i] = switch (self.componentType()) {
+                        .u8 => decodeInt(u8, bytes[i..][0..1], normalized),
+                        .i8 => decodeInt(i8, bytes[i..][0..1], normalized),
+                        .u16 => decodeInt(u16, bytes[i * 2 ..][0..2], normalized),
+                        .i16 => decodeInt(i16, bytes[i * 2 ..][0..2], normalized),
+                        .u32 => decodeInt(u32, bytes[i * 4 ..][0..4], false),
+                        .i32 => decodeInt(i32, bytes[i * 4 ..][0..4], false),
+                        .f16 => @as(f32, @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little))))),
+                        .f32 => @as(f32, @bitCast(std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little))),
+                    };
+                }
+            },
+        }
+        return out;
+    }
+
+    /// The inverse of `decode`: extra components are dropped, normalized
+    /// formats clamp to their range, integer formats round.
+    pub fn encode(self: @This(), value: [4]f32, out: []u8) void {
+        std.debug.assert(out.len >= self.byteSize());
+        switch (self) {
+            .unorm10_10_10_2 => {
+                const bits: u32 = unormBits(value[0], 10) |
+                    (unormBits(value[1], 10) << 10) |
+                    (unormBits(value[2], 10) << 20) |
+                    (unormBits(value[3], 2) << 30);
+                std.mem.writeInt(u32, out[0..4], bits, .little);
+            },
+            .unorm8x4bgra => {
+                out[0] = @intCast(unormBits(value[2], 8));
+                out[1] = @intCast(unormBits(value[1], 8));
+                out[2] = @intCast(unormBits(value[0], 8));
+                out[3] = @intCast(unormBits(value[3], 8));
+            },
+            else => {
+                const normalized = self.isNormalized();
+                for (0..self.componentCount()) |i| {
+                    switch (self.componentType()) {
+                        .u8 => encodeInt(u8, value[i], out[i..][0..1], normalized),
+                        .i8 => encodeInt(i8, value[i], out[i..][0..1], normalized),
+                        .u16 => encodeInt(u16, value[i], out[i * 2 ..][0..2], normalized),
+                        .i16 => encodeInt(i16, value[i], out[i * 2 ..][0..2], normalized),
+                        .u32 => encodeInt(u32, value[i], out[i * 4 ..][0..4], false),
+                        .i32 => encodeInt(i32, value[i], out[i * 4 ..][0..4], false),
+                        .f16 => std.mem.writeInt(u16, out[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(value[i]))), .little),
+                        .f32 => std.mem.writeInt(u32, out[i * 4 ..][0..4], @bitCast(value[i]), .little),
+                    }
+                }
+            },
+        }
+    }
+
+    fn decodeInt(comptime T: type, bytes: *const [@sizeOf(T)]u8, normalized: bool) f32 {
+        const v: f32 = @floatFromInt(std.mem.readInt(T, bytes, .little));
+        if (!normalized) return v;
+        const max: f32 = @floatFromInt(std.math.maxInt(T));
+        // snorm: the most negative value maps to -1, not -1.0078 (WebGPU rule)
+        return @max(v / max, -1.0);
+    }
+
+    fn encodeInt(comptime T: type, v: f32, out: *[@sizeOf(T)]u8, normalized: bool) void {
+        // f64 so maxInt(u32) is exactly representable
+        const min: f64 = @floatFromInt(std.math.minInt(T));
+        const max: f64 = @floatFromInt(std.math.maxInt(T));
+        const scaled: f64 = if (normalized) std.math.clamp(@as(f64, v), -1.0, 1.0) * max else v;
+        const clamped = std.math.clamp(@round(scaled), min, max);
+        std.mem.writeInt(T, out, @intFromFloat(clamped), .little);
+    }
+
+    fn unormBits(v: f32, comptime bits: u5) u32 {
+        const max: f32 = @floatFromInt((@as(u32, 1) << bits) - 1);
+        return @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * max));
+    }
 };
+
+test "VertexFormat encode/decode round trips" {
+    var buf: [16]u8 = undefined;
+    const v: [4]f32 = .{ 0.25, -0.5, 1.0, 0.75 };
+
+    // f32x3 drops w and reads it back as 1
+    VertexFormat.f32x3.encode(v, &buf);
+    try std.testing.expectEqual([4]f32{ 0.25, -0.5, 1.0, 1.0 }, VertexFormat.f32x3.decode(&buf));
+
+    // snorm16x4 within one step
+    VertexFormat.snorm16x4.encode(v, &buf);
+    for (v, VertexFormat.snorm16x4.decode(&buf)) |a, b| {
+        try std.testing.expectApproxEqAbs(a, b, 1.0 / 32767.0);
+    }
+    // the default normal (0, 0, 1) packs to 0000 0000 ff7f 0000
+    VertexFormat.snorm16x4.encode(.{ 0, 0, 1, 0 }, &buf);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0xff, 0x7f, 0, 0 }, buf[0..8]);
+
+    // unorm8x4 clamps negatives to 0 and rounds
+    VertexFormat.unorm8x4.encode(v, &buf);
+    try std.testing.expectEqualSlices(u8, &.{ 64, 0, 255, 191 }, buf[0..4]);
+
+    // snorm8 most-negative decodes to exactly -1
+    buf[0] = 0x80;
+    try std.testing.expectEqual(@as(f32, -1.0), VertexFormat.snorm8.decode(&buf)[0]);
+
+    // f16x2
+    VertexFormat.f16x2.encode(v, &buf);
+    const h = VertexFormat.f16x2.decode(&buf);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), h[0], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), h[1], 1e-3);
+    try std.testing.expectEqual(@as(f32, 0), h[2]);
+    try std.testing.expectEqual(@as(f32, 1), h[3]);
+
+    // unorm10_10_10_2
+    VertexFormat.unorm10_10_10_2.encode(.{ 1, 0, 0.5, 1 }, &buf);
+    const p = VertexFormat.unorm10_10_10_2.decode(&buf);
+    try std.testing.expectEqual(@as(f32, 1), p[0]);
+    try std.testing.expectEqual(@as(f32, 0), p[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), p[2], 1.0 / 1023.0);
+    try std.testing.expectEqual(@as(f32, 1), p[3]);
+
+    // bgra byte order
+    VertexFormat.unorm8x4bgra.encode(.{ 1, 0, 0, 1 }, &buf);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, buf[0..4]);
+    try std.testing.expectEqual([4]f32{ 1, 0, 0, 1 }, VertexFormat.unorm8x4bgra.decode(&buf));
+
+    // integers are exact
+    VertexFormat.u32x2.encode(.{ 123456, 7, 0, 0 }, &buf);
+    try std.testing.expectEqual([4]f32{ 123456, 7, 0, 1 }, VertexFormat.u32x2.decode(&buf));
+    VertexFormat.i16x2.encode(.{ -300, 300, 0, 0 }, &buf);
+    try std.testing.expectEqual([4]f32{ -300, 300, 0, 1 }, VertexFormat.i16x2.decode(&buf));
+
+    // base types
+    try std.testing.expectEqual(VertexFormat.BaseType.float, VertexFormat.snorm16x4.baseType());
+    try std.testing.expectEqual(VertexFormat.BaseType.uint, VertexFormat.u8x4.baseType());
+    try std.testing.expectEqual(VertexFormat.BaseType.sint, VertexFormat.i32.baseType());
+}
 
 pub const PrimitiveTopology = enum(c.WGPUPrimitiveTopology) {
     undefined = c.WGPUPrimitiveTopology_Undefined,
@@ -1834,7 +2047,7 @@ pub const Mesh = struct {
     };
 };
 
-fn indexOfVertexInput(vertex_meta: []const VertexInputMeta, name: []const u8) ?usize {
+pub fn indexOfVertexInput(vertex_meta: []const VertexInputMeta, name: []const u8) ?usize {
     for (vertex_meta, 0..) |meta, i| {
         if (std.mem.eql(u8, meta.name, name)) return i;
     }
@@ -2291,9 +2504,9 @@ pub const VertexLayout = struct {
 
     pub fn fromAttributes(attrs: []const VertexBuffer.AttributeDesc) Self {
         const stride = blk: {
-            var sum = 0;
+            var sum: u32 = 0;
             for (attrs) |attr| {
-                sum += attr.format.byteSize();
+                sum += @intCast(attr.format.byteSize());
             }
             break :blk sum;
         };

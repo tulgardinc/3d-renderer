@@ -228,17 +228,19 @@ pub fn run() !void {
 
     const vertex_buffer = try gpu.createBuffer(
         gpu_context,
-        std.mem.sliceAsBytes(&vertices),
-        "cube vertices",
+        @sizeOf(Vertex) * vertices.len,
         .{ .vertex = true, .copy_dst = true },
+        .{ .label = "cube vertices" },
     );
+    gpu.writeBufferBytes(gpu_context, vertex_buffer, 0, std.mem.sliceAsBytes(&vertices));
 
     const index_buffer = try gpu.createBuffer(
         gpu_context,
-        std.mem.sliceAsBytes(&indices),
-        "cube indices",
+        @sizeOf(u16) * indices.len,
         .{ .index = true, .copy_dst = true },
+        .{ .label = "cube indices" },
     );
+    gpu.writeBufferBytes(gpu_context, index_buffer, 0, std.mem.sliceAsBytes(&indices));
 
     const cube_mesh: gpu.Mesh = .{
         .vertex_count = vertices.len,
@@ -787,4 +789,11 @@ pub fn run() !void {
 
         gpu.waitForNextFrame();
     }
+}
+
+// `zig build test` builds this module; referencing the imports here is what
+// makes their tests run and forces analysis of the renderer's declarations.
+test {
+    _ = r;
+    _ = gpu;
 }

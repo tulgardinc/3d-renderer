@@ -647,9 +647,23 @@ pub fn build(b: *std.Build) void {
         const exe_tests = b.addTest(.{
             .root_module = app_mod,
         });
+        // Same dynamic CRT as the exe, or Dawn's ucrt imports stay unresolved.
+        exe_tests.linkage = if (is_windows) .dynamic else null;
         const run_exe_tests = b.addRunArtifact(exe_tests);
+        // The test binary runs from the cache dir, where SDL3.dll isn't.
+        if (is_windows) run_exe_tests.addPathDir(b.pathFromRoot("lib/windows"));
         const test_step = b.step("test", "Run tests");
         test_step.dependOn(&run_exe_tests.step);
+
+        // Tests are only collected from a compile's root module, so gpu.zig's
+        // need their own artifact. Its tests are GPU-free, so nothing from
+        // Dawn or SDL gets linked in.
+        const gpu_tests = b.addTest(.{
+            .root_module = gpu_mod,
+        });
+        gpu_tests.linkage = if (is_windows) .dynamic else null;
+        const run_gpu_tests = b.addRunArtifact(gpu_tests);
+        test_step.dependOn(&run_gpu_tests.step);
     }
 }
 
