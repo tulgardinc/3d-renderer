@@ -1824,6 +1824,60 @@ fn indexOfVertexInput(vertex_meta: []const VertexInputMeta, name: []const u8) ?u
     return null;
 }
 
+pub const MaterialRenderState = struct {
+    depth_stencil_state: DepthStencilState,
+    blend_state: ?BlendState,
+    cull_mode: CullMode,
+
+    pub fn @"opaque"() MaterialRenderState {
+        return .{
+            .depth_stencil_state = .{},
+            .blend_state = .{},
+            .cull_mode = .back,
+        };
+    }
+    pub fn transparent() MaterialRenderState {
+        return .{
+            .depth_stencil_state = .{
+                .depth_write_enabled = false,
+            },
+            .blend_state = .{
+                .color = .{
+                    .operation = .add,
+                    .src_factor = .src_alpha,
+                    .dst_factor = .one_minus_src_alpha,
+                },
+                .alpha = .{
+                    .operation = .add,
+                    .src_factor = .one,
+                    .dst_factor = .one_minus_src_alpha,
+                },
+            },
+            .cull_mode = .back,
+        };
+    }
+    pub fn additive() MaterialRenderState {
+        return .{
+            .depth_stencil_state = .{
+                .depth_write_enabled = false,
+            },
+            .blend_state = .{
+                .color = .{
+                    .operation = .add,
+                    .src_factor = .src_alpha,
+                    .dst_factor = .one,
+                },
+                .alpha = .{
+                    .operation = .add,
+                    .src_factor = .zero,
+                    .dst_factor = .one,
+                },
+            },
+            .cull_mode = .none,
+        };
+    }
+};
+
 pub const PipelineConfig = struct {
     color_format: ?TextureFormat = null,
     label: ?[]const u8 = null,

@@ -371,16 +371,12 @@ pub fn mesh(self: *Self, allocator: std.mem.Allocator, mesh_data: MeshData) !Mes
     return @intFromEnum(mesh_id);
 }
 
-pub fn material(
-    self: *Self,
-    allocator: std.mem.Allocator,
-    Reflected: type,
-    params: MaterialParams(Reflected),
-) !Material(Reflected) {
+pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), mat_render_state: gpu.RenderPassConfig) !Material(Reflected) {
     const Shader = gpu.Shader(Reflected);
     const shader_id = try self.getOrCreateShader(allocator, Shader);
     const resources: Shader.Resources(1) = undefined;
     const uniform_count = if (Reflected.Uniforms[1]) |bg| bg.len else 0;
+    // TODO: no need for one buffer per binding
     var uniforms = try allocator.alloc(c.WGPUBuffer, uniform_count);
     if (Reflected.Uniforms[1]) |elements| {
         inline for (elements, 0..) |el, i| {
@@ -424,7 +420,8 @@ pub fn material(
     try self.materials.append(allocator, material_record);
     const material_id = self.materials.items.len - 1;
     return .{
-        .material_id = material_id,
+        .material_id = @intFromEnum(material_id),
+        .shader_id = @intFromEnum(shader_id),
     };
 }
 
@@ -445,6 +442,7 @@ pub fn Material(S: type) type {
 
     return struct {
         material_id: MaterialID,
+        shader_id: ShaderID,
 
         pub const InstanceType: type = IT;
         pub const Shader = S;
@@ -501,10 +499,18 @@ const RenderPass = struct {
     pub fn draw(
         self: *@This(),
         allocator: std.mem.Allocator,
-        mesh: MeshID,
-        material: anytype,
+        mesh_id: MeshID,
+        mat: anytype,
         params: DrawParams(@TypeOf(material).InstanceType),
     ) !void {
-        try self.draw_commands.append(allocator, .{});
+        try self.draw_commands.append(allocator, .{
+            .material = mat.materialID,
+            .mesh = mesh_id,
+            .transparent = false,
+            .pipeline = 0,
+            .depth = 0,
+            .instance_offset = 0,
+            .instance_size = 0,
+        });
     }
 };
