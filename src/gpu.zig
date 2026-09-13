@@ -1832,7 +1832,7 @@ pub const MaterialRenderState = struct {
     pub fn @"opaque"() MaterialRenderState {
         return .{
             .depth_stencil_state = .{},
-            .blend_state = .{},
+            .blend_state = null,
             .cull_mode = .back,
         };
     }
@@ -1873,8 +1873,18 @@ pub const MaterialRenderState = struct {
                     .dst_factor = .one,
                 },
             },
-            .cull_mode = .none,
+            .cull_mode = .back,
         };
+    }
+
+    pub fn doubleSided(self: MaterialRenderState) MaterialRenderState {
+        var s = self;
+        s.cull_mode = .none;
+        return s;
+    }
+
+    pub fn isTransparent(self: MaterialRenderState) bool {
+        return self.blend_state != null;
     }
 };
 
@@ -2131,6 +2141,7 @@ pub const Texture = struct {
     width: u32,
     height: u32,
     format: TextureFormat,
+    sample_count: u32,
 
     const Self = @This();
 
@@ -2169,6 +2180,7 @@ pub const Texture = struct {
             .width = width,
             .height = height,
             .format = format,
+            .sample_count = config.sample_count,
         };
     }
 

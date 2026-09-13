@@ -5,10 +5,20 @@ const c = gpu.c;
 gpu_context: gpu.GPUContext,
 target_surface: gpu.Surface,
 
+// Surface-tracking targets. Owned here because their lifecycle is glued to
+// resize/sample-count changes only the renderer sees; recreated as one unit
+// in recreateSurfaceTargets. Everything else a pass writes to is app-owned.
+surface_sample_count: u32 = 1,
+surface_depth: ?gpu.Texture = null,
+surface_depth_view: c.WGPUTextureView = null,
+msaa_color: ?gpu.Texture = null,
+msaa_color_view: c.WGPUTextureView = null,
+
 draw_commands: std.ArrayList(DrawCmd),
 instance_buffer: std.ArrayList(u8),
 
 materials: std.ArrayList(MaterialRecord),
+render_states: std.ArrayList(gpu.MaterialRenderState),
 shaders: std.ArrayList(ShaderRecord),
 vertex_buffers: std.ArrayList(VertexBufferRecord),
 meshes: std.ArrayList(MeshRecord),
@@ -20,11 +30,12 @@ index_buffer: GPUArena,
 
 const Self = @This();
 
-pub const PipelineID = enum(u32) {};
-pub const MaterialID = enum(u32) {};
-pub const MeshID = enum(u32) {};
-pub const ShaderID = enum(u32) {};
-pub const VertexBufferID = enum(u32) {};
+pub const PipelineID = enum(u32) { _ };
+pub const RenderStateID = enum(u32) { _ };
+pub const MaterialID = enum(u32) { _ };
+pub const MeshID = enum(u32) { _ };
+pub const ShaderID = enum(u32) { _ };
+pub const VertexBufferID = enum(u32) { _ };
 
 const GPUArena = struct {
     ptr: c.WGPUBuffer,
@@ -90,6 +101,7 @@ const GPUArena = struct {
 
 pub const MaterialRecord = struct {
     shaderID: ShaderID,
+    render_state: RenderStateID,
     // bind group 1
     bind_group: c.WGPUBindGroup,
     base_vertex: u32,
@@ -143,6 +155,14 @@ pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type) !Sh
         .fs = S.FS,
     });
     return ShaderID(self.shaders.items.len - 1);
+}
+
+pub fn getOrCreateRenderState(self: *Self, allocator: std.mem.Allocator, state: gpu.MaterialRenderState) !RenderStateID {
+    for (self.render_states.items, 0..) |s, i| {
+        if (std.meta.eql(s, state)) return @enumFromInt(i);
+    }
+    try self.render_states.append(allocator, state);
+    return @enumFromInt(self.render_states.items.len - 1);
 }
 
 pub fn attributeSort(_: anytype, a: gpu.VertexBuffer.AttributeDesc, b: gpu.VertexBuffer.AttributeDesc) bool {
@@ -244,6 +264,51 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, instance: c.WGPUInstance, 
 
 pub fn configureTarget(self: *Self, width: u32, height: u32) void {
     self.target_surface.configure(self.gpu_context, width, height);
+    self.recreateSurfaceTargets(width, height);
+}
+
+pub fn setSampleCount(self: *Self, sample_count: u32) void {
+    if (sample_count == self.surface_sample_count) return;
+    self.surface_sample_count = sample_count;
+    if (self.surface_depth) |t| self.recreateSurfaceTargets(t.width, t.height);
+}
+
+fn recreateSurfaceTargets(self: *Self, width: u32, height: u32) void {
+    if (self.surface_depth) |*t| {
+        c.wgpuTextureViewRelease(self.surface_depth_view);
+        t.deinit();
+    }
+    self.surface_depth = gpu.Texture.init(
+        self.gpu_context,
+        "surface depth",
+        width,
+        height,
+        .@"2d",
+        surface_depth_format,
+        .{ .sample_count = self.surface_sample_count },
+        .{ .render_attachment = true },
+    );
+    self.surface_depth_view = self.surface_depth.?.createView(.{ .label = "surface depth view" });
+
+    if (self.msaa_color) |*t| {
+        c.wgpuTextureViewRelease(self.msaa_color_view);
+        t.deinit();
+        self.msaa_color = null;
+        self.msaa_color_view = null;
+    }
+    if (self.surface_sample_count > 1) {
+        self.msaa_color = gpu.Texture.init(
+            self.gpu_context,
+            "surface msaa color",
+            width,
+            height,
+            .@"2d",
+            self.target_surface.format,
+            .{ .sample_count = self.surface_sample_count },
+            .{ .render_attachment = true },
+        );
+        self.msaa_color_view = self.msaa_color.?.createView(.{ .label = "surface msaa view" });
+    }
 }
 
 pub fn beginFrame(self: Self) Frame {
@@ -371,9 +436,10 @@ pub fn mesh(self: *Self, allocator: std.mem.Allocator, mesh_data: MeshData) !Mes
     return @intFromEnum(mesh_id);
 }
 
-pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), mat_render_state: gpu.RenderPassConfig) !Material(Reflected) {
+pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), render_state: gpu.MaterialRenderState) !Material(Reflected) {
     const Shader = gpu.Shader(Reflected);
     const shader_id = try self.getOrCreateShader(allocator, Shader);
+    const render_state_id = try self.getOrCreateRenderState(allocator, render_state);
     const resources: Shader.Resources(1) = undefined;
     const uniform_count = if (Reflected.Uniforms[1]) |bg| bg.len else 0;
     // TODO: no need for one buffer per binding
@@ -414,6 +480,7 @@ pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, para
     );
     const material_record: MaterialRecord = .{
         .shaderID = shader_id,
+        .render_state = render_state_id,
         .bind_group = bind_group,
         .uniforms = uniforms,
     };
@@ -514,3 +581,91 @@ const RenderPass = struct {
         });
     }
 };
+
+pub const surface_depth_format: gpu.TextureFormat = .depth32_float;
+
+pub const ColorTarget = union(enum) {
+    // renderer managed
+    surface,
+    // app managed
+    offline_target: struct {
+        color: gpu.Texture,
+        resolve_to: ?gpu.Texture = null,
+    },
+};
+
+pub const DepthTarget = union(enum) {
+    // renderer managed
+    surface_depth,
+    // app managed
+    texture: gpu.Texture,
+};
+
+pub const ColorAttachment = struct {
+    target: ColorTarget,
+    clear_value: gpu.Color = .{ .r = 0.2, .g = 0.2, .b = 0.2, .a = 1.0 },
+    load_op: gpu.LoadOp = .clear,
+    store_op: gpu.StoreOp = .store,
+};
+
+pub const DepthStencilAttachment = struct {
+    target: DepthTarget,
+    depth_clear_value: f32 = 1.0,
+    depth_load_op: gpu.LoadOp = .clear,
+    depth_store_op: gpu.StoreOp = .store,
+};
+
+pub const PassDescriptor = struct {
+    color_attachment: ?ColorAttachment = null,
+    depth_stencil_attachment: ?DepthStencilAttachment = null,
+    label: []const u8 = "render pass",
+};
+
+/// The pass-owned half of a pipeline key: which attachments exist, their
+/// formats, and the pass's sample count. Clear values and load/store ops are
+/// per-execution and deliberately absent.
+pub const PassPipelineState = struct {
+    color_format: ?gpu.TextureFormat = null,
+    depth_format: ?gpu.TextureFormat = null,
+    sample_count: u32 = 1,
+};
+
+pub fn resolvePassState(self: *const Self, desc: PassDescriptor) PassPipelineState {
+    var state = PassPipelineState{};
+    if (desc.color_attachment) |ca| switch (ca.target) {
+        .surface => {
+            state.color_format = self.target_surface.format;
+            state.sample_count = self.surface_sample_count;
+        },
+        .offline_target => |t| {
+            state.color_format = t.color.format;
+            state.sample_count = t.color.sample_count;
+            if (t.resolve_to) |r| {
+                std.debug.assert(t.color.sample_count > 1);
+                std.debug.assert(r.sample_count == 1);
+                std.debug.assert(r.format == t.color.format);
+                std.debug.assert(r.width == t.color.width and r.height == t.color.height);
+            } else {
+                std.debug.assert(t.color.sample_count == 1);
+            }
+        },
+    };
+    if (desc.depth_stencil_attachment) |da| {
+        const depth_samples = switch (da.target) {
+            .surface_depth => blk: {
+                state.depth_format = surface_depth_format;
+                break :blk self.surface_sample_count;
+            },
+            .texture => |t| blk: {
+                state.depth_format = t.format;
+                break :blk t.sample_count;
+            },
+        };
+        if (desc.color_attachment == null) {
+            state.sample_count = depth_samples;
+        } else {
+            std.debug.assert(depth_samples == state.sample_count);
+        }
+    }
+    return state;
+}
