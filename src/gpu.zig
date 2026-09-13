@@ -982,6 +982,11 @@ pub const BlendState = struct {
     alpha: BlendComponent,
 };
 
+pub const ConstantEntry = struct {
+    key: []const u8,
+    value: f64,
+};
+
 pub const PipelineDescriptor = struct {
     color_format: ?TextureFormat,
     shader_module: c.WGPUShaderModule,
@@ -992,6 +997,7 @@ pub const PipelineDescriptor = struct {
     blend: ?BlendState = null,
     sample_count: u32 = 1,
     cull_mode: CullMode = .back,
+    constants: []const ConstantEntry = &.{},
 };
 
 pub const BindGroupEntry = struct {
@@ -1591,9 +1597,18 @@ pub fn createPipeline(
     vertex_state.bufferCount = descriptor.vertex_layouts.len;
     vertex_state.buffers = buffers.ptr;
 
-    desc.vertex = vertex_state;
+    const constant_entries = try temp.alloc(c.WGPUConstantEntry, descriptor.constants.len);
+    for (descriptor.constants, 0..) |constant, ci| {
+        constant_entries[ci] = .{
+            .nextInChain = null,
+            .key = toWGPUString(constant.key),
+            .value = constant.value,
+        };
+    }
+    vertex_state.constantCount = constant_entries.len;
+    vertex_state.constants = constant_entries.ptr;
 
-    // TODO handle constants
+    desc.vertex = vertex_state;
 
     // TODO multi target rendering
     if (fragment_entry) |fe| {
@@ -1601,6 +1616,8 @@ pub fn createPipeline(
         fragment_state.module = descriptor.shader_module;
         fragment_state.entryPoint = toWGPUString(fe);
         fragment_state.targetCount = 1;
+        fragment_state.constantCount = constant_entries.len;
+        fragment_state.constants = constant_entries.ptr;
 
         var target_state = z_WGPU_COLOR_TARGET_STATE_INIT();
         target_state.format = @intFromEnum(descriptor.color_format.?);

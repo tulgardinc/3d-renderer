@@ -12,9 +12,11 @@ instance_buffer: std.ArrayList(u8),
 
 materials: std.ArrayList(MaterialRecord),
 render_states: std.ArrayList(gpu.MaterialRenderState),
+modules: std.ArrayList(ModuleRecord),
 shaders: std.ArrayList(ShaderRecord),
 vertex_buffers: std.ArrayList(VertexBufferRecord),
 meshes: std.ArrayList(MeshRecord),
+pipelines: std.AutoHashMapUnmanaged(PipelineKey, c.WGPURenderPipeline),
 
 world_uniforms: c.WGPUBuffer,
 material_unfiorms: std.ArrayList(c.WGPUBuffer),
@@ -23,10 +25,10 @@ index_buffer: GPUArena,
 
 const Self = @This();
 
-pub const PipelineID = enum(u32) { _ };
 pub const RenderStateID = enum(u32) { _ };
 pub const MaterialID = enum(u32) { _ };
 pub const MeshID = enum(u32) { _ };
+pub const ModuleID = enum(u32) { _ };
 pub const ShaderID = enum(u32) { _ };
 pub const VertexBufferID = enum(u32) { _ };
 
@@ -108,12 +110,18 @@ pub const MaterialRecord = struct {
     };
 };
 
-pub const ShaderRecord = struct {
+pub const ModuleRecord = struct {
     name: []const u8,
     module: c.WGPUShaderModule,
     group_layouts: []const ?c.WGPUBindGroupLayout,
     vs: [][]const gpu.VertexInputMeta,
     fs: [][]const u8,
+};
+
+pub const ShaderRecord = struct {
+    module: ModuleID,
+    vertex_entry: []const u8,
+    fragment_entry: []const u8,
 };
 
 pub const VertexBufferRecord = struct {
@@ -133,21 +141,39 @@ pub const MeshRecord = struct {
     },
 };
 
-pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type) !ShaderID {
-    for (self.shaders.items, 0..) |s, i| {
-        if (std.mem.eql(u8, s.name, S.NAME)) {
-            return ShaderID(i);
+pub fn getOrCreateModule(self: *Self, allocator: std.mem.Allocator, S: type) !ModuleID {
+    for (self.modules.items, 0..) |m, i| {
+        if (std.mem.eql(u8, m.name, S.NAME)) {
+            return @enumFromInt(i);
         }
     }
     const shader = try gpu.Shader(S).init(allocator, self.gpu_context);
-    try self.shaders.append(allocator, .{
+    try self.modules.append(allocator, .{
         .name = S.NAME,
         .group_layouts = shader.group_layouts,
         .module = shader.module,
         .vs = S.VS,
         .fs = S.FS,
     });
-    return ShaderID(self.shaders.items.len - 1);
+    return @enumFromInt(self.modules.items.len - 1);
+}
+
+pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type, vertex_entry: []const u8, fragment_entry: []const u8) !ShaderID {
+    const module_id = try self.getOrCreateModule(allocator, S);
+    for (self.shaders.items, 0..) |s, i| {
+        if (s.module == module_id and
+            std.mem.eql(u8, s.vertex_entry, vertex_entry) and
+            std.mem.eql(u8, s.fragment_entry, fragment_entry))
+        {
+            return @enumFromInt(i);
+        }
+    }
+    try self.shaders.append(allocator, .{
+        .module = module_id,
+        .vertex_entry = vertex_entry,
+        .fragment_entry = fragment_entry,
+    });
+    return @enumFromInt(self.shaders.items.len - 1);
 }
 
 pub fn getOrCreateRenderState(self: *Self, allocator: std.mem.Allocator, state: gpu.MaterialRenderState) !RenderStateID {
@@ -441,7 +467,7 @@ pub fn mesh(self: *Self, allocator: std.mem.Allocator, mesh_data: MeshData) !Mes
 
 pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), render_state: gpu.MaterialRenderState) !Material(Reflected) {
     const Shader = gpu.Shader(Reflected);
-    const shader_id = try self.getOrCreateShader(allocator, Shader);
+    const shader_id = try self.getOrCreateShader(allocator, Shader, "vs_main", "fs_main");
     const render_state_id = try self.getOrCreateRenderState(allocator, render_state);
     const resources: Shader.Resources(1) = undefined;
     const uniform_count = if (Reflected.Uniforms[1]) |bg| bg.len else 0;
@@ -478,7 +504,7 @@ pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, para
     const bind_group = try gpu.ShaderBindGroup(Reflected, 1).create(
         allocator,
         self.gpu_context,
-        self.shaders[ShaderID].group_layouts,
+        self.modules.items[@intFromEnum(self.shaders.items[@intFromEnum(shader_id)].module)].group_layouts,
         resources,
     );
     const material_record: MaterialRecord = .{
@@ -668,4 +694,55 @@ pub fn resolvePassState(self: *const Self, desc: PassDescriptor) PassPipelineSta
         }
     }
     return state;
+}
+
+pub const PipelineKey = struct {
+    veretex_buffer_id: VertexBufferID,
+    shader_id: ShaderID,
+    render_state_id: RenderStateID,
+    pass_state: PassPipelineState,
+};
+
+pub fn getOrCreatePipeline(self: *Self, allocator: std.mem.Allocator, key: PipelineKey) !c.WGPURenderPipeline {
+    if (self.pipelines.get(key)) |pipeline| return pipeline;
+    const shader = self.shaders.items[@intFromEnum(key.shader_id)];
+    const module = self.modules.items[@intFromEnum(shader.module)];
+    const render_state = self.render_states.items[@intFromEnum(key.render_state_id)];
+    const vb = self.vertex_buffers.items[@intFromEnum(key.veretex_buffer_id)];
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    const arena_alloc = arena.allocator();
+    defer arena.deinit();
+    var consts = try arena_alloc.alloc(gpu.ConstantEntry, vb.attributes.len + 1);
+    consts[0] = .{
+        .key = "_stride",
+        .value = @floatFromInt(vb.stride / 4),
+    };
+    for (1..consts.len) |i| {
+        consts[i] = .{
+            .key = try std.fmt.allocPrint(arena_alloc, "_{s}_offset", .{vb.attributes[i - 1].name}),
+            .value = @floatFromInt(vb.attributes[i - 1].offset / 4),
+        };
+    }
+    const pipeline = try gpu.createPipeline(
+        allocator,
+        self.gpu_context,
+        "render pipeline",
+        .{
+            .shader_module = module.module,
+            .vertex_layouts = &.{},
+            .blend = render_state.blend_state,
+            .cull_mode = render_state.cull_mode,
+            .depth_stencil = render_state.depth_stencil_state,
+            .depth_format = key.pass_state.depth_format,
+            .color_format = key.pass_state.color_format,
+            .sample_count = key.pass_state.sample_count,
+            .primitive_topology = .triangle_list,
+            .constants = consts,
+        },
+        shader.vertex_entry,
+        shader.fragment_entry,
+        module.group_layouts,
+    );
+    try self.pipelines.put(allocator, key, pipeline);
+    return pipeline;
 }
