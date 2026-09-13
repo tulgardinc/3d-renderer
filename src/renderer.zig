@@ -5,14 +5,7 @@ const c = gpu.c;
 gpu_context: gpu.GPUContext,
 target_surface: gpu.Surface,
 
-// Surface-tracking targets. Owned here because their lifecycle is glued to
-// resize/sample-count changes only the renderer sees; recreated as one unit
-// in recreateSurfaceTargets. Everything else a pass writes to is app-owned.
-surface_sample_count: u32 = 1,
-surface_depth: ?gpu.Texture = null,
-surface_depth_view: c.WGPUTextureView = null,
-msaa_color: ?gpu.Texture = null,
-msaa_color_view: c.WGPUTextureView = null,
+surface_targets: SurfaceTargets = .{},
 
 draw_commands: std.ArrayList(DrawCmd),
 instance_buffer: std.ArrayList(u8),
@@ -262,52 +255,62 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, instance: c.WGPUInstance, 
     };
 }
 
-pub fn configureTarget(self: *Self, width: u32, height: u32) void {
-    self.target_surface.configure(self.gpu_context, width, height);
-    self.recreateSurfaceTargets(width, height);
-}
+pub const SurfaceTargets = struct {
+    sample_count: u32 = 1,
+    depth: ?gpu.Texture = null,
+    depth_view: c.WGPUTextureView = null,
+    msaa_color: ?gpu.Texture = null,
+    msaa_color_view: c.WGPUTextureView = null,
 
-pub fn setSampleCount(self: *Self, sample_count: u32) void {
-    if (sample_count == self.surface_sample_count) return;
-    self.surface_sample_count = sample_count;
-    if (self.surface_depth) |t| self.recreateSurfaceTargets(t.width, t.height);
-}
-
-fn recreateSurfaceTargets(self: *Self, width: u32, height: u32) void {
-    if (self.surface_depth) |*t| {
-        c.wgpuTextureViewRelease(self.surface_depth_view);
-        t.deinit();
-    }
-    self.surface_depth = gpu.Texture.init(
-        self.gpu_context,
-        "surface depth",
-        width,
-        height,
-        .@"2d",
-        surface_depth_format,
-        .{ .sample_count = self.surface_sample_count },
-        .{ .render_attachment = true },
-    );
-    self.surface_depth_view = self.surface_depth.?.createView(.{ .label = "surface depth view" });
-
-    if (self.msaa_color) |*t| {
-        c.wgpuTextureViewRelease(self.msaa_color_view);
-        t.deinit();
-        self.msaa_color = null;
-        self.msaa_color_view = null;
-    }
-    if (self.surface_sample_count > 1) {
-        self.msaa_color = gpu.Texture.init(
-            self.gpu_context,
-            "surface msaa color",
+    fn recreate(self: *SurfaceTargets, ctx: gpu.GPUContext, color_format: gpu.TextureFormat, width: u32, height: u32) void {
+        if (self.depth) |*t| {
+            c.wgpuTextureViewRelease(self.depth_view);
+            t.deinit();
+        }
+        self.depth = gpu.Texture.init(
+            ctx,
+            "surface depth",
             width,
             height,
             .@"2d",
-            self.target_surface.format,
-            .{ .sample_count = self.surface_sample_count },
+            surface_depth_format,
+            .{ .sample_count = self.sample_count },
             .{ .render_attachment = true },
         );
-        self.msaa_color_view = self.msaa_color.?.createView(.{ .label = "surface msaa view" });
+        self.depth_view = self.depth.?.createView(.{ .label = "surface depth view" });
+
+        if (self.msaa_color) |*t| {
+            c.wgpuTextureViewRelease(self.msaa_color_view);
+            t.deinit();
+            self.msaa_color = null;
+            self.msaa_color_view = null;
+        }
+        if (self.sample_count > 1) {
+            self.msaa_color = gpu.Texture.init(
+                ctx,
+                "surface msaa color",
+                width,
+                height,
+                .@"2d",
+                color_format,
+                .{ .sample_count = self.sample_count },
+                .{ .render_attachment = true },
+            );
+            self.msaa_color_view = self.msaa_color.?.createView(.{ .label = "surface msaa view" });
+        }
+    }
+};
+
+pub fn configureTarget(self: *Self, width: u32, height: u32) void {
+    self.target_surface.configure(self.gpu_context, width, height);
+    self.surface_targets.recreate(self.gpu_context, self.target_surface.format, width, height);
+}
+
+pub fn setSampleCount(self: *Self, sample_count: u32) void {
+    if (sample_count == self.surface_targets.sample_count) return;
+    self.surface_targets.sample_count = sample_count;
+    if (self.surface_targets.depth) |t| {
+        self.surface_targets.recreate(self.gpu_context, self.target_surface.format, t.width, t.height);
     }
 }
 
@@ -621,9 +624,6 @@ pub const PassDescriptor = struct {
     label: []const u8 = "render pass",
 };
 
-/// The pass-owned half of a pipeline key: which attachments exist, their
-/// formats, and the pass's sample count. Clear values and load/store ops are
-/// per-execution and deliberately absent.
 pub const PassPipelineState = struct {
     color_format: ?gpu.TextureFormat = null,
     depth_format: ?gpu.TextureFormat = null,
@@ -635,7 +635,7 @@ pub fn resolvePassState(self: *const Self, desc: PassDescriptor) PassPipelineSta
     if (desc.color_attachment) |ca| switch (ca.target) {
         .surface => {
             state.color_format = self.target_surface.format;
-            state.sample_count = self.surface_sample_count;
+            state.sample_count = self.surface_targets.sample_count;
         },
         .offline_target => |t| {
             state.color_format = t.color.format;
@@ -654,7 +654,7 @@ pub fn resolvePassState(self: *const Self, desc: PassDescriptor) PassPipelineSta
         const depth_samples = switch (da.target) {
             .surface_depth => blk: {
                 state.depth_format = surface_depth_format;
-                break :blk self.surface_sample_count;
+                break :blk self.surface_targets.sample_count;
             },
             .texture => |t| blk: {
                 state.depth_format = t.format;
