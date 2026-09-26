@@ -2302,4 +2302,12 @@ pub const VertexLayout = struct {
             .attributes = attrs,
         };
     }
+
+    pub fn getSize(self: Self) u32 {
+        var total: u32 = 0;
+        for (self.attributes) |a| {
+            total += a.format.byteSize();
+        }
+        return total;
+    }
 };
