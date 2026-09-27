@@ -59,7 +59,6 @@ pub fn Renderer(config: RendererConfig) type {
         render_states: std.ArrayList(gpu.MaterialRenderState),
         modules: std.ArrayList(ModuleRecord),
         shaders: std.ArrayList(ShaderRecord),
-        vertex_buffers: std.ArrayList(VertexBufferRecord),
         pipelines: std.AutoHashMapUnmanaged(PipelineKey, c.WGPURenderPipeline),
 
         geometry_pool: GeometryPool,
@@ -74,7 +73,6 @@ pub fn Renderer(config: RendererConfig) type {
         pub const MeshID = packed struct { gen: u8, index: u24 };
         pub const ModuleID = enum(u32) { _ };
         pub const ShaderID = enum(u32) { _ };
-        pub const VertexBufferID = enum(u32) { _ };
 
         pub const MeshLocation = struct {
             page_index: u32,
@@ -199,74 +197,11 @@ pub fn Renderer(config: RendererConfig) type {
             };
         };
 
-        const GPUArena = struct {
-            ptr: c.WGPUBuffer,
-            len: u32,
-            cap: u32,
-            usage: gpu.BufferUsage,
-
-            // forces copy dst and copy src on
-            pub const ArenaUsage = packed struct(c.WGPUBufferUsage) {
-                map_read: bool = false,
-                map_write: bool = false,
-                _forced0: u1 = 1,
-                _forced1: u1 = 1,
-                index: bool = false,
-                vertex: bool = false,
-                uniform: bool = false,
-                storage: bool = false,
-                indirect: bool = false,
-                query_resolve: bool = false,
-                _padding: u54 = 0,
-            };
-
-            pub fn init(ctx: gpu.GPUContext, capacity: u32, usage: ArenaUsage) !@This() {
-                const buffer = try gpu.createBuffer(ctx, capacity, @bitCast(usage), .{ .label = "arena" });
-                return .{
-                    .ptr = buffer,
-                    .cap = capacity,
-                    .len = 0,
-                    .usage = usage,
-                };
-            }
-
-            pub fn append(self: *@This(), ctx: gpu.GPUContext, data: []const u8) !void {
-                if (self.len + data.len > self.cap) {
-                    const encoder = ctx.getEncoder();
-                    const new_size = @max(self.cap * 2, self.cap + data.len);
-                    const new_buffer = try gpu.createBuffer(ctx, new_size, self.usage, .{ .label = "arena" });
-                    c.wgpuCommandEncoderCopyBufferToBuffer(
-                        encoder,
-                        self.ptr,
-                        0,
-                        new_buffer,
-                        0,
-                        new_buffer.len,
-                    );
-                    const cmds = gpu.finishEncoder(encoder);
-                    c.wgpuQueueSubmit(self.gpu_context.queue, 1, cmds);
-                    c.wgpuCommandEncoderRelease(encoder);
-                    c.wgpuCommandBufferRelease(cmds);
-                    c.wgpuBufferRelease(self.buffer);
-                    self.buffer = new_buffer;
-                    self.cap = new_size;
-                }
-                gpu.writeBuffer(ctx, self.buffer, self.len, data);
-                self.len += data.len;
-            }
-
-            pub fn deinit(self: *@This()) void {
-                c.wgpuBufferRelease(self.ptr);
-                self.* = undefined;
-            }
-        };
-
         pub const MaterialRecord = struct {
             shaderID: ShaderID,
             render_state: RenderStateID,
             // bind group 1
             bind_group: c.WGPUBindGroup,
-            base_vertex: u32,
 
             uniforms: []const gpu.BindGroupEntry.BufferEntry,
 
@@ -289,13 +224,6 @@ pub fn Renderer(config: RendererConfig) type {
             module: ModuleID,
             vertex_entry: []const u8,
             fragment_entry: []const u8,
-        };
-
-        pub const VertexBufferRecord = struct {
-            arena: GPUArena,
-
-            stride: u32,
-            attributes: []const gpu.VertexBuffer.AttributeDesc,
         };
 
         pub fn getOrCreateModule(self: *Self, allocator: std.mem.Allocator, S: type) !ModuleID {
@@ -339,45 +267,6 @@ pub fn Renderer(config: RendererConfig) type {
             }
             try self.render_states.append(allocator, state);
             return @enumFromInt(self.render_states.items.len - 1);
-        }
-
-        pub fn attributeSort(_: anytype, a: gpu.VertexBuffer.AttributeDesc, b: gpu.VertexBuffer.AttributeDesc) bool {
-            return std.mem.order(u8, a.name, b.name).compare(.lt);
-        }
-
-        pub fn attributesEql(a: []gpu.VertexBuffer.AttributeDesc, b: []gpu.VertexBuffer.AttributeDesc) bool {
-            if (a.len != b.len) return false;
-            for (0..a.len) |i| {
-                if (a[i].format != b[i].format) return false;
-                if (!std.mem.eql(u8, a[i].name, b[i].name)) return false;
-            }
-            return true;
-        }
-
-        pub fn getOrCreateVertexBuffer(self: *Self, allocator: std.mem.Allocator, desc: gpu.VertexLayout) !VertexBufferID {
-            const MAX_ATTR_COUNT = 20;
-            var attrs: [MAX_ATTR_COUNT]gpu.VertexBuffer.AttributeDesc = undefined;
-            std.mem.copyForwards(gpu.VertexBuffer.AttributeDesc, attrs[0..], desc.attributes);
-            std.mem.sort(gpu.VertexBuffer.AttributeDesc, attrs[0..desc.attributes.len], {}, attributeSort);
-            for (self.vertex_buffers.items, 0..) |vb, i| {
-                if (attributesEql(vb.layout.attributes, attrs[0..desc.attributes.len])) {
-                    return @intFromEnum(i);
-                }
-            }
-            const owned_attrs = try allocator.dupe(gpu.VertexBuffer.AttributeDesc, attrs[0..desc.attributes.len]);
-            var offset = 0;
-            for (owned_attrs) |attr| {
-                attr.offset = offset;
-                offset += attr.format.byteSize();
-            }
-            const stride = offset;
-            const arena: GPUArena = try .init(self.gpu_context, 4096, .{ .storage = true });
-            try self.vertex_buffers.append(allocator, .{
-                .arena = arena,
-                .attributes = owned_attrs,
-                .stride = stride,
-            });
-            return @intFromEnum(self.vertex_buffers.items.len - 1);
         }
 
         pub fn DrawParams(Instance: type) type {
@@ -721,7 +610,7 @@ pub fn Renderer(config: RendererConfig) type {
 
         pub const DrawCmd = struct {
             transparent: bool,
-            pipeline: PipelineID,
+            pipeline: PipelineKey,
             material: MaterialID,
             mesh: MeshID,
             depth: f32 = 0,
@@ -871,7 +760,6 @@ pub fn Renderer(config: RendererConfig) type {
         }
 
         pub const PipelineKey = struct {
-            veretex_buffer_id: VertexBufferID,
             shader_id: ShaderID,
             render_state_id: RenderStateID,
             pass_state: PassPipelineState,
@@ -882,21 +770,6 @@ pub fn Renderer(config: RendererConfig) type {
             const shader = self.shaders.items[@intFromEnum(key.shader_id)];
             const module = self.modules.items[@intFromEnum(shader.module)];
             const render_state = self.render_states.items[@intFromEnum(key.render_state_id)];
-            const vb = self.vertex_buffers.items[@intFromEnum(key.veretex_buffer_id)];
-            var arena = std.heap.ArenaAllocator.init(allocator);
-            const arena_alloc = arena.allocator();
-            defer arena.deinit();
-            var consts = try arena_alloc.alloc(gpu.ConstantEntry, vb.attributes.len + 1);
-            consts[0] = .{
-                .key = "_stride",
-                .value = @floatFromInt(vb.stride / 4),
-            };
-            for (1..consts.len) |i| {
-                consts[i] = .{
-                    .key = try std.fmt.allocPrint(arena_alloc, "_{s}_offset", .{vb.attributes[i - 1].name}),
-                    .value = @floatFromInt(vb.attributes[i - 1].offset / 4),
-                };
-            }
             const pipeline = try gpu.createPipeline(
                 allocator,
                 self.gpu_context,
@@ -911,9 +784,7 @@ pub fn Renderer(config: RendererConfig) type {
                     .color_format = key.pass_state.color_format,
                     .sample_count = key.pass_state.sample_count,
                     .primitive_topology = .triangle_list,
-                    .constants = consts,
                 },
-                shader.vertex_entry,
                 shader.fragment_entry,
                 module.group_layouts,
             );
