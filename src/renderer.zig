@@ -62,7 +62,7 @@ pub fn Renderer(config: RendererConfig) type {
         vertex_buffers: std.ArrayList(VertexBufferRecord),
         pipelines: std.AutoHashMapUnmanaged(PipelineKey, c.WGPURenderPipeline),
 
-        geometry_pool: GeometryPool(config.geomtry_pool),
+        geometry_pool: GeometryPool,
 
         world_uniforms: c.WGPUBuffer,
         material_unfiorms: std.ArrayList(c.WGPUBuffer),
@@ -87,116 +87,117 @@ pub fn Renderer(config: RendererConfig) type {
             },
         };
 
-        pub fn GeometryPool(pool_config: RendererConfig.GeometryPoolConfig) type {
-            return struct {
-                pages: std.ArrayList(Page),
-                gpu_context: gpu.GPUContext,
-                mesh_table: std.ArrayList(MeshRecord),
-                mesh_table_next_free: ?usize,
-                index_chunks: std.ArrayList(IndexChunk),
-                index_count: usize,
+        pub const GeometryPool = struct {
+            pages: std.ArrayList(Page),
+            gpu_context: gpu.GPUContext,
+            mesh_table: std.ArrayList(MeshRecord),
+            mesh_table_next_free: ?usize,
+            index_chunks: std.ArrayList(IndexChunk),
+            index_count: usize,
 
-                pub const MeshRecord = struct {
-                    gen: u8,
-                    data: union(enum) {
-                        location: MeshLocation,
-                        next_free: usize,
-                    },
-                };
+            pub const MeshRecord = struct {
+                gen: u8,
+                data: union(enum) {
+                    location: MeshLocation,
+                    next_free: usize,
+                },
+            };
 
-                // TODO freeing
+            // TODO freeing
 
-                pub fn meshTableAppend(self: *@This(), allocator: std.mem.Allocator, location: MeshLocation) !MeshID {
-                    if (self.mesh_table_next_free) |free_index| {
-                        var free_slot = &self.mesh_table.items[free_index];
-                        self.mesh_table_next_free = free_slot.data.next_free;
-                        free_slot.data = .{ .location = location };
-                        return .{ .gen = free_slot.gen, .index = free_index };
+            pub fn meshTableAppend(self: *@This(), allocator: std.mem.Allocator, location: MeshLocation) !MeshID {
+                if (self.mesh_table_next_free) |free_index| {
+                    var free_slot = &self.mesh_table.items[free_index];
+                    self.mesh_table_next_free = free_slot.data.next_free;
+                    free_slot.data = .{ .location = location };
+                    return .{ .gen = free_slot.gen, .index = free_index };
+                }
+                try self.mesh_table.append(allocator, .{ .gen = 0, .data = .{ .location = location } });
+                return .{ .gen = 0, .index = self.mesh_table.items.len - 1 };
+            }
+
+            pub fn append(self: *@This(), allocator: std.mem.Allocator, mesh_data: MeshData) !MeshID {
+                std.debug.assert(mesh_data.vertex_count <= config.geomtry_pool.page_capacity);
+
+                // TODO some system for onerror deallocating
+                var mesh_location: MeshLocation = undefined;
+
+                if (mesh_data.indices) |ind| {
+                    var index_chunk = &self.index_chunks.items[self.index_chunks.items.len - 1];
+                    const chunk_remaining_capacity = config.geomtry_pool.index_chunk_capacity - index_chunk.size;
+                    if (chunk_remaining_capacity >= ind.len) {
+                        gpu.writeBuffer(self.gpu_context, index_chunk.buffer, index_chunk.size * @sizeOf(u32), std.mem.sliceAsBytes(ind));
+                        mesh_location.indices = .{
+                            .base_index = index_chunk.size,
+                            .chunk_index = self.index_chunks.items.len - 1,
+                            .index_count = ind.len,
+                        };
+                        index_chunk.size += ind.len;
+                    } else {
+                        const new_buffer = gpu.createBuffer(self.gpu_context, config.geomtry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
+                        gpu.writeBuffer(self.gpu_context, new_buffer, 0, std.mem.sliceAsBytes(ind));
+                        try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = ind.len });
+                        mesh_location.indices = .{
+                            .base_index = 0,
+                            .chunk_index = self.index_chunks.items.len - 1,
+                            .index_count = ind.len,
+                        };
                     }
-                    try self.mesh_table.append(allocator, .{ .gen = 0, .data = .{ .location = location } });
-                    return .{ .gen = 0, .index = self.mesh_table.items.len - 1 };
+                } else {
+                    mesh_location.indices = null;
                 }
 
-                pub fn append(self: *@This(), allocator: std.mem.Allocator, mesh_data: MeshData) !MeshID {
-                    std.debug.assert(mesh_data.vertex_count <= pool_config.page_capacity);
-
-                    // TODO some system for onerror deallocating
-                    var mesh_location: MeshLocation = undefined;
-
-                    if (mesh_data.indices) |ind| {
-                        var index_chunk = &self.index_chunks.items[self.index_chunks.items.len - 1];
-                        const chunk_remaining_capacity = pool_config.index_chunk_capacity - index_chunk.size;
-                        if (chunk_remaining_capacity >= ind.len) {
-                            gpu.writeBuffer(self.gpu_context, index_chunk.buffer, index_chunk.size, std.mem.sliceAsBytes(ind));
-                            index_chunk.size += ind.len;
-                            mesh_location.indices = .{
-                                .base_index = index_chunk.size,
-                                .chunk_index = self.index_chunks.items.len - 1,
-                                .index_count = ind.len,
-                            };
-                        } else {
-                            const new_buffer = gpu.createBuffer(self.gpu_context, pool_config.index_chunk_capacity, .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
-                            gpu.writeBuffer(self.gpu_context, new_buffer, 0, std.mem.sliceAsBytes(ind));
-                            try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = ind.len });
-                            mesh_location.indices = .{
-                                .base_index = 0,
-                                .chunk_index = self.index_chunks.items.len - 1,
-                                .index_count = ind.len,
-                            };
-                        }
+                var last_page = &self.pages.items[self.pages.items.len - 1];
+                const page_remaining_capacity = config.geomtry_pool.page_capacity - last_page.size;
+                if (page_remaining_capacity >= mesh_data.vertex_count) {
+                    // append to page
+                    inline for (config.geomtry_pool.layouts, 0..) |l, i| {
+                        gpu.writeBuffer(self.gpu_context, last_page.data[i], last_page.size * l.getSize(), mesh_data.streams[i].data);
                     }
 
-                    var last_page = &self.pages.items[self.pages.items.len - 1];
-                    const page_remaining_capacity = pool_config.page_capacity - last_page.size;
-                    if (page_remaining_capacity >= mesh_data.vertex_count) {
-                        // append to page
-                        inline for (pool_config.layouts, 0..) |l, i| {
-                            gpu.writeBuffer(self.gpu_context, last_page.data[i], last_page.size * l.getSize(), mesh_data.streams[i].data);
-                            last_page.size += mesh_data.vertex_count;
-                        }
-
-                        mesh_location.base_vertex = last_page.sizel;
-                        mesh_location.page_index = self.pages.items.len - 1;
-                        mesh_location.vertex_count = mesh_data.vertex_count;
-
-                        return try self.meshTableAppend(allocator, mesh_location);
-                    }
-                    // new page
-                    var new_page: Page = undefined;
-                    inline for (pool_config.layouts, 0..) |l, i| {
-                        new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.getSize(), .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
-                        gpu.writeBuffer(self.gpu_context, new_page.data[i], 0, mesh_data.streams[i].data);
-                    }
-                    new_page.size = mesh_data.vertex_count;
-                    try self.pages.append(allocator, new_page);
-
-                    mesh_location.base_vertex = 0;
+                    mesh_location.base_vertex = last_page.size;
                     mesh_location.page_index = self.pages.items.len - 1;
                     mesh_location.vertex_count = mesh_data.vertex_count;
 
+                    last_page.size += mesh_data.vertex_count;
+
                     return try self.meshTableAppend(allocator, mesh_location);
                 }
-
-                pub fn get(self: @This(), mesh_id: MeshID) ?MeshRecord {
-                    const slot = self.mesh_table.items[@intCast(mesh_id.index)];
-                    if (slot.gen != mesh_id.gen) return null;
-                    return slot.data.location;
+                // new page
+                var new_page: Page = undefined;
+                inline for (config.geomtry_pool.layouts, 0..) |l, i| {
+                    new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.getSize() * config.geomtry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
+                    gpu.writeBuffer(self.gpu_context, new_page.data[i], 0, mesh_data.streams[i].data);
                 }
+                new_page.size = mesh_data.vertex_count;
+                try self.pages.append(allocator, new_page);
 
-                pub const Page = struct {
-                    // TODO handle tails in pages
-                    data: [pool_config.layouts.len]c.WGPUBuffer,
-                    /// in vertex count
-                    size: u32,
-                };
+                mesh_location.base_vertex = 0;
+                mesh_location.page_index = self.pages.items.len - 1;
+                mesh_location.vertex_count = mesh_data.vertex_count;
 
-                pub const IndexChunk = struct {
-                    buffer: c.WGPUBuffer,
-                    // in index count
-                    size: u32,
-                };
+                return try self.meshTableAppend(allocator, mesh_location);
+            }
+
+            pub fn get(self: @This(), mesh_id: MeshID) ?MeshRecord {
+                const slot = self.mesh_table.items[@intCast(mesh_id.index)];
+                if (slot.gen != mesh_id.gen) return null;
+                return slot.data.location;
+            }
+
+            pub const Page = struct {
+                // TODO handle tails in pages
+                data: [config.geomtry_pool.layouts.len]c.WGPUBuffer,
+                /// in vertex count
+                size: u32,
             };
-        }
+
+            pub const IndexChunk = struct {
+                buffer: c.WGPUBuffer,
+                // in index count
+                size: u32,
+            };
+        };
 
         const GPUArena = struct {
             ptr: c.WGPUBuffer,
