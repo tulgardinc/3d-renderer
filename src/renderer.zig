@@ -2,12 +2,44 @@ const std = @import("std");
 const gpu = @import("gpu");
 const c = gpu.c;
 
+pub const default_layout: []const gpu.VertexLayout = &.{
+    .{
+        .stride = 12,
+        .attributes = &.{
+            .{
+                .name = "position",
+                .format = .f32x3,
+                .offset = 0,
+            },
+        },
+    },
+    .{
+        .stride = 20,
+        .attributes = &.{
+            .{
+                .name = "normal",
+                .format = .snorm16x4,
+                .offset = 0,
+            },
+            .{
+                .name = "uv",
+                .format = .f32x2,
+                .offset = 8,
+            },
+            .{
+                .name = "color",
+                .format = .unorm8x4,
+                .offset = 16,
+            },
+        },
+    },
+};
+
 pub const RendererConfig = struct {
     comptime geomtry_pool: GeometryPoolConfig = .{},
 
     pub const GeometryPoolConfig = struct {
-        // TODO Default layout
-        layouts: []const gpu.VertexLayout,
+        layouts: []const gpu.VertexLayout = default_layout,
         page_capacity: u32 = 524_288,
         index_chunk_capacity: u32 = 4_194_304,
     };
@@ -134,8 +166,8 @@ pub fn Renderer(config: RendererConfig) type {
                     inline for (pool_config.layouts, 0..) |l, i| {
                         new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.getSize(), .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
                         gpu.writeBuffer(self.gpu_context, new_page.data[i], 0, mesh_data.streams[i].data);
-                        new_page.size = mesh_data.vertex_count;
                     }
+                    new_page.size = mesh_data.vertex_count;
                     try self.pages.append(allocator, new_page);
 
                     mesh_location.base_vertex = 0;
@@ -526,48 +558,84 @@ pub fn Renderer(config: RendererConfig) type {
         };
 
         pub fn mesh(self: *Self, allocator: std.mem.Allocator, mesh_data: MeshData) !MeshID {
-            // check for space in the Geometry Pool
-            // new page allocated if not enough space
+            const canon_layouts = config.geomtry_pool.layouts;
 
-            // check for space in the latest index chunk
-            // new chunk if doesn't exist
+            for (mesh_data.streams) |stream| {
+                std.debug.assert(stream.data.len >= stream.layout.getSize() * mesh_data.vertex_count);
+            }
 
-            // take position out into the position buffer
-            // take attributes into the attribute buffer
-            // take indeices into the indices buffer
+            var canon_mesh_data: MeshData = undefined;
+            canon_mesh_data.indices = mesh_data.indices;
+            canon_mesh_data.vertex_count = mesh_data.vertex_count;
+            canon_mesh_data.streams = allocator.alloc(MeshData.Stream, canon_layouts.len);
 
-            // return id: page index, index chunk index, vertex offset, vertex count, index offset, index count
-            var vertex_buffer = &self.vertex_buffers.items[vb_id];
-            const stride = vertex_buffer.stride;
-            const canon_attr = vertex_buffer.attributes;
-            var vertex_data = try allocator.alloc(u8, stride * mesh_data.vertex_count);
-            defer allocator.free(vertex_data);
-            // TODO: optimize via partial eval
-            for (0..mesh_data.vertex_count) |vi| {
-                for (canon_attr) |ca| {
-                    for (mesh_data.streams) |s| {
-                        for (s.layout.attributes) |a| {
-                            if (std.mem.eql(u8, ca.name, a.name)) {
-                                std.mem.copyForwards(
-                                    u8,
-                                    vertex_data[(vi * stride + ca.offset)..],
-                                    s.data[(vi * s.layout.stride + a.offset)..(vi * s.layout.stride + a.offset + a.format.byteSize())],
-                                );
+            for (canon_layouts, 0..) |layout, i| {
+                canon_mesh_data.streams[i].layout = layout;
+                canon_mesh_data.streams[i].data = try allocator.alloc(u8, layout.getSize() * canon_mesh_data.vertex_count);
+            }
+
+            var source_info: std.ArrayList(?struct {
+                src_stream_index: usize,
+                src_offset: u32,
+                src_format: gpu.VertexFormat,
+            }) = .empty;
+
+            inline for (canon_layouts) |can_layout| {
+                for (can_layout.attributes) |can_attr| {
+                    var missing = true;
+                    for (mesh_data.streams, 0..) |src_stream, i| {
+                        for (src_stream.layout.attributes) |src_attr| {
+                            if (std.mem.eql(u8, can_attr.name, src_attr)) {
+                                std.debug.assert(missing);
+                                missing = false;
+                                try source_info.append(allocator, .{
+                                    .src_stream_index = i,
+                                    .src_offset = src_attr.offset,
+                                    .src_format = src_attr.format,
+                                });
                             }
                         }
                     }
+                    if (missing) {
+                        std.debug.panic("No defaults in the current version", .{});
+                        try source_info.append(allocator, null);
+                    }
                 }
             }
-            const base_vertex = vertex_buffer.arena.len / stride;
-            try vertex_buffer.arena.append(self.gpu_context, vertex_data);
-            const mesh_id = self.meshes.items.len;
-            try self.meshes.append(allocator, .{
-                .buffer = vb_id,
-                .base_vertex = base_vertex,
-                .vertex_count = mesh_data.vertex_count,
-                .indices = indices,
-            });
-            return @intFromEnum(mesh_id);
+
+            var info_index = 0;
+            inline for (canon_layouts, 0..) |_, i| {
+                var can_stream = &canon_mesh_data.streams[i];
+                for (can_stream.layout.attributes) |can_attr| {
+                    const src_attr_info = source_info.items[info_index];
+                    const should_transform = src_attr_info.format != can_attr.format;
+                    var src_base = 0;
+                    var can_base = 0;
+                    const src_stream = mesh_data.streams[src_attr_info.src_stream_index];
+                    const src_stride = src_stream.layout.getSize();
+                    const can_stride = can_stream.layout.getSize();
+                    const src_attr_size = src_attr_info.src_format.byteSize();
+                    const can_attr_size = can_attr.format.byteSize();
+                    for (0..mesh_data.vertex_count) |_| {
+                        if (should_transform) {
+                            can_attr.format.encode(
+                                src_attr_info.src_format.decode(src_stream.data[src_base + src_attr_info.src_offset ..][0..src_attr_size]),
+                                can_stream.data[can_base + can_attr.offset ..][0..can_attr_size],
+                            );
+                        } else {
+                            @memcpy(
+                                can_stream.data[can_base + can_attr.offset ..][0..can_attr_size],
+                                src_stream.data[src_base + src_attr_info.src_offset ..][0..src_attr_size],
+                            );
+                        }
+                        can_base += can_stride;
+                        src_base += src_stride;
+                    }
+                    info_index += 1;
+                }
+            }
+
+            return try self.geometry_pool.append(allocator, canon_mesh_data);
         }
 
         pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), render_state: gpu.MaterialRenderState) !Material(Reflected) {

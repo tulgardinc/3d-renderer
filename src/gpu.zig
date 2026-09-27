@@ -747,6 +747,84 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
             .f32x4, .u32x4, .i32x4 => 16,
         };
     }
+
+    pub fn componentCount(self: @This()) usize {
+        return switch (self) {
+            .undefined => 0,
+            .u8, .i8, .unorm8, .snorm8, .u16, .i16, .unorm16, .snorm16, .f16, .u32, .i32, .f32 => 1,
+            .u8x2, .i8x2, .unorm8x2, .snorm8x2, .u16x2, .i16x2, .unorm16x2, .snorm16x2, .f16x2, .u32x2, .i32x2, .f32x2 => 2,
+            .u32x3, .i32x3, .f32x3 => 3,
+            .u8x4, .i8x4, .unorm8x4, .snorm8x4, .u16x4, .i16x4, .unorm16x4, .snorm16x4, .f16x4, .u32x4, .i32x4, .f32x4, .unorm10_10_10_2, .unorm8x4bgra => 4,
+        };
+    }
+
+    pub fn decode(self: @This(), data: []const u8) [4]f32 {
+        var intermediary: [4]f32 = .{ 0, 0, 0, 1 };
+        switch (self) {
+            .f32, .f32x2, .f32x3, .f32x4 => @memcpy(intermediary[0 .. self.byteSize() / 4], std.mem.bytesAsSlice(f32, data[0..@intCast(self.byteSize())])),
+            .f16, .f16x2, .f16x4 => {
+                for (0..self.byteSize() / 2) |i| {
+                    intermediary[i] = @as(f16, @bitCast(std.mem.readInt(u16, data[i * 2 ..][0..2], .little)));
+                }
+            },
+            .unorm16, .unorm16x2, .unorm16x4 => {
+                for (0..self.byteSize() / 2) |i| {
+                    intermediary[i] = @as(f32, @floatFromInt(std.mem.readInt(u16, data[i * 2 ..][0..2], .little))) / 65_535.0;
+                }
+            },
+            .snorm16, .snorm16x2, .snorm16x4 => {
+                for (0..self.byteSize() / 2) |i| {
+                    intermediary[i] = @max(-1.0, @as(f32, @floatFromInt(std.mem.readInt(i16, data[i * 2 ..][0..2], .little))) / 32_767.0);
+                }
+            },
+            .unorm8, .unorm8x2, .unorm8x4 => {
+                for (0..self.byteSize()) |i| {
+                    intermediary[i] = @as(f32, @floatFromInt(std.mem.readInt(u8, data[i..][0..1], .little))) / 255.0;
+                }
+            },
+            .inorm8, .inorm8x2, .inorm8x4 => {
+                for (0..self.byteSize()) |i| {
+                    intermediary[i] = @max(-1.0, @as(f32, @floatFromInt(std.mem.readInt(i8, data[i..][0..1], .little))) / 127.0);
+                }
+            },
+            else => std.debug.panic("Unsported format", .{}),
+        }
+        return intermediary;
+    }
+
+    pub fn encode(self: @This(), data: [4]f32, destination: []u8) void {
+        std.debug.assert(destination.len == self.byteSize());
+
+        switch (self) {
+            .f32, .f32x2, .f32x3, .f32x4 => @memcpy(destination, std.mem.sliceAsBytes(data[0..self.componentCount()])),
+            .f16, .f16x2, .f16x4 => {
+                for (0..self.componentCount()) |i| {
+                    std.mem.writeInt(u16, destination[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(data[i]))), .little);
+                }
+            },
+            .unorm16, .unorm16x2, .unorm16x4 => {
+                for (0..self.componentCount()) |i| {
+                    std.mem.writeInt(u16, destination[i * 2 ..][0..2], @intFromFloat(@round(std.math.clamp(data[i], 0.0, 1.0) * 65_535.0)), .little);
+                }
+            },
+            .snorm16, .snorm16x2, .snorm16x4 => {
+                for (0..self.componentCount()) |i| {
+                    std.mem.writeInt(i16, destination[i * 2 ..][0..2], @intFromFloat(@round(std.math.clamp(data[i], -1.0, 1.0) * 32_767.0)), .little);
+                }
+            },
+            .unorm8, .unorm8x2, .unorm8x4 => {
+                for (0..self.componentCount()) |i| {
+                    std.mem.writeInt(u8, destination[i..][0..1], @intFromFloat(@round(std.math.clamp(data[i], 0.0, 1.0) * 255.0)), .little);
+                }
+            },
+            .inorm8, .inorm8x2, .inorm8x4 => {
+                for (0..self.componentCount()) |i| {
+                    std.mem.writeInt(i8, destination[i..][0..1], @intFromFloat(@round(std.math.clamp(data[i], -1.0, 1.0) * 127.0)), .little);
+                }
+            },
+            else => std.debug.panic("Unsported format", .{}),
+        }
+    }
 };
 
 pub const PrimitiveTopology = enum(c.WGPUPrimitiveTopology) {
