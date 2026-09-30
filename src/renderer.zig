@@ -2,7 +2,34 @@ const std = @import("std");
 const gpu = @import("gpu");
 const c = gpu.c;
 
-pub const default_layout: []const gpu.VertexLayout = &.{
+pub const StreamLayout = struct {
+    stride: u32,
+    attributes: []const Attribute,
+
+    const Self = @This();
+
+    pub const Attribute = struct {
+        name: []const u8,
+        format: gpu.VertexFormat,
+        offset: u32,
+    };
+
+    pub fn fromAttributes(attrs: []const Attribute) Self {
+        const stride = blk: {
+            var sum = 0;
+            for (attrs) |attr| {
+                sum += attr.format.byteSize();
+            }
+            break :blk sum;
+        };
+        return .{
+            .stride = stride,
+            .attributes = attrs,
+        };
+    }
+};
+
+pub const default_layout: []const StreamLayout = &.{
     .{
         .stride = 12,
         .attributes = &.{
@@ -36,10 +63,10 @@ pub const default_layout: []const gpu.VertexLayout = &.{
 };
 
 pub const RendererConfig = struct {
-    comptime geomtry_pool: GeometryPoolConfig = .{},
+    comptime geometry_pool: GeometryPoolConfig = .{},
 
     pub const GeometryPoolConfig = struct {
-        layouts: []const gpu.VertexLayout = default_layout,
+        layouts: []const StreamLayout = default_layout,
         page_capacity: u32 = 524_288,
         index_chunk_capacity: u32 = 4_194_304,
     };
@@ -58,7 +85,7 @@ pub fn Renderer(config: RendererConfig) type {
         materials: std.ArrayList(MaterialRecord),
         render_states: std.ArrayList(gpu.MaterialRenderState),
         modules: std.ArrayList(ModuleRecord),
-        shaders: std.ArrayList(ShaderRecord),
+        shaders: std.ArrayList(ShaderProgramRecord),
         pipelines: std.AutoHashMapUnmanaged(PipelineKey, c.WGPURenderPipeline),
 
         geometry_pool: GeometryPool,
@@ -72,7 +99,7 @@ pub fn Renderer(config: RendererConfig) type {
         pub const MaterialID = enum(u32) { _ };
         pub const MeshID = packed struct { gen: u8, index: u24 };
         pub const ModuleID = enum(u32) { _ };
-        pub const ShaderID = enum(u32) { _ };
+        pub const ShaderProgramID = enum(u32) { _ };
 
         pub const MeshLocation = struct {
             page_index: u32,
@@ -115,14 +142,23 @@ pub fn Renderer(config: RendererConfig) type {
             }
 
             pub fn append(self: *@This(), allocator: std.mem.Allocator, mesh_data: MeshData) !MeshID {
-                std.debug.assert(mesh_data.vertex_count <= config.geomtry_pool.page_capacity);
+                std.debug.assert(mesh_data.vertex_count <= config.geometry_pool.page_capacity);
+
+                if (self.pages.items.len == 0) {
+                    var new_page: Page = undefined;
+                    inline for (config.geometry_pool.layouts, 0..) |l, i| {
+                        new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.stride * config.geometry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
+                    }
+                    new_page.size = 0;
+                    try self.pages.append(allocator, new_page);
+                }
 
                 // TODO some system for onerror deallocating
                 var mesh_location: MeshLocation = undefined;
 
                 if (mesh_data.indices) |ind| {
                     var index_chunk = &self.index_chunks.items[self.index_chunks.items.len - 1];
-                    const chunk_remaining_capacity = config.geomtry_pool.index_chunk_capacity - index_chunk.size;
+                    const chunk_remaining_capacity = config.geometry_pool.index_chunk_capacity - index_chunk.size;
                     if (chunk_remaining_capacity >= ind.len) {
                         gpu.writeBuffer(self.gpu_context, index_chunk.buffer, index_chunk.size * @sizeOf(u32), std.mem.sliceAsBytes(ind));
                         mesh_location.indices = .{
@@ -132,7 +168,7 @@ pub fn Renderer(config: RendererConfig) type {
                         };
                         index_chunk.size += ind.len;
                     } else {
-                        const new_buffer = gpu.createBuffer(self.gpu_context, config.geomtry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
+                        const new_buffer = gpu.createBuffer(self.gpu_context, config.geometry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
                         gpu.writeBuffer(self.gpu_context, new_buffer, 0, std.mem.sliceAsBytes(ind));
                         try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = ind.len });
                         mesh_location.indices = .{
@@ -146,11 +182,11 @@ pub fn Renderer(config: RendererConfig) type {
                 }
 
                 var last_page = &self.pages.items[self.pages.items.len - 1];
-                const page_remaining_capacity = config.geomtry_pool.page_capacity - last_page.size;
+                const page_remaining_capacity = config.geometry_pool.page_capacity - last_page.size;
                 if (page_remaining_capacity >= mesh_data.vertex_count) {
                     // append to page
-                    inline for (config.geomtry_pool.layouts, 0..) |l, i| {
-                        gpu.writeBuffer(self.gpu_context, last_page.data[i], last_page.size * l.getSize(), mesh_data.streams[i].data);
+                    inline for (config.geometry_pool.layouts, 0..) |l, i| {
+                        gpu.writeBuffer(self.gpu_context, last_page.data[i], last_page.size * l.stride, mesh_data.streams[i].data);
                     }
 
                     mesh_location.base_vertex = last_page.size;
@@ -163,8 +199,8 @@ pub fn Renderer(config: RendererConfig) type {
                 }
                 // new page
                 var new_page: Page = undefined;
-                inline for (config.geomtry_pool.layouts, 0..) |l, i| {
-                    new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.getSize() * config.geomtry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
+                inline for (config.geometry_pool.layouts, 0..) |l, i| {
+                    new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.stride * config.geometry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
                     gpu.writeBuffer(self.gpu_context, new_page.data[i], 0, mesh_data.streams[i].data);
                 }
                 new_page.size = mesh_data.vertex_count;
@@ -185,7 +221,7 @@ pub fn Renderer(config: RendererConfig) type {
 
             pub const Page = struct {
                 // TODO handle tails in pages
-                data: [config.geomtry_pool.layouts.len]c.WGPUBuffer,
+                data: [config.geometry_pool.layouts.len]c.WGPUBuffer,
                 /// in vertex count
                 size: u32,
             };
@@ -198,7 +234,7 @@ pub fn Renderer(config: RendererConfig) type {
         };
 
         pub const MaterialRecord = struct {
-            shaderID: ShaderID,
+            shaderID: ShaderProgramID,
             render_state: RenderStateID,
             // bind group 1
             bind_group: c.WGPUBindGroup,
@@ -215,15 +251,15 @@ pub fn Renderer(config: RendererConfig) type {
         pub const ModuleRecord = struct {
             name: []const u8,
             module: c.WGPUShaderModule,
-            group_layouts: []const ?c.WGPUBindGroupLayout,
-            vs: [][]const gpu.VertexInputMeta,
-            fs: [][]const u8,
+            group_layouts: []const c.WGPUBindGroupLayout,
+            vs: []const gpu.VertexEntryMeta,
+            fs: []const []const u8,
         };
 
-        pub const ShaderRecord = struct {
+        pub const ShaderProgramRecord = struct {
             module: ModuleID,
             vertex_entry: []const u8,
-            fragment_entry: []const u8,
+            fragment_entry: ?[]const u8,
         };
 
         pub fn getOrCreateModule(self: *Self, allocator: std.mem.Allocator, S: type) !ModuleID {
@@ -235,15 +271,15 @@ pub fn Renderer(config: RendererConfig) type {
             const shader = try gpu.Shader(S).init(allocator, self.gpu_context);
             try self.modules.append(allocator, .{
                 .name = S.NAME,
-                .group_layouts = shader.group_layouts,
+                .group_layouts = try allocator.dupe(c.WGPUBindGroupLayout, &shader.group_layouts),
                 .module = shader.module,
-                .vs = S.VS,
-                .fs = S.FS,
+                .vs = S.VS orelse &.{},
+                .fs = S.FS orelse &.{},
             });
             return @enumFromInt(self.modules.items.len - 1);
         }
 
-        pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type, vertex_entry: []const u8, fragment_entry: []const u8) !ShaderID {
+        pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type, vertex_entry: []const u8, fragment_entry: []const u8) !ShaderProgramID {
             const module_id = try self.getOrCreateModule(allocator, S);
             for (self.shaders.items, 0..) |s, i| {
                 if (s.module == module_id and
@@ -442,16 +478,16 @@ pub fn Renderer(config: RendererConfig) type {
             vertex_count: u32,
 
             pub const Stream = struct {
-                layout: gpu.VertexLayout,
+                layout: StreamLayout,
                 data: []const u8,
             };
         };
 
         pub fn mesh(self: *Self, allocator: std.mem.Allocator, mesh_data: MeshData) !MeshID {
-            const canon_layouts = config.geomtry_pool.layouts;
+            const canon_layouts = config.geometry_pool.layouts;
 
             for (mesh_data.streams) |stream| {
-                std.debug.assert(stream.data.len >= stream.layout.getSize() * mesh_data.vertex_count);
+                std.debug.assert(stream.data.len >= stream.layout.stride * mesh_data.vertex_count);
             }
 
             var canon_mesh_data: MeshData = undefined;
@@ -461,7 +497,7 @@ pub fn Renderer(config: RendererConfig) type {
 
             for (canon_layouts, 0..) |layout, i| {
                 canon_mesh_data.streams[i].layout = layout;
-                canon_mesh_data.streams[i].data = try allocator.alloc(u8, layout.getSize() * canon_mesh_data.vertex_count);
+                canon_mesh_data.streams[i].data = try allocator.alloc(u8, layout.stride * canon_mesh_data.vertex_count);
             }
 
             var source_info: std.ArrayList(?struct {
@@ -502,8 +538,8 @@ pub fn Renderer(config: RendererConfig) type {
                     var src_base = 0;
                     var can_base = 0;
                     const src_stream = mesh_data.streams[src_attr_info.src_stream_index];
-                    const src_stride = src_stream.layout.getSize();
-                    const can_stride = can_stream.layout.getSize();
+                    const src_stride = src_stream.layout.stride;
+                    const can_stride = can_stream.layout.stride;
                     const src_attr_size = src_attr_info.src_format.byteSize();
                     const can_attr_size = can_attr.format.byteSize();
                     for (0..mesh_data.vertex_count) |_| {
@@ -567,7 +603,7 @@ pub fn Renderer(config: RendererConfig) type {
             const bind_group = try gpu.ShaderBindGroup(Reflected, 1).create(
                 allocator,
                 self.gpu_context,
-                self.modules.items[@intFromEnum(self.shaders.items[@intFromEnum(shader_id)].module)].group_layouts,
+                self.modules.items[@intFromEnum(self.shaders.items[@intFromEnum(shader_id)].module)].group_layouts[1],
                 resources,
             );
             const material_record: MaterialRecord = .{
@@ -601,7 +637,7 @@ pub fn Renderer(config: RendererConfig) type {
 
             return struct {
                 material_id: MaterialID,
-                shader_id: ShaderID,
+                shader_id: ShaderProgramID,
 
                 pub const InstanceType: type = IT;
                 pub const Shader = S;
@@ -610,7 +646,7 @@ pub fn Renderer(config: RendererConfig) type {
 
         pub const DrawCmd = struct {
             transparent: bool,
-            pipeline: PipelineKey,
+            pipeline: c.WGPURenderPipeline,
             material: MaterialID,
             mesh: MeshID,
             depth: f32 = 0,
@@ -621,7 +657,7 @@ pub fn Renderer(config: RendererConfig) type {
             pub fn lessThan(_: void, a: DrawCmd, b: DrawCmd) bool {
                 if (a.transparent != b.transparent) return !a.transparent;
                 if (a.transparent) return a.depth > b.depth;
-                if (a.pipeline != b.pipeline) return a.pipeline < b.pipeline;
+                if (a.pipeline != b.pipeline) return @as(usize, @intFromPtr(a.pipeline)) < @as(usize, @intFromPtr(b.pipeline));
                 if (a.material != b.material) return a.material < b.material;
                 return a.mesh < b.mesh;
             }
@@ -760,23 +796,63 @@ pub fn Renderer(config: RendererConfig) type {
         }
 
         pub const PipelineKey = struct {
-            shader_id: ShaderID,
+            shader_program_id: ShaderProgramID,
             render_state_id: RenderStateID,
             pass_state: PassPipelineState,
         };
 
         pub fn getOrCreatePipeline(self: *Self, allocator: std.mem.Allocator, key: PipelineKey) !c.WGPURenderPipeline {
             if (self.pipelines.get(key)) |pipeline| return pipeline;
-            const shader = self.shaders.items[@intFromEnum(key.shader_id)];
-            const module = self.modules.items[@intFromEnum(shader.module)];
+            const program = self.shaders.items[@intFromEnum(key.shader_program_id)];
+            const module = self.modules.items[@intFromEnum(program.module)];
             const render_state = self.render_states.items[@intFromEnum(key.render_state_id)];
+            var vertex_layouts: [config.geometry_pool.layouts.len]gpu.VertexBufferLayout = undefined;
+            const total_attribute_count = blk: {
+                var total = 0;
+                inline for (config.geometry_pool.layouts) |l| {
+                    total += l.attributes.len;
+                }
+                break :blk total;
+            };
+            var attributes: [total_attribute_count]gpu.VertexBufferLayout.VertexAttribute = undefined;
+            var attr_index = 0;
+            var match_count = 0;
+            const vs = blk: {
+                for (module.vs) |vs| {
+                    if (std.mem.eql(u8, vs.fn_name, program.vertex_entry)) break :blk vs;
+                }
+                return error.UnknownVertexShaderEntry;
+            };
+            for (config.geometry_pool.layouts, 0..) |l, i| {
+                const attr_start = attr_index;
+                for (l.attributes) |attr| {
+                    for (vs.params) |par| {
+                        if (std.mem.eql(u8, par.name, attr.name)) {
+                            attributes[attr_index] = .{
+                                .format = attr.format,
+                                .offset = attr.offset,
+                                .shader_location = par.location,
+                            };
+                            attr_index += 1;
+                            match_count += 1;
+                            break;
+                        }
+                    }
+                }
+                vertex_layouts[i] = .{
+                    .step_mode = .vertex,
+                    .array_stride = l.stride,
+                    .attributes = attributes[attr_start..attr_index],
+                };
+            }
+            if (match_count != vs.params.len) return error.MissingVertexParameter;
             const pipeline = try gpu.createPipeline(
                 allocator,
                 self.gpu_context,
                 "render pipeline",
                 .{
                     .shader_module = module.module,
-                    .vertex_layouts = &.{},
+                    .vertex_layouts = &vertex_layouts,
                     .blend = render_state.blend_state,
                     .cull_mode = render_state.cull_mode,
                     .depth_stencil = render_state.depth_stencil_state,
@@ -785,7 +861,8 @@ pub fn Renderer(config: RendererConfig) type {
                     .sample_count = key.pass_state.sample_count,
                     .primitive_topology = .triangle_list,
                 },
-                shader.fragment_entry,
+                program.vertex_entry,
+                program.fragment_entry,
                 module.group_layouts,
             );
             try self.pipelines.put(allocator, key, pipeline);

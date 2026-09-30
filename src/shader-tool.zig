@@ -1161,7 +1161,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try w.print("\n", .{});
 
-    try w.print("pub const VS: ?[]const struct {{ fn_name: []const u8,  params: []const gpu.VertexInputMeta }} = ", .{});
+    try w.print("pub const VS: ?[]const gpu.VertexEntryMeta = ", .{});
     if (entries.vertex.len == 0) {
         try w.print("null;\n", .{});
     } else {

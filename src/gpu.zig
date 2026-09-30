@@ -1362,7 +1362,7 @@ fn StorageNamespace(Reflected: type) type {
 pub fn Shader(Reflected: type) type {
     return struct {
         module: c.WGPUShaderModule,
-        group_layouts: [group_count]?c.WGPUBindGroupLayout,
+        group_layouts: [group_count]c.WGPUBindGroupLayout,
 
         const Self = @This();
         const group_count = Reflected.layouts.len;
@@ -1379,48 +1379,27 @@ pub fn Shader(Reflected: type) type {
             const module = try createShader(ctx, Reflected.SOURCE, Reflected.NAME);
             errdefer c.wgpuShaderModuleRelease(module);
 
-            var group_layouts: [group_count]?c.WGPUBindGroupLayout = @splat(null);
+            var group_layouts: [group_count]c.WGPUBindGroupLayout = @splat(null);
             errdefer for (group_layouts) |maybe| {
                 if (maybe) |bgl| c.wgpuBindGroupLayoutRelease(bgl);
             };
 
-            for (Reflected.layouts, &group_layouts) |maybe_entries, *slot| {
-                const entries = maybe_entries orelse continue;
-                slot.* = try createBindGroupLayout(allocator, ctx, entries);
+            for (Reflected.layouts, &group_layouts) |maybe, *slot| {
+                if (maybe) |gl| {
+                    slot.* = try createBindGroupLayout(allocator, ctx, gl);
+                } else {
+                    slot.* = try createBindGroupLayout(allocator, ctx, &.{});
+                }
             }
 
             return .{ .module = module, .group_layouts = group_layouts };
         }
 
         pub fn deinit(self: Self) void {
-            for (self.group_layouts) |maybe| {
-                if (maybe) |bgl| c.wgpuBindGroupLayoutRelease(bgl);
+            for (self.group_layouts) |bgl| {
+                c.wgpuBindGroupLayoutRelease(bgl);
             }
             c.wgpuShaderModuleRelease(self.module);
-        }
-
-        pub fn layout(self: Self, comptime index: u32) c.WGPUBindGroupLayout {
-            if (comptime Reflected.layouts[index] == null) {
-                @compileError(std.fmt.comptimePrint(
-                    "'{s}' does not define bind group {d}",
-                    .{ Reflected.NAME, index },
-                ));
-            }
-            return self.group_layouts[index].?;
-        }
-
-        pub fn pipelineLayouts(self: Self) ![group_count]c.WGPUBindGroupLayout {
-            var dense: [group_count]c.WGPUBindGroupLayout = undefined;
-            for (self.group_layouts, &dense, 0..) |maybe, *slot, i| {
-                slot.* = maybe orelse {
-                    std.log.err(
-                        "'{s}' declares bind groups but leaves group {d} undefined",
-                        .{ Reflected.NAME, i },
-                    );
-                    return error.UndefinedBindGroup;
-                };
-            }
-            return dense;
         }
 
         pub fn createBindGroup(
@@ -1433,7 +1412,7 @@ pub fn Shader(Reflected: type) type {
             return ShaderBindGroup(Reflected, index).create(
                 allocator,
                 ctx,
-                self.layout(index),
+                self.group_layouts(index),
                 resources,
             );
         }
@@ -1443,6 +1422,12 @@ pub fn Shader(Reflected: type) type {
 pub const VertexInputMeta = struct {
     location: u32,
     name: []const u8,
+};
+
+/// One vertex entry point of a shader module and the inputs it reads.
+pub const VertexEntryMeta = struct {
+    fn_name: []const u8,
+    params: []const VertexInputMeta,
 };
 
 pub fn ShaderBindGroup(Reflected: type, comptime index: u32) type {
@@ -2360,32 +2345,3 @@ pub fn createSampler(ctx: GPUContext, config: SamplerConfig) c.WGPUSampler {
     desc.minFilter = @intFromEnum(config.min_filter);
     return c.wgpuDeviceCreateSampler(ctx.device, &desc);
 }
-
-pub const VertexLayout = struct {
-    stride: u32,
-    attributes: []const VertexBuffer.AttributeDesc,
-
-    const Self = @This();
-
-    pub fn fromAttributes(attrs: []const VertexBuffer.AttributeDesc) Self {
-        const stride = blk: {
-            var sum = 0;
-            for (attrs) |attr| {
-                sum += attr.format.byteSize();
-            }
-            break :blk sum;
-        };
-        return .{
-            .stride = stride,
-            .attributes = attrs,
-        };
-    }
-
-    pub fn getSize(self: Self) u32 {
-        var total: u32 = 0;
-        for (self.attributes) |a| {
-            total += a.format.byteSize();
-        }
-        return total;
-    }
-};
