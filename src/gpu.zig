@@ -312,6 +312,8 @@ pub fn finishEncoder(encoder: c.WGPUCommandEncoder) c.WGPUCommandBuffer {
 pub const Surface = struct {
     surface: c.WGPUSurface,
     format: TextureFormat,
+    width: u32 = 0,
+    height: u32 = 0,
 
     const Self = @This();
 
@@ -332,13 +334,32 @@ pub const Surface = struct {
         conf.device = ctx.device;
         conf.format = @intFromEnum(self.format);
         c.wgpuSurfaceConfigure(self.surface, &conf);
+        self.width = width;
+        self.height = height;
     }
 
-    pub fn getCurrentView(self: *const Self) !c.WGPUTextureView {
+    pub fn getTexture(self: Self) !Texture {
+        var surface_texture = z_WGPU_SURFACE_TEXTURE_INIT();
+        c.wgpuSurfaceGetCurrentTexture(self.surface, &surface_texture);
+        if (surface_texture.status != c.WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal and
+            surface_texture.status != c.WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
+        {
+            return error.FailedToGetTexture;
+        }
+        return .{
+            .ptr = surface_texture.texture,
+            .width = self.width,
+            .height = self.height,
+            .format = self.format,
+            .sample_count = 1,
+        };
+    }
+
+    pub fn getCurrentView(self: Self) !c.WGPUTextureView {
         return try getNextSurfaceView(self.surface);
     }
 
-    pub fn present(self: *const Self) !void {
+    pub fn present(self: Self) !void {
         if (is_web) return;
 
         if (c.wgpuSurfacePresent(self.surface) == c.WGPUStatus_Error) {

@@ -423,8 +423,12 @@ pub fn Renderer(config: RendererConfig) type {
         }
 
         pub fn beginFrame(self: Self) Frame {
+            var surface_texture = gpu.z_WGPU_SURFACE_TEXTURE_INIT();
+            self.target_surface.getTexture();
+            c.wgpuSurfaceGetCurrentTexture(self.target_surface.surface, &surface_texture);
             return .{
                 .encoder = self.gpu_context.getEncoder(),
+                .surface_texture = surface_texture,
             };
         }
 
@@ -666,28 +670,22 @@ pub fn Renderer(config: RendererConfig) type {
         pub const Frame = struct {
             renderer: *Self,
             encoder: c.WGPUCommandEncoder,
-            surface_view: c.WGPUTextureView,
+            surface_texture: gpu.Texture,
             world_buffer_cursor: u32 = 0,
+            arena: std.heap.ArenaAllocator,
 
-            pub fn beginPass(config: gpu.RenderPassConfig) RenderPass {
-                return RenderPass.init(config);
-            }
-
-            pub fn endPass(self: *@This(), pass: RenderPass) void {
-                std.mem.sort(DrawCmd, self.renderer.draw_commands.items, {}, DrawCmd.lessThan);
-
-                // clear the instance cursor
-                self.renderer.instance_buffer.items.len = 0;
+            pub fn pass(p_config: gpu.RenderPassConfig) RenderPass {
+                return RenderPass.init(p_config);
             }
 
             pub fn end(self: *@This()) void {
                 c.wgpuCommandEncoderRelease(self.encoder);
-                c.wgpuTextureViewRelease(self.surface_view);
+                self.surface_texture.deinit();
             }
         };
 
         const RenderPass = struct {
-            draw_commands: *std.ArrayList(DrawCmd),
+            draw_commands: std.ArrayList(DrawCmd),
 
             pub fn setCamera() void {}
 
