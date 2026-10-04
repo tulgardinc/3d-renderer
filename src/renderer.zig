@@ -1,6 +1,7 @@
 const std = @import("std");
 const gpu = @import("gpu");
 const c = gpu.c;
+const l = @import("lena.zig");
 
 pub const StreamLayout = struct {
     stride: u32,
@@ -64,6 +65,7 @@ pub const default_layout: []const StreamLayout = &.{
 
 pub const RendererConfig = struct {
     comptime geometry_pool: GeometryPoolConfig = .{},
+    comptime max_pass_count: usize = 16,
 
     pub const GeometryPoolConfig = struct {
         layouts: []const StreamLayout = default_layout,
@@ -81,6 +83,8 @@ pub fn Renderer(config: RendererConfig) type {
 
         draw_commands: std.ArrayList(DrawCmd),
         instance_buffer: std.ArrayList(u8),
+        sorted_instance_buffer: std.ArrayList(u8),
+        draw_batches: std.ArrayList(DrawBatch),
 
         materials: std.ArrayList(MaterialRecord),
         render_states: std.ArrayList(gpu.MaterialRenderState),
@@ -91,6 +95,11 @@ pub fn Renderer(config: RendererConfig) type {
         geometry_pool: GeometryPool,
 
         world_uniforms: c.WGPUBuffer,
+        world_uniforms_cursor: u32 = 0,
+        world_uniforms_capacity: u32 = world_uniforms_initial_capacity,
+        instances: c.WGPUBuffer,
+        instances_layout: c.WGPUBindGroupLayout,
+        instances_bind_group: c.WGPUBindGroup,
         material_unfiorms: std.ArrayList(c.WGPUBuffer),
 
         const Self = @This();
@@ -100,6 +109,55 @@ pub fn Renderer(config: RendererConfig) type {
         pub const MeshID = packed struct { gen: u8, index: u24 };
         pub const ModuleID = enum(u32) { _ };
         pub const ShaderProgramID = enum(u32) { _ };
+
+        pub const World = extern struct {
+            vp_matrix: [4][4]f32,
+            light_vp: [4][4]f32,
+            light_pos: [3]f32,
+            ambient: f32,
+        };
+
+        pub const world_slot_size: u32 = std.mem.alignForward(u32, @sizeOf(World), 256);
+        pub const world_uniforms_initial_capacity: u32 = world_slot_size * config.max_pass_count;
+
+        pub fn allocWorldUniforms(self: *Self, allocator: std.mem.Allocator, size: u32) !u32 {
+            const offset = self.world_uniforms_cursor;
+            const end = offset + std.mem.alignForward(u32, size, 256);
+            if (end > self.world_uniforms_capacity) try self.growWorldUniforms(allocator, end);
+            self.world_uniforms_cursor = end;
+            return offset;
+        }
+
+        fn growWorldUniforms(self: *Self, allocator: std.mem.Allocator, min_capacity: u32) !void {
+            var new_capacity = self.world_uniforms_capacity;
+            while (new_capacity < min_capacity) new_capacity *= 2;
+            const new_buffer = try gpu.createBuffer(
+                self.gpu_context,
+                new_capacity,
+                .{ .uniform = true, .copy_dst = true, .copy_src = true },
+                .{ .label = "world uniforms" },
+            );
+            if (self.world_uniforms_cursor > 0) {
+                const encoder = self.gpu_context.getEncoder();
+                c.wgpuCommandEncoderCopyBufferToBuffer(encoder, self.world_uniforms, 0, new_buffer, 0, self.world_uniforms_cursor);
+                self.gpu_context.submitCommands(&.{gpu.finishEncoder(encoder)});
+                c.wgpuCommandEncoderRelease(encoder);
+            }
+            c.wgpuBufferRelease(self.world_uniforms);
+            self.world_uniforms = new_buffer;
+            self.world_uniforms_capacity = new_capacity;
+            for (self.modules.items) |*module| {
+                const new_bind_group = try gpu.createBindGroup(allocator, self.gpu_context, .{
+                    .layout = module.group_layouts[0],
+                    .entries = &.{.{
+                        .binding = module.world_binding,
+                        .resource = .{ .buffer = .{ .buffer = new_buffer, .size = @sizeOf(World) } },
+                    }},
+                });
+                c.wgpuBindGroupRelease(module.world_bind_group);
+                module.world_bind_group = new_bind_group;
+            }
+        }
 
         pub const MeshLocation = struct {
             page_index: u32,
@@ -157,6 +215,11 @@ pub fn Renderer(config: RendererConfig) type {
                 var mesh_location: MeshLocation = undefined;
 
                 if (mesh_data.indices) |ind| {
+                    if (self.index_chunks.items.len == 0) {
+                        const new_buffer = gpu.createBuffer(self.gpu_context, config.geometry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
+                        try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = ind.len });
+                    }
+
                     var index_chunk = &self.index_chunks.items[self.index_chunks.items.len - 1];
                     const chunk_remaining_capacity = config.geometry_pool.index_chunk_capacity - index_chunk.size;
                     if (chunk_remaining_capacity >= ind.len) {
@@ -235,7 +298,7 @@ pub fn Renderer(config: RendererConfig) type {
 
         pub const MaterialRecord = struct {
             shaderID: ShaderProgramID,
-            render_state: RenderStateID,
+            render_state_id: RenderStateID,
             // bind group 1
             bind_group: c.WGPUBindGroup,
 
@@ -252,6 +315,8 @@ pub fn Renderer(config: RendererConfig) type {
             name: []const u8,
             module: c.WGPUShaderModule,
             group_layouts: []const c.WGPUBindGroupLayout,
+            world_binding: u32,
+            world_bind_group: c.WGPUBindGroup,
             vs: []const gpu.VertexEntryMeta,
             fs: []const []const u8,
         };
@@ -268,10 +333,36 @@ pub fn Renderer(config: RendererConfig) type {
                     return @enumFromInt(i);
                 }
             }
-            const shader = try gpu.Shader(S).init(allocator, self.gpu_context);
+            var shader = try gpu.Shader(S).init(allocator, self.gpu_context);
+            if (comptime S.layouts.len > 0 and S.layouts[0] != null) {
+                var world_entries = S.layouts[0].?[0..S.layouts[0].?.len].*;
+                for (&world_entries) |*entry| switch (entry.type) {
+                    .buffer => |*buffer| if (buffer.type == .uniform) {
+                        buffer.has_dynamic_offset = true;
+                    },
+                    else => {},
+                };
+                c.wgpuBindGroupLayoutRelease(shader.group_layouts[0]);
+                shader.group_layouts[0] = try gpu.createBindGroupLayout(allocator, self.gpu_context, &world_entries);
+            }
+            const world_binding: u32 = comptime blk: {
+                if (S.Uniforms.len > 0) if (S.Uniforms[0]) |group| for (group) |u| {
+                    if (std.mem.eql(u8, u.name, "world")) break :blk u.binding;
+                };
+                @compileError("Shader has no world uniform which is required");
+            };
+            const world_bind_group = try gpu.createBindGroup(allocator, self.gpu_context, .{
+                .layout = shader.group_layouts[0],
+                .entries = &.{.{
+                    .binding = world_binding,
+                    .resource = .{ .buffer = .{ .buffer = self.world_uniforms, .size = @sizeOf(World) } },
+                }},
+            });
             try self.modules.append(allocator, .{
                 .name = S.NAME,
                 .group_layouts = try allocator.dupe(c.WGPUBindGroupLayout, &shader.group_layouts),
+                .world_binding = world_binding,
+                .world_bind_group = world_bind_group,
                 .module = shader.module,
                 .vs = S.VS orelse &.{},
                 .fs = S.FS orelse &.{},
@@ -339,7 +430,9 @@ pub fn Renderer(config: RendererConfig) type {
                 }
                 field_names[count] = f.name;
                 field_types[count] = f.type;
-                field_attrs[count] = .{};
+                field_attrs[count] = .{
+                    .default_value_ptr = f.default_value_ptr,
+                };
                 count += 1;
             }
 
@@ -355,11 +448,58 @@ pub fn Renderer(config: RendererConfig) type {
         pub fn init(io: std.Io, allocator: std.mem.Allocator, instance: c.WGPUInstance, surface: c.WGPUSurface) !Self {
             const gpu_context = try gpu.GPUContext.initSync(io, instance.webgpu_instance, surface);
             const target_surface = gpu.Surface.init(gpu_context, surface);
+            const world_uniforms = try gpu.createBuffer(
+                gpu_context,
+                world_uniforms_initial_capacity,
+                .{ .uniform = true, .copy_dst = true, .copy_src = true },
+                .{ .label = "world uniforms" },
+            );
+            const world_instances = try gpu.createBuffer(
+                gpu_context,
+                524_288,
+                .{ .storage = true, .copy_dst = true },
+                .{ .label = "world instances" },
+            );
+            const world_instances_layout = try gpu.createBindGroupLayout(allocator, gpu_context, &.{.{
+                .binding = 0,
+                .type = .{ .buffer = .{
+                    .type = .read_only_storage,
+                    .has_dynamic_offset = false,
+                    .min_binding_size = 0,
+                } },
+            }});
+            const world_instances_bind_group = try gpu.createBindGroup(allocator, gpu_context, .{
+                .layout = world_instances_layout,
+                .entries = &.{.{
+                    .binding = 0,
+                    .resource = .{ .buffer = .{ .buffer = world_instances, .size = 524_288 } },
+                }},
+            });
             return .{
                 .gpu_context = gpu_context,
                 .target_surface = target_surface,
                 .draw_commands = try .initCapacity(allocator, 512),
                 .instance_buffer = try .initCapacity(allocator, 524_288),
+                .sorted_instance_buffer = try .initCapacity(allocator, 524_288),
+                .draw_batches = try .initCapacity(allocator, 512),
+                .materials = .empty,
+                .render_states = .empty,
+                .modules = .empty,
+                .shaders = .empty,
+                .pipelines = .empty,
+                .geometry_pool = .{
+                    .pages = .empty,
+                    .gpu_context = gpu_context,
+                    .mesh_table = .empty,
+                    .mesh_table_next_free = null,
+                    .index_chunks = .empty,
+                    .index_count = 0,
+                },
+                .material_unfiorms = .empty,
+                .world_uniforms = world_uniforms,
+                .instances = world_instances,
+                .instances_layout = world_instances_layout,
+                .instances_bind_group = world_instances_bind_group,
             };
         }
 
@@ -422,7 +562,8 @@ pub fn Renderer(config: RendererConfig) type {
             }
         }
 
-        pub fn beginFrame(self: Self) Frame {
+        pub fn beginFrame(self: *Self) Frame {
+            self.world_uniforms_cursor = 0;
             var surface_texture = gpu.z_WGPU_SURFACE_TEXTURE_INIT();
             self.target_surface.getTexture();
             c.wgpuSurfaceGetCurrentTexture(self.target_surface.surface, &surface_texture);
@@ -612,7 +753,7 @@ pub fn Renderer(config: RendererConfig) type {
             );
             const material_record: MaterialRecord = .{
                 .shaderID = shader_id,
-                .render_state = render_state_id,
+                .render_state_id = render_state_id,
                 .bind_group = bind_group,
                 .uniforms = uniforms,
             };
@@ -620,7 +761,7 @@ pub fn Renderer(config: RendererConfig) type {
             const material_id = self.materials.items.len - 1;
             return .{
                 .material_id = @intFromEnum(material_id),
-                .shader_id = @intFromEnum(shader_id),
+                .shader_program_id = @intFromEnum(shader_id),
             };
         }
 
@@ -630,8 +771,8 @@ pub fn Renderer(config: RendererConfig) type {
                     if (group == null) continue;
                     for (group.?) |r| {
                         if (std.mem.eql(u8, r.name, "instances")) {
-                            if (r.resource_type != .storage) @compileError("'instances' must be defined as a storage array");
-                            if (r.resource_type.storage != .array) @compileError("'instances' must be defined as a storage array");
+                            if (r.resource_type != .storage) @compileError("instances must be defined as a storage array");
+                            if (r.resource_type.storage != .array) @compileError("instances must be defined as a storage array");
                             break :blk r.resource_type.storage.array;
                         }
                     }
@@ -639,9 +780,41 @@ pub fn Renderer(config: RendererConfig) type {
                 @compileError("Shader has no instances array which is required");
             };
 
+            comptime {
+                var found_world = false;
+                for (S.Uniforms, 0..) |group, group_index| {
+                    if (group == null) continue;
+                    for (group.?) |u| {
+                        if (!std.mem.eql(u8, u.name, "world")) {
+                            if (group_index == 0) @compileError("group 0 may only contain the world uniform");
+                            continue;
+                        }
+                        if (group_index != 0) @compileError("world must be declared in group 0");
+                        if (@typeInfo(u.Type) != .@"struct") @compileError("world must be defined as a struct");
+                        if (@sizeOf(u.Type) != @sizeOf(World)) @compileError("world must match the renderer's World struct");
+                        for (@typeInfo(World).@"struct".fields) |f| {
+                            if (!@hasField(u.Type, f.name) or
+                                @FieldType(u.Type, f.name) != f.type or
+                                @offsetOf(u.Type, f.name) != @offsetOf(World, f.name))
+                            {
+                                @compileError("world." ++ f.name ++ " must match the renderer's World struct");
+                            }
+                        }
+                        for (@typeInfo(u.Type).@"struct".fields) |f| {
+                            if (!std.mem.startsWith(u8, f.name, "pad_") and !@hasField(World, f.name)) {
+                                @compileError("world." ++ f.name ++ " is not part of the renderer's World struct");
+                            }
+                        }
+                        found_world = true;
+                    }
+                }
+                if (S.Resources.len > 0 and S.Resources[0] != null) @compileError("group 0 may only contain the world uniform");
+                if (!found_world) @compileError("Shader has no world uniform which is required");
+            }
+
             return struct {
                 material_id: MaterialID,
-                shader_id: ShaderProgramID,
+                shader_program_id: ShaderProgramID,
 
                 pub const InstanceType: type = IT;
                 pub const Shader = S;
@@ -649,6 +822,8 @@ pub fn Renderer(config: RendererConfig) type {
         }
 
         pub const DrawCmd = struct {
+            pass: u8,
+            world_offset: u32,
             transparent: bool,
             pipeline: c.WGPURenderPipeline,
             material: MaterialID,
@@ -667,44 +842,89 @@ pub fn Renderer(config: RendererConfig) type {
             }
         };
 
+        pub const DrawBatch = struct {
+            pass: u8,
+            pipeline: c.WGPURenderPipeline,
+            material: MaterialID,
+            mesh: MeshID,
+            first_instance: u32,
+            instance_count: u32,
+        };
+
         pub const Frame = struct {
             renderer: *Self,
             encoder: c.WGPUCommandEncoder,
             surface_texture: gpu.Texture,
-            world_buffer_cursor: u32 = 0,
-            arena: std.heap.ArenaAllocator,
+            passes: [config.max_pass_count]PassDescriptor,
+            pass_count: usize = 0,
 
-            pub fn pass(p_config: gpu.RenderPassConfig) RenderPass {
-                return RenderPass.init(p_config);
+            pub fn pass(self: *@This(), descriptor: PassDescriptor) RenderPass {
+                self.passes[self.pass_count] = descriptor;
+                self.pass_count += 1;
+                return .{
+                    .renderer = self.renderer,
+                    .index = @intCast(self.pass_count - 1),
+                    .desc = descriptor,
+                };
             }
 
-            pub fn end(self: *@This()) void {
+            pub fn submit(self: @This()) void {}
+
+            pub fn deinit(self: *@This()) void {
                 c.wgpuCommandEncoderRelease(self.encoder);
                 self.surface_texture.deinit();
+                self.* = null;
             }
         };
 
         const RenderPass = struct {
-            draw_commands: std.ArrayList(DrawCmd),
+            renderer: *Self,
+            index: u8,
+            desc: PassDescriptor,
+            world_offset: ?u32 = null,
 
             pub fn setCamera() void {}
 
             pub fn draw(
-                self: *@This(),
-                allocator: std.mem.Allocator,
+                self: @This(),
                 mesh_id: MeshID,
                 mat: anytype,
-                params: DrawParams(@TypeOf(material).InstanceType),
+                allocator: std.mem.Allocator,
+                params: DrawParams(@TypeOf(mat).InstanceType),
             ) !void {
-                try self.draw_commands.append(allocator, .{
-                    .material = mat.materialID,
-                    .mesh = mesh_id,
-                    .transparent = false,
-                    .pipeline = 0,
-                    .depth = 0,
-                    .instance_offset = 0,
-                    .instance_size = 0,
+                const material_record = self.renderer.materials.items[mat.material_id];
+                const render_state = self.renderer.render_states.items[material_record.render_state_id];
+                const pipeline = try self.renderer.getOrCreatePipeline(allocator, .{
+                    .pipeline_pass_state = self.renderer.resolvePipelinePassState(self.desc),
+                    .shader_program_id = mat.shader_program_id,
+                    .render_state_id = material_record.render_state_id,
                 });
+                const depth = if (comptime @hasField(@TypeOf(params), "position")) params.position[2] else 0;
+                const InstanceType: type = @TypeOf(mat).InstanceType;
+                try self.renderer.draw_commands.append(allocator, .{
+                    .pass = self.index,
+                    .world_offset = self.world_offset.?,
+                    .material = mat.material_id,
+                    .mesh = mesh_id,
+                    .transparent = render_state.blend_state != null,
+                    .pipeline = pipeline,
+                    .depth = depth,
+                    .instance_offset = @intCast(self.renderer.instance_buffer.items.len),
+                    .instance_size = @sizeOf(InstanceType),
+                });
+                var instances: InstanceType = undefined;
+                inline for (std.meta.fields(InstanceType)) |field| {
+                    if (comptime std.mem.eql(u8, field.name, "model")) {
+                        const pos = l.Vec3(f32).fromArray(@field(params, "position"));
+                        const scale = l.Vec3(f32).fromArray(@field(params, "scale"));
+                        const rot = l.Vec3(f32).fromArray(@field(params, "rotation"));
+                        const model_mat = l.Mat4x4(f32).translation(pos).mul(.euler(rot)).mul(.scale(scale));
+                        @field(instances, "model") = model_mat.toArray();
+                        continue;
+                    }
+                    @field(instances, field.name) = @field(params, field.name);
+                }
+                try self.renderer.instance_buffer.appendSlice(allocator, std.mem.toBytes(&instances));
             }
         };
 
@@ -753,7 +973,7 @@ pub fn Renderer(config: RendererConfig) type {
             sample_count: u32 = 1,
         };
 
-        pub fn resolvePassState(self: *const Self, desc: PassDescriptor) PassPipelineState {
+        pub fn resolvePipelinePassState(self: *const Self, desc: PassDescriptor) PassPipelineState {
             var state = PassPipelineState{};
             if (desc.color_attachment) |ca| switch (ca.target) {
                 .surface => {
@@ -796,7 +1016,7 @@ pub fn Renderer(config: RendererConfig) type {
         pub const PipelineKey = struct {
             shader_program_id: ShaderProgramID,
             render_state_id: RenderStateID,
-            pass_state: PassPipelineState,
+            pipeline_pass_state: PassPipelineState,
         };
 
         pub fn getOrCreatePipeline(self: *Self, allocator: std.mem.Allocator, key: PipelineKey) !c.WGPURenderPipeline {
@@ -854,9 +1074,9 @@ pub fn Renderer(config: RendererConfig) type {
                     .blend = render_state.blend_state,
                     .cull_mode = render_state.cull_mode,
                     .depth_stencil = render_state.depth_stencil_state,
-                    .depth_format = key.pass_state.depth_format,
-                    .color_format = key.pass_state.color_format,
-                    .sample_count = key.pass_state.sample_count,
+                    .depth_format = key.pipeline_pass_state.depth_format,
+                    .color_format = key.pipeline_pass_state.color_format,
+                    .sample_count = key.pipeline_pass_state.sample_count,
                     .primitive_topology = .triangle_list,
                 },
                 program.vertex_entry,

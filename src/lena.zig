@@ -162,6 +162,14 @@ pub fn Vec3(T: type) type {
         pub fn asArray(self: *Self) *[3]T {
             return @ptrCast(self);
         }
+
+        pub fn fromArray(data: [3]T) Self {
+            return .{
+                .x = data[0],
+                .y = data[1],
+                .z = data[2],
+            };
+        }
     };
 }
 
@@ -302,6 +310,25 @@ pub fn Mat4x4(T: type) type {
                     Vec4(T).init(c + t * u.x * u.x, t * u.x * u.y + s * u.z, t * u.x * u.z - s * u.y, 0),
                     Vec4(T).init(t * u.x * u.y - s * u.z, c + t * u.y * u.y, t * u.y * u.z + s * u.x, 0),
                     Vec4(T).init(t * u.x * u.z + s * u.y, t * u.y * u.z - s * u.x, c + t * u.z * u.z, 0),
+                    Vec4(T).init(0, 0, 0, 1),
+                },
+            };
+        }
+
+        // angles = (pitch about X, yaw about Y, roll about Z), applied as Ry * Rx * Rz
+        pub fn euler(angles: Vec3(T)) Self {
+            comptime if (@typeInfo(T) == .int) @compileError("euler requires a float matrix");
+            const cp = @cos(angles.x);
+            const sp = @sin(angles.x);
+            const cy = @cos(angles.y);
+            const sy = @sin(angles.y);
+            const cr = @cos(angles.z);
+            const sr = @sin(angles.z);
+            return .{
+                .cols = .{
+                    Vec4(T).init(cy * cr + sy * sp * sr, cp * sr, cy * sp * sr - sy * cr, 0),
+                    Vec4(T).init(sy * sp * cr - cy * sr, cp * cr, sy * sr + cy * sp * cr, 0),
+                    Vec4(T).init(sy * cp, -sp, cy * cp, 0),
                     Vec4(T).init(0, 0, 0, 1),
                 },
             };
