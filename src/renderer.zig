@@ -63,6 +63,54 @@ pub const default_layout: []const StreamLayout = &.{
     },
 };
 
+pub fn nameHash(comptime name: []const u8) u64 {
+    return comptime std.hash.Fnv1a_64.hash(name);
+}
+
+pub fn layoutFingerprint(comptime T: type) u64 {
+    return comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var hasher = std.hash.Fnv1a_64.init();
+        hashLayout(&hasher, T);
+        break :blk hasher.final();
+    };
+}
+
+fn hashLayout(hasher: *std.hash.Fnv1a_64, comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .int => |info| {
+            hasher.update(if (info.signedness == .signed) "i" else "u");
+            hashInt(hasher, info.bits);
+        },
+        .float => |info| {
+            hasher.update("f");
+            hashInt(hasher, info.bits);
+        },
+        .array => |info| {
+            hasher.update("[");
+            hashInt(hasher, info.len);
+            hashInt(hasher, @sizeOf(info.child));
+            hashLayout(hasher, info.child);
+        },
+        .@"struct" => |info| {
+            if (info.layout != .@"extern") @compileError(@typeName(T) ++ " must be an extern struct to have a fixed layout");
+            hasher.update("{");
+            inline for (info.fields) |f| {
+                if (comptime std.mem.startsWith(u8, f.name, "pad_")) continue;
+                hasher.update(f.name);
+                hashInt(hasher, @offsetOf(T, f.name));
+                hashLayout(hasher, f.type);
+            }
+            hasher.update("}");
+        },
+        else => @compileError(@typeName(T) ++ " cannot be used as a pass uniform value"),
+    }
+}
+
+fn hashInt(hasher: *std.hash.Fnv1a_64, value: u64) void {
+    hasher.update(std.mem.asBytes(&value));
+}
+
 pub const RendererConfig = struct {
     comptime geometry_pool: GeometryPoolConfig = .{},
     comptime max_pass_count: usize = 16,
@@ -77,14 +125,18 @@ pub const RendererConfig = struct {
 pub fn Renderer(config: RendererConfig) type {
     return struct {
         gpu_context: gpu.GPUContext,
-        target_surface: gpu.Surface,
-
-        surface_targets: SurfaceTargets = .{},
+        surface_targets: SurfaceTargets,
 
         draw_commands: std.ArrayList(DrawCmd),
         instance_buffer: std.ArrayList(u8),
         sorted_instance_buffer: std.ArrayList(u8),
         draw_batches: std.ArrayList(DrawBatch),
+
+        pass_values: std.ArrayList(u8),
+        pass_value_entries: std.ArrayList(PassValueEntry),
+        pass_snapshots: std.ArrayList(PassSnapshot),
+        pass_blocks: std.AutoHashMapUnmanaged(PassBlockKey, u32),
+        pass_states: [config.max_pass_count]PassState = undefined,
 
         materials: std.ArrayList(MaterialRecord),
         render_states: std.ArrayList(gpu.MaterialRenderState),
@@ -95,8 +147,8 @@ pub fn Renderer(config: RendererConfig) type {
         geometry_pool: GeometryPool,
 
         world_uniforms: c.WGPUBuffer,
-        world_uniforms_cursor: u32 = 0,
         world_uniforms_capacity: u32 = world_uniforms_initial_capacity,
+        world_uniforms_mirror: std.ArrayList(u8),
         instances: c.WGPUBuffer,
         instances_layout: c.WGPUBindGroupLayout,
         instances_bind_group: c.WGPUBindGroup,
@@ -110,22 +162,67 @@ pub fn Renderer(config: RendererConfig) type {
         pub const ModuleID = enum(u32) { _ };
         pub const ShaderProgramID = enum(u32) { _ };
 
-        pub const World = extern struct {
-            vp_matrix: [4][4]f32,
-            light_vp: [4][4]f32,
-            light_pos: [3]f32,
-            ambient: f32,
+        pub const world_uniforms_initial_capacity: u32 = 256 * config.max_pass_count;
+
+        pub const PassValueEntry = struct {
+            name_hash: u64,
+            fingerprint: u64,
+            offset: u32,
+            size: u32,
         };
 
-        pub const world_slot_size: u32 = std.mem.alignForward(u32, @sizeOf(World), 256);
-        pub const world_uniforms_initial_capacity: u32 = world_slot_size * config.max_pass_count;
+        pub const PassSnapshot = struct {
+            first_entry: u32,
+            entry_count: u32,
+        };
 
-        pub fn allocWorldUniforms(self: *Self, allocator: std.mem.Allocator, size: u32) !u32 {
-            const offset = self.world_uniforms_cursor;
-            const end = offset + std.mem.alignForward(u32, size, 256);
-            if (end > self.world_uniforms_capacity) try self.growWorldUniforms(allocator, end);
-            self.world_uniforms_cursor = end;
-            return offset;
+        pub const PassBlockKey = struct {
+            snapshot: u32,
+            module: ModuleID,
+        };
+
+        pub const PassState = struct {
+            snapshot: u32,
+            world_offset: ?u32,
+            last_module: ?ModuleID,
+            last_snapshot: u32,
+            last_block_offset: u32,
+        };
+
+        pub const PassUniform = struct {
+            binding: u32,
+            size: u32,
+        };
+
+        fn createWorldBindGroup(
+            self: *const Self,
+            allocator: std.mem.Allocator,
+            layout: c.WGPUBindGroupLayout,
+            pass_uniforms: []const PassUniform,
+        ) !c.WGPUBindGroup {
+            const entries = try allocator.alloc(gpu.BindGroupEntry, pass_uniforms.len);
+            defer allocator.free(entries);
+            for (pass_uniforms, entries) |u, *entry| {
+                entry.* = .{
+                    .binding = u.binding,
+                    .resource = .{ .buffer = .{ .buffer = self.world_uniforms, .size = u.size } },
+                };
+            }
+            return gpu.createBindGroup(allocator, self.gpu_context, .{
+                .layout = layout,
+                .entries = entries,
+            });
+        }
+
+        pub const WorldUniformsSlot = struct {
+            offset: u32,
+            bytes: []u8,
+        };
+
+        pub fn stageWorldUniforms(self: *Self, allocator: std.mem.Allocator, size: u32) !WorldUniformsSlot {
+            const offset: u32 = @intCast(self.world_uniforms_mirror.items.len);
+            const bytes = try self.world_uniforms_mirror.addManyAsSlice(allocator, std.mem.alignForward(u32, size, 256));
+            return .{ .offset = offset, .bytes = bytes[0..size] };
         }
 
         fn growWorldUniforms(self: *Self, allocator: std.mem.Allocator, min_capacity: u32) !void {
@@ -134,26 +231,14 @@ pub fn Renderer(config: RendererConfig) type {
             const new_buffer = try gpu.createBuffer(
                 self.gpu_context,
                 new_capacity,
-                .{ .uniform = true, .copy_dst = true, .copy_src = true },
+                .{ .uniform = true, .copy_dst = true },
                 .{ .label = "world uniforms" },
             );
-            if (self.world_uniforms_cursor > 0) {
-                const encoder = self.gpu_context.getEncoder();
-                c.wgpuCommandEncoderCopyBufferToBuffer(encoder, self.world_uniforms, 0, new_buffer, 0, self.world_uniforms_cursor);
-                self.gpu_context.submitCommands(&.{gpu.finishEncoder(encoder)});
-                c.wgpuCommandEncoderRelease(encoder);
-            }
             c.wgpuBufferRelease(self.world_uniforms);
             self.world_uniforms = new_buffer;
             self.world_uniforms_capacity = new_capacity;
             for (self.modules.items) |*module| {
-                const new_bind_group = try gpu.createBindGroup(allocator, self.gpu_context, .{
-                    .layout = module.group_layouts[0],
-                    .entries = &.{.{
-                        .binding = module.world_binding,
-                        .resource = .{ .buffer = .{ .buffer = new_buffer, .size = @sizeOf(World) } },
-                    }},
-                });
+                const new_bind_group = try self.createWorldBindGroup(allocator, module.group_layouts[0], module.pass_uniforms);
                 c.wgpuBindGroupRelease(module.world_bind_group);
                 module.world_bind_group = new_bind_group;
             }
@@ -315,7 +400,7 @@ pub fn Renderer(config: RendererConfig) type {
             name: []const u8,
             module: c.WGPUShaderModule,
             group_layouts: []const c.WGPUBindGroupLayout,
-            world_binding: u32,
+            pass_uniforms: []const PassUniform,
             world_bind_group: c.WGPUBindGroup,
             vs: []const gpu.VertexEntryMeta,
             fs: []const []const u8,
@@ -345,23 +430,20 @@ pub fn Renderer(config: RendererConfig) type {
                 c.wgpuBindGroupLayoutRelease(shader.group_layouts[0]);
                 shader.group_layouts[0] = try gpu.createBindGroupLayout(allocator, self.gpu_context, &world_entries);
             }
-            const world_binding: u32 = comptime blk: {
-                if (S.Uniforms.len > 0) if (S.Uniforms[0]) |group| for (group) |u| {
-                    if (std.mem.eql(u8, u.name, "world")) break :blk u.binding;
-                };
-                @compileError("Shader has no world uniform which is required");
+            const pass_uniforms: []const PassUniform = comptime blk: {
+                if (S.Uniforms.len == 0 or S.Uniforms[0] == null) break :blk &.{};
+                var list: [S.Uniforms[0].?.len]PassUniform = undefined;
+                for (S.Uniforms[0].?, &list) |u, *entry| {
+                    entry.* = .{ .binding = u.binding, .size = @sizeOf(u.Type) };
+                }
+                const final = list;
+                break :blk &final;
             };
-            const world_bind_group = try gpu.createBindGroup(allocator, self.gpu_context, .{
-                .layout = shader.group_layouts[0],
-                .entries = &.{.{
-                    .binding = world_binding,
-                    .resource = .{ .buffer = .{ .buffer = self.world_uniforms, .size = @sizeOf(World) } },
-                }},
-            });
+            const world_bind_group = try self.createWorldBindGroup(allocator, shader.group_layouts[0], pass_uniforms);
             try self.modules.append(allocator, .{
                 .name = S.NAME,
                 .group_layouts = try allocator.dupe(c.WGPUBindGroupLayout, &shader.group_layouts),
-                .world_binding = world_binding,
+                .pass_uniforms = pass_uniforms,
                 .world_bind_group = world_bind_group,
                 .module = shader.module,
                 .vs = S.VS orelse &.{},
@@ -447,11 +529,10 @@ pub fn Renderer(config: RendererConfig) type {
 
         pub fn init(io: std.Io, allocator: std.mem.Allocator, instance: c.WGPUInstance, surface: c.WGPUSurface) !Self {
             const gpu_context = try gpu.GPUContext.initSync(io, instance.webgpu_instance, surface);
-            const target_surface = gpu.Surface.init(gpu_context, surface);
             const world_uniforms = try gpu.createBuffer(
                 gpu_context,
                 world_uniforms_initial_capacity,
-                .{ .uniform = true, .copy_dst = true, .copy_src = true },
+                .{ .uniform = true, .copy_dst = true },
                 .{ .label = "world uniforms" },
             );
             const world_instances = try gpu.createBuffer(
@@ -475,13 +556,19 @@ pub fn Renderer(config: RendererConfig) type {
                     .resource = .{ .buffer = .{ .buffer = world_instances, .size = 524_288 } },
                 }},
             });
+            var pass_blocks: std.AutoHashMapUnmanaged(PassBlockKey, u32) = .empty;
+            try pass_blocks.ensureTotalCapacity(allocator, 256);
             return .{
                 .gpu_context = gpu_context,
-                .target_surface = target_surface,
+                .surface_targets = .{ .surface = gpu.Surface.init(gpu_context, surface) },
                 .draw_commands = try .initCapacity(allocator, 512),
                 .instance_buffer = try .initCapacity(allocator, 524_288),
                 .sorted_instance_buffer = try .initCapacity(allocator, 524_288),
                 .draw_batches = try .initCapacity(allocator, 512),
+                .pass_values = try .initCapacity(allocator, 16_384),
+                .pass_value_entries = try .initCapacity(allocator, 256),
+                .pass_snapshots = try .initCapacity(allocator, 256),
+                .pass_blocks = pass_blocks,
                 .materials = .empty,
                 .render_states = .empty,
                 .modules = .empty,
@@ -497,6 +584,7 @@ pub fn Renderer(config: RendererConfig) type {
                 },
                 .material_unfiorms = .empty,
                 .world_uniforms = world_uniforms,
+                .world_uniforms_mirror = try .initCapacity(allocator, world_uniforms_initial_capacity),
                 .instances = world_instances,
                 .instances_layout = world_instances_layout,
                 .instances_bind_group = world_instances_bind_group,
@@ -504,13 +592,14 @@ pub fn Renderer(config: RendererConfig) type {
         }
 
         pub const SurfaceTargets = struct {
+            surface: gpu.Surface,
             sample_count: u32 = 1,
             depth: ?gpu.Texture = null,
             depth_view: c.WGPUTextureView = null,
             msaa_color: ?gpu.Texture = null,
             msaa_color_view: c.WGPUTextureView = null,
 
-            fn recreate(self: *SurfaceTargets, ctx: gpu.GPUContext, color_format: gpu.TextureFormat, width: u32, height: u32) void {
+            fn recreate(self: *SurfaceTargets, ctx: gpu.GPUContext) void {
                 if (self.depth) |*t| {
                     c.wgpuTextureViewRelease(self.depth_view);
                     t.deinit();
@@ -518,8 +607,8 @@ pub fn Renderer(config: RendererConfig) type {
                 self.depth = gpu.Texture.init(
                     ctx,
                     "surface depth",
-                    width,
-                    height,
+                    self.surface.width,
+                    self.surface.height,
                     .@"2d",
                     surface_depth_format,
                     .{ .sample_count = self.sample_count },
@@ -537,10 +626,10 @@ pub fn Renderer(config: RendererConfig) type {
                     self.msaa_color = gpu.Texture.init(
                         ctx,
                         "surface msaa color",
-                        width,
-                        height,
+                        self.surface.width,
+                        self.surface.height,
                         .@"2d",
-                        color_format,
+                        self.surface.format,
                         .{ .sample_count = self.sample_count },
                         .{ .render_attachment = true },
                     );
@@ -550,23 +639,29 @@ pub fn Renderer(config: RendererConfig) type {
         };
 
         pub fn configureTarget(self: *Self, width: u32, height: u32) void {
-            self.target_surface.configure(self.gpu_context, width, height);
-            self.surface_targets.recreate(self.gpu_context, self.target_surface.format, width, height);
+            self.surface_targets.surface.configure(self.gpu_context, width, height);
+            self.surface_targets.recreate(self.gpu_context);
         }
 
         pub fn setSampleCount(self: *Self, sample_count: u32) void {
             if (sample_count == self.surface_targets.sample_count) return;
             self.surface_targets.sample_count = sample_count;
-            if (self.surface_targets.depth) |t| {
-                self.surface_targets.recreate(self.gpu_context, self.target_surface.format, t.width, t.height);
-            }
+            if (self.surface_targets.depth != null) self.surface_targets.recreate(self.gpu_context);
         }
 
         pub fn beginFrame(self: *Self) Frame {
-            self.world_uniforms_cursor = 0;
+            self.world_uniforms_mirror.clearRetainingCapacity();
+            self.draw_commands.clearRetainingCapacity();
+            self.instance_buffer.clearRetainingCapacity();
+            self.sorted_instance_buffer.clearRetainingCapacity();
+            self.draw_batches.clearRetainingCapacity();
+            self.pass_values.clearRetainingCapacity();
+            self.pass_value_entries.clearRetainingCapacity();
+            self.pass_snapshots.clearRetainingCapacity();
+            self.pass_blocks.clearRetainingCapacity();
             var surface_texture = gpu.z_WGPU_SURFACE_TEXTURE_INIT();
-            self.target_surface.getTexture();
-            c.wgpuSurfaceGetCurrentTexture(self.target_surface.surface, &surface_texture);
+            self.surface_targets.surface.getTexture();
+            c.wgpuSurfaceGetCurrentTexture(self.surface_targets.surface.surface, &surface_texture);
             return .{
                 .encoder = self.gpu_context.getEncoder(),
                 .surface_texture = surface_texture,
@@ -785,30 +880,15 @@ pub fn Renderer(config: RendererConfig) type {
                 for (S.Uniforms, 0..) |group, group_index| {
                     if (group == null) continue;
                     for (group.?) |u| {
-                        if (!std.mem.eql(u8, u.name, "world")) {
-                            if (group_index == 0) @compileError("group 0 may only contain the world uniform");
-                            continue;
-                        }
+                        if (!std.mem.eql(u8, u.name, "world")) continue;
                         if (group_index != 0) @compileError("world must be declared in group 0");
                         if (@typeInfo(u.Type) != .@"struct") @compileError("world must be defined as a struct");
-                        if (@sizeOf(u.Type) != @sizeOf(World)) @compileError("world must match the renderer's World struct");
-                        for (@typeInfo(World).@"struct".fields) |f| {
-                            if (!@hasField(u.Type, f.name) or
-                                @FieldType(u.Type, f.name) != f.type or
-                                @offsetOf(u.Type, f.name) != @offsetOf(World, f.name))
-                            {
-                                @compileError("world." ++ f.name ++ " must match the renderer's World struct");
-                            }
-                        }
-                        for (@typeInfo(u.Type).@"struct".fields) |f| {
-                            if (!std.mem.startsWith(u8, f.name, "pad_") and !@hasField(World, f.name)) {
-                                @compileError("world." ++ f.name ++ " is not part of the renderer's World struct");
-                            }
-                        }
+                        if (!@hasField(u.Type, "vp_matrix")) @compileError("world must have a vp_matrix field");
+                        if (@FieldType(u.Type, "vp_matrix") != [4][4]f32) @compileError("world.vp_matrix must be defined as mat4x4<f32>");
                         found_world = true;
                     }
                 }
-                if (S.Resources.len > 0 and S.Resources[0] != null) @compileError("group 0 may only contain the world uniform");
+                if (S.Resources.len > 0 and S.Resources[0] != null) @compileError("group 0 may only contain uniforms");
                 if (!found_world) @compileError("Shader has no world uniform which is required");
             }
 
@@ -858,12 +938,25 @@ pub fn Renderer(config: RendererConfig) type {
             passes: [config.max_pass_count]PassDescriptor,
             pass_count: usize = 0,
 
-            pub fn pass(self: *@This(), descriptor: PassDescriptor) RenderPass {
-                self.passes[self.pass_count] = descriptor;
+            pub fn pass(self: *@This(), allocator: std.mem.Allocator, descriptor: PassDescriptor) !RenderPass {
+                const index = self.pass_count;
+                const snapshot: u32 = @intCast(self.renderer.pass_snapshots.items.len);
+                try self.renderer.pass_snapshots.append(allocator, .{
+                    .first_entry = @intCast(self.renderer.pass_value_entries.items.len),
+                    .entry_count = 0,
+                });
+                self.renderer.pass_states[index] = .{
+                    .snapshot = snapshot,
+                    .world_offset = null,
+                    .last_module = null,
+                    .last_snapshot = snapshot,
+                    .last_block_offset = 0,
+                };
+                self.passes[index] = descriptor;
                 self.pass_count += 1;
                 return .{
                     .renderer = self.renderer,
-                    .index = @intCast(self.pass_count - 1),
+                    .index = @intCast(index),
                     .desc = descriptor,
                 };
             }
@@ -881,9 +974,61 @@ pub fn Renderer(config: RendererConfig) type {
             renderer: *Self,
             index: u8,
             desc: PassDescriptor,
-            world_offset: ?u32 = null,
 
-            pub fn setCamera() void {}
+            pub fn setCamera(self: *@This(), allocator: std.mem.Allocator, camera: Camera) !void {
+                const slot = try self.renderer.stageWorldUniforms(allocator, @sizeOf(World));
+                const width, const height = blk: {
+                    if (self.desc.color_attachment) |ca| {
+                        break :blk switch (ca.target) {
+                            .offline_target => |t| .{ t.color.width, t.color.height },
+                            .surface => .{ self.renderer.surface_targets.surface.width, self.renderer.surface_targets.surface.height },
+                        };
+                    }
+                    break :blk switch (self.desc.depth_stencil_attachment.?.target) {
+                        .surface_depth => .{ self.renderer.surface_targets.depth.?.width, self.renderer.surface_targets.depth.?.height },
+                        .texture => |t| .{ t.width, t.height },
+                    };
+                };
+                const aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
+                const vp_matrix = camera.toVP(aspect);
+                @memcpy(slot.bytes, std.mem.asBytes(&World{ .vp_matrix = vp_matrix.toArray() }));
+                self.renderer.pass_states[self.index].world_offset = slot.offset;
+            }
+
+            pub fn set(self: *@This(), allocator: std.mem.Allocator, name: []const u8, value: anytype) !void {
+                const name_hash = nameHash(name);
+                const state = self.renderer.pass_states[self.index];
+                const snapshot = self.renderer.pass_snapshots.items[state];
+                const pass_values_old_size = self.renderer.pass_values.items.len;
+                const pass_value_entries_old_size = self.renderer.pass_value_entries.items.len;
+                try self.renderer.pass_value_entries.ensureUnusedCapacity(allocator, snapshot.entry_count + 1);
+                try self.renderer.pass_values.appendSlice(allocator, std.mem.asBytes(&value));
+                const fingerprint = layoutFingerprint(@TypeOf(value));
+                try self.renderer.pass_value_entries.appendSlice(allocator, self.renderer.pass_value_entries.items[snapshot.first_entry..][0..snapshot.entry_count]);
+                for (self.renderer.pass_value_entries.items[snapshot.first_entry..][0..snapshot.entry_count], 0..) |entry, i| {
+                    if (entry.name_hash == name_hash) {
+                        std.debug.assert(entry.fingerprint == fingerprint);
+                        self.renderer.pass_value_entries.items[pass_value_entries_old_size + i].offset = pass_values_old_size;
+                        try self.renderer.pass_snapshots.append(allocator, .{
+                            .first_entry = pass_value_entries_old_size,
+                            .entry_coutn = snapshot.entry_count,
+                        });
+                        self.renderer.pass_states[self.index].snapshot = self.renderer.pass_snapshots.items.len - 1;
+                        return;
+                    }
+                }
+                try self.renderer.pass_value_entries.append(allocator, .{
+                    .fingerprint = fingerprint,
+                    .name_hash = name_hash,
+                    .size = @sizeOf(value),
+                    .offset = pass_values_old_size,
+                });
+                try self.renderer.pass_snapshots.append(allocator, .{
+                    .first_entry = pass_value_entries_old_size,
+                    .entry_coutn = snapshot.entry_count + 1,
+                });
+                self.renderer.pass_states[self.index].snapshot = self.renderer.pass_snapshots.items.len - 1;
+            }
 
             pub fn draw(
                 self: @This(),
@@ -977,7 +1122,7 @@ pub fn Renderer(config: RendererConfig) type {
             var state = PassPipelineState{};
             if (desc.color_attachment) |ca| switch (ca.target) {
                 .surface => {
-                    state.color_format = self.target_surface.format;
+                    state.color_format = self.surface_targets.surface.format;
                     state.sample_count = self.surface_targets.sample_count;
                 },
                 .offline_target => |t| {
@@ -1088,3 +1233,43 @@ pub fn Renderer(config: RendererConfig) type {
         }
     };
 }
+
+pub const Camera = struct {
+    pos: l.Vec3(f32) = .splat(0),
+    yaw: f32 = 0,
+    pitch: f32 = 0,
+    projection: Projection = .{ .perspective = .{} },
+    near: f32 = 0.01,
+    far: f32 = 100,
+
+    pub const Projection = union(enum) {
+        perspective: struct { fov_y: f32 = std.math.degreesToRadians(90) },
+        orthographic: struct { height: f32 = 10 },
+    };
+
+    pub fn forward(self: Camera) l.Vec3(f32) {
+        return .init(@cos(self.pitch) * @sin(self.yaw), -@sin(self.pitch), -@cos(self.pitch) * @cos(self.yaw));
+    }
+
+    pub fn right(self: Camera) l.Vec3(f32) {
+        return .init(@cos(self.yaw), 0, @sin(self.yaw));
+    }
+
+    pub fn toVP(self: Camera, aspect: f32) l.Mat4x4(f32) {
+        const f = self.forward();
+        const view = l.Mat4x4(f32).lookAt(self.pos, self.pos.add(f), self.right().cross(f));
+        const proj = switch (self.projection) {
+            .perspective => |p| l.Mat4x4(f32).perspective(p.fov_y, aspect, self.near, self.far),
+            .orthographic => |o| blk: {
+                const half_h = o.height / 2;
+                const half_w = half_h * aspect;
+                break :blk l.Mat4x4(f32).orthographic(-half_w, half_w, half_h, -half_h, self.near, self.far);
+            },
+        };
+        return proj.mul(view);
+    }
+};
+
+pub const World = extern struct {
+    vp_matrix: [4][4]f32,
+};
