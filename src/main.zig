@@ -3,45 +3,27 @@ const gpu = @import("gpu");
 const builtin = @import("builtin");
 const c = gpu.c;
 const l = @import("lena.zig");
-
-const Mesh = @import("Mesh");
-const Shadow = @import("Shadow");
-
 const r = @import("renderer.zig");
+
+const Basic = @import("Basic");
+
+const Renderer = r.Renderer(.{});
 
 const Vertex = extern struct {
     position: [3]f32,
     uv: [2]f32,
     normal: [3]f32,
+    color: [4]u8 = .{ 255, 255, 255, 255 },
 };
 
-const DrawCmd = struct {
-    transparent: bool,
-    pipeline: usize,
-    material: usize,
-    mesh: usize,
-    depth: f32 = 0,
-
-    instance: Mesh.Instance,
-
-    pub fn lessThan(_: void, a: DrawCmd, b: DrawCmd) bool {
-        if (a.transparent != b.transparent) return !a.transparent;
-        if (a.transparent) return a.depth > b.depth;
-        if (a.pipeline != b.pipeline) return a.pipeline < b.pipeline;
-        if (a.material != b.material) return a.material < b.material;
-        return a.mesh < b.mesh;
-    }
-};
-
-/// A run of sort-adjacent commands with identical state: one draw call.
-/// `first`/`count` index the flat instance array uploaded this frame.
-const Batch = struct {
-    transparent: bool,
-    pipeline: usize,
-    material: usize,
-    mesh: usize,
-    first: u32,
-    count: u32,
+const vertex_layout: r.StreamLayout = .{
+    .stride = @sizeOf(Vertex),
+    .attributes = &.{
+        .{ .name = "position", .format = .f32x3, .offset = @offsetOf(Vertex, "position") },
+        .{ .name = "uv", .format = .f32x2, .offset = @offsetOf(Vertex, "uv") },
+        .{ .name = "normal", .format = .f32x3, .offset = @offsetOf(Vertex, "normal") },
+        .{ .name = "color", .format = .unorm8x4, .offset = @offsetOf(Vertex, "color") },
+    },
 };
 
 /// Corners run bottom-left, bottom-right, top-right, top-left as seen from outside
@@ -78,7 +60,7 @@ const vertices = [_]Vertex{
     .{ .position = .{ -0.5, -0.5, 0.5 }, .uv = .{ 0, 0 }, .normal = .{ 0, -1, 0 } },
 };
 
-const indices = [_]u16{
+const indices = [_]u32{
     0,  1,  2,  0,  2,  3,
     4,  5,  6,  4,  6,  7,
     8,  9,  10, 8,  10, 11,
@@ -86,8 +68,6 @@ const indices = [_]u16{
     16, 17, 18, 16, 18, 19,
     20, 21, 22, 20, 22, 23,
 };
-
-const instance_count: u32 = 4;
 
 // 2x2 rgba8unorm checkerboard, row-major.
 const checker_pixels = [_][4]u8{
@@ -140,47 +120,6 @@ pub fn main() if (gpu.is_web) void else anyerror!void {
     }
 }
 
-const Camera = struct {
-    pos: l.Vec3(f32) = .init(0, 0, 3),
-    rot: l.Vec2(f32) = .init(0, 0),
-
-    const Self = @This();
-
-    pub fn forward(self: Self) l.Vec3(f32) {
-        return .init(@cos(self.rot.x) * @sin(self.rot.y), -@sin(self.rot.x), -@cos(self.rot.x) * @cos(self.rot.y));
-    }
-
-    pub fn getViewMatrix(self: Self) l.Mat4x4(f32) {
-        return l.Mat4x4(f32).lookAt(self.pos, self.pos.add(self.forward()), l.Vec3(f32).up());
-    }
-};
-
-// always facing 0,0,0
-const DirectionalLight = struct {
-    pos: l.Vec3(f32) = .init(30, 30, 20),
-    ambient: f32 = 0.05,
-    texture_size: f32 = 512,
-
-    const Self = @This();
-
-    pub fn getVPMatrix(self: Self) l.Mat4x4(f32) {
-        const proj = l.Mat4x4(f32).orthographic(-2, 2, 2, -2, 0.01, 50);
-        return proj.mul(.lookAt(self.pos, .splat(0), .up()));
-    }
-};
-
-const CubeInstance = struct {
-    scale: l.Vec3(f32) = .splat(1),
-    pos: l.Vec3(f32) = .splat(0),
-    rot: f32 = 0,
-
-    const Self = @This();
-
-    pub fn modelMatrix(self: Self) l.Mat4x4(f32) {
-        return l.Mat4x4(f32).translation(self.pos).mul(.rotation(.up(), self.rot)).mul(.scale(self.scale));
-    }
-};
-
 pub fn run() !void {
     var debug_allocator = std.heap.DebugAllocator(.{}){};
     const allocator = if (gpu.is_web)
@@ -219,59 +158,24 @@ pub fn run() !void {
 
     _ = c.SDL_SetWindowRelativeMouseMode(window, true);
 
-    const instance = try gpu.GPUInstance.init();
+    var instance = try gpu.GPUInstance.init();
+    defer instance.deinit();
     const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
 
-    const gpu_context = try gpu.GPUContext.initSync(io, instance.webgpu_instance, surface);
-    var target_surface = gpu.Surface.init(gpu_context, surface);
-    target_surface.configure(gpu_context, @intCast(width), @intCast(height));
+    var renderer = try Renderer.init(io, allocator, instance.webgpu_instance, surface);
+    defer renderer.deinit(allocator);
 
-    const vertex_buffer = try gpu.createBuffer(
-        gpu_context,
-        std.mem.sliceAsBytes(&vertices),
-        "cube vertices",
-        .{ .vertex = true, .copy_dst = true },
-    );
+    renderer.setSampleCount(4);
+    renderer.configureTarget(@intCast(width), @intCast(height));
 
-    const index_buffer = try gpu.createBuffer(
-        gpu_context,
-        std.mem.sliceAsBytes(&indices),
-        "cube indices",
-        .{ .index = true, .copy_dst = true },
-    );
-
-    const cube_mesh: gpu.Mesh = .{
+    const cube = try renderer.mesh(allocator, .{
+        .streams = &.{.{ .layout = vertex_layout, .data = std.mem.sliceAsBytes(&vertices) }},
+        .indices = &indices,
         .vertex_count = vertices.len,
-        .indices = .{
-            .buffer = index_buffer,
-            .format = .u16,
-            .index_count = indices.len,
-        },
-        .buffers = &.{.of(Vertex, vertex_buffer, .{
-            .position = .f32x3,
-            .uv = .f32x2,
-            .normal = .f32x3,
-        })},
-    };
-
-    const MeshShader = gpu.Shader(Mesh);
-    const ShadowShader = gpu.Shader(Shadow);
-
-    const mesh_shader = try MeshShader.init(allocator, gpu_context);
-    defer mesh_shader.deinit();
-
-    const shadow_shader = try ShadowShader.init(allocator, gpu_context);
-    defer shadow_shader.deinit();
-
-    const world_ub = try MeshShader.Uniform.world.init(gpu_context, .{});
-
-    var cam = Camera{};
-
-    var cam_aspect: f32 = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
-    var cam_proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), cam_aspect, 0.01, 100);
+    });
 
     const checker_tex = gpu.Texture.init(
-        gpu_context,
+        renderer.gpu_context,
         "checker texture",
         2,
         2,
@@ -282,19 +186,15 @@ pub fn run() !void {
     );
     defer checker_tex.deinit();
 
-    const checker_texel = gpu.TexelData{
+    checker_tex.writeTexture(renderer.gpu_context, .{
         .width = 2,
         .height = 2,
         .format = .rgba8_unorm,
         .data = std.mem.asBytes(&checker_pixels),
-    };
-    checker_tex.writeTexture(gpu_context, checker_texel, .{});
-
-    const checker_view = checker_tex.createView(.{ .label = "checker view" });
-    defer c.wgpuTextureViewRelease(checker_view);
+    }, .{});
 
     const white_tex = gpu.Texture.init(
-        gpu_context,
+        renderer.gpu_context,
         "white texture",
         1,
         1,
@@ -305,304 +205,32 @@ pub fn run() !void {
     );
     defer white_tex.deinit();
 
-    white_tex.writeTexture(gpu_context, .{
+    white_tex.writeTexture(renderer.gpu_context, .{
         .width = 1,
         .height = 1,
         .format = .rgba8_unorm,
         .data = std.mem.asBytes(&simple_pixel),
     }, .{});
 
-    const white_view = white_tex.createView(.{ .label = "white view" });
-    defer c.wgpuTextureViewRelease(white_view);
+    const checker_mat = try renderer.material(allocator, Basic, .{
+        .texture = .{ .tex = checker_tex },
+        .smp = .{},
+    }, .@"opaque"());
 
-    const sampler = gpu.createSampler(gpu_context, .{});
-    defer c.wgpuSamplerRelease(sampler);
+    const white_mat = try renderer.material(allocator, Basic, .{
+        .texture = .{ .tex = white_tex },
+        .smp = .{},
+    }, .@"opaque"());
 
-    const instance_storage = try MeshShader.Storage.instances.initCapacity(gpu_context, 8, .{});
-    defer instance_storage.deinit();
+    const glass_mat = try renderer.material(allocator, Basic, .{
+        .texture = .{ .tex = checker_tex },
+        .smp = .{},
+    }, .transparent());
 
-    const dir_light = DirectionalLight{};
-    const dir_light_ub = try ShadowShader.Uniform.light_vp.init(gpu_context, .{});
-
-    const shadow_map = gpu.Texture.init(
-        gpu_context,
-        "shadow map",
-        @intCast(2048),
-        @intCast(2048),
-        .@"2d",
-        .depth32_float,
-        .{},
-        .{
-            .texture_binding = true,
-            .render_attachment = true,
-        },
-    );
-    defer shadow_map.deinit();
-
-    const shadow_map_view = shadow_map.createView(.{ .label = "shadow view" });
-    defer c.wgpuTextureViewRelease(shadow_map_view);
-
-    const shadow_smp = gpu.createSampler(
-        gpu_context,
-        .{
-            .compare = .less_equal,
-            .min_filter = .linear,
-            .mag_filter = .linear,
-        },
-    );
-
-    const frame_bg = try mesh_shader.createBindGroup(
-        0,
-        allocator,
-        gpu_context,
-        .{
-            .world = world_ub.binding(),
-            .shadow_map = shadow_map_view,
-            .shadow_smp = shadow_smp,
-        },
-    );
-    defer c.wgpuBindGroupRelease(frame_bg);
-
-    // Two materials sharing render_pipeline: the sort has to group by pipeline
-    // first, then by material bind group within it.
-    const checker_bg = try mesh_shader.createBindGroup(
-        1,
-        allocator,
-        gpu_context,
-        .{
-            .texture = checker_view,
-            .smp = sampler,
-        },
-    );
-    defer c.wgpuBindGroupRelease(checker_bg);
-
-    const white_bg = try mesh_shader.createBindGroup(
-        1,
-        allocator,
-        gpu_context,
-        .{
-            .texture = white_view,
-            .smp = sampler,
-        },
-    );
-    defer c.wgpuBindGroupRelease(white_bg);
-
-    const instances_bg = try mesh_shader.createBindGroup(
-        2,
-        allocator,
-        gpu_context,
-        .{
-            .instances = instance_storage.binding(),
-        },
-    );
-    defer c.wgpuBindGroupRelease(instances_bg);
-
-    const light_bg = try shadow_shader.createBindGroup(
-        0,
-        allocator,
-        gpu_context,
-        .{
-            .light_vp = dir_light_ub.binding(),
-            .instances = instance_storage.binding(),
-        },
-    );
-    defer c.wgpuBindGroupRelease(light_bg);
-
-    const shadow_pipeline = try gpu.createPipelineFromMesh(
-        allocator,
-        gpu_context,
-        shadow_shader,
-        cube_mesh,
-        &.{},
-        .{
-            .label = "shadow",
-            .depth_stencil_state = .{},
-            .depth_format = .depth32_float,
-        },
-    );
-    defer c.wgpuRenderPipelineRelease(shadow_pipeline);
-
-    const render_pipeline = try gpu.createPipelineFromMesh(
-        allocator,
-        gpu_context,
-        mesh_shader,
-        cube_mesh,
-        &.{},
-        .{
-            .label = "mesh",
-            .color_format = target_surface.format,
-            .depth_stencil_state = .{},
-            .depth_format = .depth32_float,
-            .fragment_entry = "fs",
-            .sample_count = 4,
-        },
-    );
-    defer c.wgpuRenderPipelineRelease(render_pipeline);
-
-    const transparent_pipeline = try gpu.createPipelineFromMesh(
-        allocator,
-        gpu_context,
-        mesh_shader,
-        cube_mesh,
-        &.{},
-        .{
-            .label = "transparent",
-            .color_format = target_surface.format,
-            .depth_stencil_state = .{
-                .depth_write_enabled = false,
-            },
-            .depth_format = .depth32_float,
-            .fragment_entry = "fs",
-            .sample_count = 4,
-            .blend = .{
-                .color = .{
-                    .operation = .add,
-                    .src_factor = .src_alpha,
-                    .dst_factor = .one_minus_src_alpha,
-                },
-                .alpha = .{
-                    .operation = .add,
-                    .src_factor = .one,
-                    .dst_factor = .one_minus_src_alpha,
-                },
-            },
-        },
-    );
-    defer c.wgpuRenderPipelineRelease(transparent_pipeline);
-
-    var depth_texture = gpu.Texture.init(
-        gpu_context,
-        "depth texture",
-        @intCast(width),
-        @intCast(height),
-        .@"2d",
-        .depth32_float,
-        .{ .sample_count = 4 },
-        .{
-            .render_attachment = true,
-        },
-    );
-    defer depth_texture.deinit();
-
-    var depth_view = depth_texture.createView(.{ .label = "depth view" });
-    defer c.wgpuTextureViewRelease(depth_view);
-
-    var msaa_texture = gpu.Texture.init(
-        gpu_context,
-        "msaa texture",
-        @intCast(width),
-        @intCast(height),
-        .@"2d",
-        target_surface.format,
-        .{ .sample_count = 4 },
-        .{
-            .render_attachment = true,
-        },
-    );
-    defer msaa_texture.deinit();
-
-    var msaa_view = msaa_texture.createView(.{ .label = "msaa view" });
-    defer c.wgpuTextureViewRelease(msaa_view);
-
-    dir_light_ub.upload(gpu_context, dir_light.getVPMatrix().toArray());
-
-    var draw_cmds: std.ArrayList(DrawCmd) = .empty;
-    defer draw_cmds.deinit(allocator);
-
-    var flat_instances: std.ArrayList(Mesh.Instance) = .empty;
-    defer flat_instances.deinit(allocator);
-
-    var batches: std.ArrayList(Batch) = .empty;
-    defer batches.deinit(allocator);
+    var cam: r.Camera = .{ .pos = .init(0, 1, 5) };
 
     var running = true;
-    while (running) {
-        draw_cmds.clearRetainingCapacity();
-
-        try draw_cmds.append(
-            allocator,
-            .{
-                .transparent = false,
-                .pipeline = @intFromPtr(render_pipeline),
-                .material = @intFromPtr(checker_bg),
-                .mesh = @intFromPtr(&cube_mesh),
-                .instance = .{
-                    .model = (CubeInstance{ .pos = .init(2, 0, 0), .rot = std.math.degreesToRadians(30) }).modelMatrix().toArray(),
-                    .tint = l.Vec4(f32).init(0, 0, 1, 1).toArray(),
-                },
-            },
-        );
-
-        try draw_cmds.append(
-            allocator,
-            .{
-                .transparent = false,
-                .pipeline = @intFromPtr(render_pipeline),
-                .material = @intFromPtr(white_bg),
-                .mesh = @intFromPtr(&cube_mesh),
-                .instance = .{
-                    .model = (CubeInstance{ .pos = .init(4, 0, 0), .rot = std.math.degreesToRadians(45) }).modelMatrix().toArray(),
-                    .tint = l.Vec4(f32).init(1, 0.5, 0, 1).toArray(),
-                },
-            },
-        );
-
-        try draw_cmds.append(
-            allocator,
-            .{
-                .transparent = true,
-                .pipeline = @intFromPtr(transparent_pipeline),
-                .material = @intFromPtr(checker_bg),
-                .mesh = @intFromPtr(&cube_mesh),
-                .instance = .{
-                    .model = (CubeInstance{ .pos = .init(0, 0, 0), .rot = std.math.degreesToRadians(15) }).modelMatrix().toArray(),
-                    .tint = l.Vec4(f32).init(0, 1, 0, 0.3).toArray(),
-                },
-            },
-        );
-
-        try draw_cmds.append(
-            allocator,
-            .{
-                .transparent = false,
-                .pipeline = @intFromPtr(render_pipeline),
-                .material = @intFromPtr(checker_bg),
-                .mesh = @intFromPtr(&cube_mesh),
-                .instance = .{
-                    .model = (CubeInstance{ .pos = .init(0, -1, 0), .scale = .init(8, 1, 8) }).modelMatrix().toArray(),
-                    .tint = l.Vec4(f32).init(1, 1, 1, 1).toArray(),
-                },
-            },
-        );
-
-        try draw_cmds.append(
-            allocator,
-            .{
-                .transparent = false,
-                .pipeline = @intFromPtr(render_pipeline),
-                .material = @intFromPtr(white_bg),
-                .mesh = @intFromPtr(&cube_mesh),
-                .instance = .{
-                    .model = (CubeInstance{ .pos = .init(-4, 0, 0), .rot = std.math.degreesToRadians(60) }).modelMatrix().toArray(),
-                    .tint = l.Vec4(f32).init(0.6, 0, 1, 1).toArray(),
-                },
-            },
-        );
-
-        try draw_cmds.append(
-            allocator,
-            .{
-                .transparent = true,
-                .pipeline = @intFromPtr(transparent_pipeline),
-                .material = @intFromPtr(checker_bg),
-                .mesh = @intFromPtr(&cube_mesh),
-                .instance = .{
-                    .model = (CubeInstance{ .pos = .init(-2, 0, 0), .rot = 0 }).modelMatrix().toArray(),
-                    .tint = l.Vec4(f32).init(1, 0, 0, 0.3).toArray(),
-                },
-            },
-        );
-
+    while (running) : (gpu.waitForNextFrame()) {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -613,8 +241,8 @@ pub fn run() !void {
                     }
                 },
                 c.SDL_EVENT_MOUSE_MOTION => {
-                    cam.rot.y += event.motion.xrel * 0.001;
-                    cam.rot.x += event.motion.yrel * 0.001;
+                    cam.yaw += event.motion.xrel * 0.001;
+                    cam.pitch += event.motion.yrel * 0.001;
                 },
                 else => {},
             }
@@ -628,11 +256,9 @@ pub fn run() !void {
             cam.pos = cam.pos.add(cam.forward().scale(-cam_speed));
         }
         if (active_keys[c.SDL_SCANCODE_D]) {
-            const right = cam.forward().cross(.up()).normalize().scale(cam_speed);
-            cam.pos = cam.pos.add(right);
+            cam.pos = cam.pos.add(cam.right().scale(cam_speed));
         } else if (active_keys[c.SDL_SCANCODE_A]) {
-            const left = cam.forward().cross(.up()).normalize().scale(-cam_speed);
-            cam.pos = cam.pos.add(left);
+            cam.pos = cam.pos.add(cam.right().scale(-cam_speed));
         }
         if (active_keys[c.SDL_SCANCODE_E]) {
             cam.pos = cam.pos.add(l.Vec3(f32).up().scale(cam_speed));
@@ -647,144 +273,55 @@ pub fn run() !void {
         if (cur_width != width or cur_height != height) {
             width = cur_width;
             height = cur_height;
-            target_surface.configure(gpu_context, @intCast(width), @intCast(height));
-
-            c.wgpuTextureViewRelease(depth_view);
-            depth_texture.deinit();
-
-            depth_texture = gpu.Texture.init(
-                gpu_context,
-                "depth texture",
-                @intCast(width),
-                @intCast(height),
-                .@"2d",
-                .depth32_float,
-                .{ .sample_count = 4 },
-                .{
-                    .render_attachment = true,
-                },
-            );
-            depth_view = depth_texture.createView(.{ .label = "depth view" });
-
-            c.wgpuTextureViewRelease(msaa_view);
-            msaa_texture.deinit();
-
-            msaa_texture = gpu.Texture.init(
-                gpu_context,
-                "msaa texture",
-                @intCast(width),
-                @intCast(height),
-                .@"2d",
-                target_surface.format,
-                .{ .sample_count = 4 },
-                .{
-                    .render_attachment = true,
-                },
-            );
-            msaa_view = msaa_texture.createView(.{ .label = "msaa view" });
-
-            cam_aspect = @as(f32, @floatFromInt(width)) / @as(f32, @floatFromInt(height));
-            cam_proj = l.Mat4x4(f32).perspective(std.math.degreesToRadians(90), cam_aspect, 0.01, 100);
+            renderer.configureTarget(@intCast(width), @intCast(height));
         }
 
-        const view_proj = cam_proj.mul(cam.getViewMatrix());
-        world_ub.upload(gpu_context, .{
-            .vp_matrix = view_proj.toArray(),
-            .light_vp = dir_light.getVPMatrix().toArray(),
-            .light_pos = dir_light.pos.toArray(),
-            .ambient = dir_light.ambient,
+        var frame = renderer.beginFrame() catch {
+            renderer.configureTarget(@intCast(width), @intCast(height));
+            continue;
+        };
+        defer frame.deinit();
+
+        var main_pass = try frame.pass(allocator, .{
+            .label = "main",
+            .color_attachment = .{
+                .target = .surface,
+                .clear_value = .{ .r = 0.05, .g = 0.06, .b = 0.09 },
+            },
+            .depth_stencil_attachment = .{ .target = .surface_depth },
+        });
+        try main_pass.setCamera(allocator, cam);
+
+        try main_pass.draw(cube, checker_mat, allocator, .{
+            .position = .{ 0, -1, 0 },
+            .scale = .{ 8, 1, 8 },
+            .tint = .{ 1, 1, 1, 1 },
+        });
+        try main_pass.draw(cube, checker_mat, allocator, .{
+            .position = .{ 2, 0, 0 },
+            .rotation = .{ 0, std.math.degreesToRadians(30), 0 },
+            .tint = .{ 0, 0, 1, 1 },
+        });
+        try main_pass.draw(cube, white_mat, allocator, .{
+            .position = .{ 4, 0, 0 },
+            .rotation = .{ 0, std.math.degreesToRadians(45), 0 },
+            .tint = .{ 1, 0.5, 0, 1 },
+        });
+        try main_pass.draw(cube, white_mat, allocator, .{
+            .position = .{ -4, 0, 0 },
+            .rotation = .{ 0, std.math.degreesToRadians(60), 0 },
+            .tint = .{ 0.6, 0, 1, 1 },
+        });
+        try main_pass.draw(cube, glass_mat, allocator, .{
+            .position = .{ 0, 0, 0 },
+            .rotation = .{ 0, std.math.degreesToRadians(15), 0 },
+            .tint = .{ 0, 1, 0, 0.3 },
+        });
+        try main_pass.draw(cube, glass_mat, allocator, .{
+            .position = .{ -2, 0, 0 },
+            .tint = .{ 1, 0, 0, 0.3 },
         });
 
-        for (draw_cmds.items) |*cmd| {
-            const pos = l.Vec3(f32).init(cmd.instance.model[3][0], cmd.instance.model[3][1], cmd.instance.model[3][2]);
-            cmd.depth = pos.sub(cam.pos).dot(cam.forward());
-        }
-
-        std.mem.sort(DrawCmd, draw_cmds.items, {}, DrawCmd.lessThan);
-
-        flat_instances.clearRetainingCapacity();
-        batches.clearRetainingCapacity();
-        for (draw_cmds.items) |cmd| {
-            const extends = batches.items.len > 0 and blk: {
-                const b = batches.items[batches.items.len - 1];
-                break :blk b.transparent == cmd.transparent and
-                    b.pipeline == cmd.pipeline and
-                    b.material == cmd.material and
-                    b.mesh == cmd.mesh;
-            };
-            if (extends) {
-                batches.items[batches.items.len - 1].count += 1;
-            } else {
-                try batches.append(allocator, .{
-                    .transparent = cmd.transparent,
-                    .pipeline = cmd.pipeline,
-                    .material = cmd.material,
-                    .mesh = cmd.mesh,
-                    .first = @intCast(flat_instances.items.len),
-                    .count = 1,
-                });
-            }
-            try flat_instances.append(allocator, cmd.instance);
-        }
-
-        try instance_storage.upload(gpu_context, flat_instances.items);
-
-        const encoder = gpu_context.getEncoder();
-        defer c.wgpuCommandEncoderRelease(encoder);
-
-        const color_view = try target_surface.getCurrentView();
-        defer c.wgpuTextureViewRelease(color_view);
-
-        const shadow_pass = gpu.RenderPass.init(encoder, .{
-            .depth_stencil_attachment = .{
-                .view = shadow_map_view,
-            },
-        });
-        for (batches.items) |batch| {
-            if (batch.transparent) break;
-            shadow_pass.draw(.{
-                .bind_groups = &.{.{ .group = 0, .bind_group = light_bg }},
-                .mesh = @as(*const gpu.Mesh, @ptrFromInt(batch.mesh)).*,
-                .pipeline = shadow_pipeline,
-                .instances = .initCount(batch.first, batch.count),
-            });
-        }
-        shadow_pass.end();
-
-        const rp = gpu.RenderPass.init(
-            encoder,
-            .{
-                .color_attachment = .{
-                    .clear_value = .{ .r = 0.05, .g = 0.06, .b = 0.09 },
-                    .view = msaa_view,
-                    .resolve_target = color_view,
-                    .store_op = .discard,
-                },
-                .depth_stencil_attachment = .{
-                    .view = depth_view,
-                },
-            },
-        );
-        for (batches.items) |batch| {
-            rp.draw(.{
-                .bind_groups = &.{
-                    .{ .group = 0, .bind_group = frame_bg },
-                    .{ .group = 1, .bind_group = @ptrFromInt(batch.material) },
-                    .{ .group = 2, .bind_group = instances_bg },
-                },
-                .mesh = @as(*const gpu.Mesh, @ptrFromInt(batch.mesh)).*,
-                .pipeline = @ptrFromInt(batch.pipeline),
-                .instances = .initCount(batch.first, batch.count),
-            });
-        }
-        rp.end();
-
-        const buffer = gpu.finishEncoder(encoder);
-
-        gpu_context.submitCommands(&.{buffer});
-
-        try target_surface.present();
-
-        gpu.waitForNextFrame();
+        try frame.submit(allocator);
     }
 }

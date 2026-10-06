@@ -399,9 +399,9 @@ pub fn writeBuffer(
     ctx: GPUContext,
     buffer: c.WGPUBuffer,
     offset: u32,
-    data: anytype,
+    data: []const u8,
 ) void {
-    c.wgpuQueueWriteBuffer(ctx.queue, buffer, offset, std.mem.asBytes(data), @sizeOf(@TypeOf(data)));
+    c.wgpuQueueWriteBuffer(ctx.queue, buffer, offset, data.ptr, data.len);
 }
 
 pub const PresentMode = enum(c.WGPUPresentMode) {
@@ -803,7 +803,7 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
                     intermediary[i] = @as(f32, @floatFromInt(std.mem.readInt(u8, data[i..][0..1], .little))) / 255.0;
                 }
             },
-            .inorm8, .inorm8x2, .inorm8x4 => {
+            .snorm8, .snorm8x2, .snorm8x4 => {
                 for (0..self.byteSize()) |i| {
                     intermediary[i] = @max(-1.0, @as(f32, @floatFromInt(std.mem.readInt(i8, data[i..][0..1], .little))) / 127.0);
                 }
@@ -838,7 +838,7 @@ pub const VertexFormat = enum(c.WGPUVertexFormat) {
                     std.mem.writeInt(u8, destination[i..][0..1], @intFromFloat(@round(std.math.clamp(data[i], 0.0, 1.0) * 255.0)), .little);
                 }
             },
-            .inorm8, .inorm8x2, .inorm8x4 => {
+            .snorm8, .snorm8x2, .snorm8x4 => {
                 for (0..self.componentCount()) |i| {
                     std.mem.writeInt(i8, destination[i..][0..1], @intFromFloat(@round(std.math.clamp(data[i], -1.0, 1.0) * 127.0)), .little);
                 }

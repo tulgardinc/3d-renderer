@@ -63,6 +63,20 @@ pub const default_layout: []const StreamLayout = &.{
     },
 };
 
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn pluginsType(S: type) ?type {
+    if (S.Uniforms.len == 0) return null;
+    const group = S.Uniforms[0] orelse return null;
+    for (group) |u| {
+        if (std.mem.eql(u8, u.name, "plugins")) return u.Type;
+    }
+    return null;
+}
+
 pub fn nameHash(comptime name: []const u8) u64 {
     return comptime std.hash.Fnv1a_64.hash(name);
 }
@@ -304,10 +318,10 @@ pub fn Renderer(config: RendererConfig) type {
                     var free_slot = &self.mesh_table.items[free_index];
                     self.mesh_table_next_free = free_slot.data.next_free;
                     free_slot.data = .{ .location = location };
-                    return .{ .gen = free_slot.gen, .index = free_index };
+                    return .{ .gen = free_slot.gen, .index = @intCast(free_index) };
                 }
                 try self.mesh_table.append(allocator, .{ .gen = 0, .data = .{ .location = location } });
-                return .{ .gen = 0, .index = self.mesh_table.items.len - 1 };
+                return .{ .gen = 0, .index = @intCast(self.mesh_table.items.len - 1) };
             }
 
             pub fn append(self: *@This(), allocator: std.mem.Allocator, mesh_data: MeshData) !MeshID {
@@ -315,8 +329,8 @@ pub fn Renderer(config: RendererConfig) type {
 
                 if (self.pages.items.len == 0) {
                     var new_page: Page = undefined;
-                    inline for (config.geometry_pool.layouts, 0..) |l, i| {
-                        new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.stride * config.geometry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
+                    inline for (config.geometry_pool.layouts, 0..) |layout, i| {
+                        new_page.data[i] = try gpu.createBuffer(self.gpu_context, layout.stride * config.geometry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
                     }
                     new_page.size = 0;
                     try self.pages.append(allocator, new_page);
@@ -327,8 +341,8 @@ pub fn Renderer(config: RendererConfig) type {
 
                 if (mesh_data.indices) |ind| {
                     if (self.index_chunks.items.len == 0) {
-                        const new_buffer = gpu.createBuffer(self.gpu_context, config.geometry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
-                        try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = ind.len });
+                        const new_buffer = try gpu.createBuffer(self.gpu_context, config.geometry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
+                        try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = 0 });
                     }
 
                     var index_chunk = &self.index_chunks.items[self.index_chunks.items.len - 1];
@@ -337,18 +351,18 @@ pub fn Renderer(config: RendererConfig) type {
                         gpu.writeBuffer(self.gpu_context, index_chunk.buffer, index_chunk.size * @sizeOf(u32), std.mem.sliceAsBytes(ind));
                         mesh_location.indices = .{
                             .base_index = index_chunk.size,
-                            .chunk_index = self.index_chunks.items.len - 1,
-                            .index_count = ind.len,
+                            .chunk_index = @intCast(self.index_chunks.items.len - 1),
+                            .index_count = @intCast(ind.len),
                         };
-                        index_chunk.size += ind.len;
+                        index_chunk.size += @intCast(ind.len);
                     } else {
-                        const new_buffer = gpu.createBuffer(self.gpu_context, config.geometry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
+                        const new_buffer = try gpu.createBuffer(self.gpu_context, config.geometry_pool.index_chunk_capacity * @sizeOf(u32), .{ .index = true, .copy_dst = true }, .{ .label = "index buffer" });
                         gpu.writeBuffer(self.gpu_context, new_buffer, 0, std.mem.sliceAsBytes(ind));
-                        try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = ind.len });
+                        try self.index_chunks.append(allocator, .{ .buffer = new_buffer, .size = @intCast(ind.len) });
                         mesh_location.indices = .{
                             .base_index = 0,
-                            .chunk_index = self.index_chunks.items.len - 1,
-                            .index_count = ind.len,
+                            .chunk_index = @intCast(self.index_chunks.items.len - 1),
+                            .index_count = @intCast(ind.len),
                         };
                     }
                 } else {
@@ -359,12 +373,12 @@ pub fn Renderer(config: RendererConfig) type {
                 const page_remaining_capacity = config.geometry_pool.page_capacity - last_page.size;
                 if (page_remaining_capacity >= mesh_data.vertex_count) {
                     // append to page
-                    inline for (config.geometry_pool.layouts, 0..) |l, i| {
-                        gpu.writeBuffer(self.gpu_context, last_page.data[i], last_page.size * l.stride, mesh_data.streams[i].data);
+                    inline for (config.geometry_pool.layouts, 0..) |layout, i| {
+                        gpu.writeBuffer(self.gpu_context, last_page.data[i], last_page.size * layout.stride, mesh_data.streams[i].data);
                     }
 
                     mesh_location.base_vertex = last_page.size;
-                    mesh_location.page_index = self.pages.items.len - 1;
+                    mesh_location.page_index = @intCast(self.pages.items.len - 1);
                     mesh_location.vertex_count = mesh_data.vertex_count;
 
                     last_page.size += mesh_data.vertex_count;
@@ -373,21 +387,21 @@ pub fn Renderer(config: RendererConfig) type {
                 }
                 // new page
                 var new_page: Page = undefined;
-                inline for (config.geometry_pool.layouts, 0..) |l, i| {
-                    new_page.data[i] = try gpu.createBuffer(self.gpu_context, l.stride * config.geometry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
+                inline for (config.geometry_pool.layouts, 0..) |layout, i| {
+                    new_page.data[i] = try gpu.createBuffer(self.gpu_context, layout.stride * config.geometry_pool.page_capacity, .{ .vertex = true, .copy_dst = true }, .{ .label = "vertex buffer" });
                     gpu.writeBuffer(self.gpu_context, new_page.data[i], 0, mesh_data.streams[i].data);
                 }
                 new_page.size = mesh_data.vertex_count;
                 try self.pages.append(allocator, new_page);
 
                 mesh_location.base_vertex = 0;
-                mesh_location.page_index = self.pages.items.len - 1;
+                mesh_location.page_index = @intCast(self.pages.items.len - 1);
                 mesh_location.vertex_count = mesh_data.vertex_count;
 
                 return try self.meshTableAppend(allocator, mesh_location);
             }
 
-            pub fn get(self: @This(), mesh_id: MeshID) ?MeshRecord {
+            pub fn get(self: @This(), mesh_id: MeshID) ?MeshLocation {
                 const slot = self.mesh_table.items[@intCast(mesh_id.index)];
                 if (slot.gen != mesh_id.gen) return null;
                 return slot.data.location;
@@ -483,12 +497,12 @@ pub fn Renderer(config: RendererConfig) type {
             return @enumFromInt(self.modules.items.len - 1);
         }
 
-        pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type, vertex_entry: []const u8, fragment_entry: []const u8) !ShaderProgramID {
+        pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type, vertex_entry: []const u8, fragment_entry: ?[]const u8) !ShaderProgramID {
             const module_id = try self.getOrCreateModule(allocator, S);
             for (self.shaders.items, 0..) |s, i| {
                 if (s.module_id == module_id and
                     std.mem.eql(u8, s.vertex_entry, vertex_entry) and
-                    std.mem.eql(u8, s.fragment_entry, fragment_entry))
+                    optionalStringEql(s.fragment_entry, fragment_entry))
                 {
                     return @enumFromInt(i);
                 }
@@ -559,7 +573,7 @@ pub fn Renderer(config: RendererConfig) type {
         }
 
         pub fn init(io: std.Io, allocator: std.mem.Allocator, instance: c.WGPUInstance, surface: c.WGPUSurface) !Self {
-            const gpu_context = try gpu.GPUContext.initSync(io, instance.webgpu_instance, surface);
+            const gpu_context = try gpu.GPUContext.initSync(io, instance, surface);
             const world_uniforms_gpu = try gpu.createBuffer(
                 gpu_context,
                 world_uniforms_gpu_initial_capacity,
@@ -764,10 +778,10 @@ pub fn Renderer(config: RendererConfig) type {
         }
 
         pub fn MaterialParams(Reflected: type) type {
-            const uniforms = Reflected.Uniforms[1];
-            const resources = Reflected.Resources[1];
-            const uniform_count = if (uniforms) |u| u.len orelse 0;
-            const resource_count = if (resources) |r| r.len orelse 0;
+            const uniforms: []const gpu.BindGroupUniformEntryMeta = if (Reflected.Uniforms.len > 1) Reflected.Uniforms[1] orelse &.{} else &.{};
+            const resources: []const gpu.BindGroupResourceEntryMeta = if (Reflected.Resources.len > 1) Reflected.Resources[1] orelse &.{} else &.{};
+            const uniform_count = uniforms.len;
+            const resource_count = resources.len;
             const field_count = uniform_count + resource_count;
             if (field_count == 0) return void;
 
@@ -775,26 +789,22 @@ pub fn Renderer(config: RendererConfig) type {
             var field_types: [field_count]type = undefined;
             var field_attrs: [field_count]std.builtin.Type.StructField.Attributes = undefined;
 
-            inline for (0..uniform_count) |i| {
-                field_names[i] = uniforms[i].name;
-                field_types[i] = uniforms[i].Type;
+            for (uniforms, 0..) |u, i| {
+                field_names[i] = u.name;
+                field_types[i] = u.Type;
                 field_attrs[i] = .{};
             }
 
-            inline for (0..resource_count) |i| {
-                field_names[field_count + i] = resources[i].name;
-                field_types[field_count + i] =
-                    switch (resources[i].resource_type) {
-                        .texture => struct {
-                            tex: gpu.Texture,
-                            view_config: gpu.Texture.ViewConfig = .{},
-                        },
-                        .sampler => gpu.SamplerConfig,
-                        .storage => gpu.BindGroupEntry.BufferEntry,
-                    };
-                field_attrs[uniform_count + i] = switch (resources[i].resource_type) {
+            for (resources, 0..) |res, i| {
+                field_names[uniform_count + i] = res.name;
+                field_types[uniform_count + i] = switch (res.resource_type) {
+                    .texture => MaterialTexture,
+                    .sampler => gpu.SamplerConfig,
+                    .storage => gpu.BindGroupEntry.BufferEntry,
+                };
+                field_attrs[uniform_count + i] = switch (res.resource_type) {
                     .sampler => .{ .default_value_ptr = &gpu.SamplerConfig{} },
-                    else => &.{},
+                    else => .{},
                 };
             }
 
@@ -806,6 +816,11 @@ pub fn Renderer(config: RendererConfig) type {
                 field_attrs[0..field_count],
             );
         }
+
+        pub const MaterialTexture = struct {
+            tex: gpu.Texture,
+            view_config: gpu.Texture.ViewConfig = .{},
+        };
 
         pub const MeshData = struct {
             streams: []const Stream,
@@ -825,28 +840,35 @@ pub fn Renderer(config: RendererConfig) type {
                 std.debug.assert(stream.data.len >= stream.layout.stride * mesh_data.vertex_count);
             }
 
-            var canon_mesh_data: MeshData = undefined;
-            canon_mesh_data.indices = mesh_data.indices;
-            canon_mesh_data.vertex_count = mesh_data.vertex_count;
-            canon_mesh_data.streams = allocator.alloc(MeshData.Stream, canon_layouts.len);
-
-            for (canon_layouts, 0..) |layout, i| {
-                canon_mesh_data.streams[i].layout = layout;
-                canon_mesh_data.streams[i].data = try allocator.alloc(u8, layout.stride * canon_mesh_data.vertex_count);
+            var canon_bytes: [canon_layouts.len][]u8 = undefined;
+            var allocated_count: usize = 0;
+            defer for (canon_bytes[0..allocated_count]) |bytes| allocator.free(bytes);
+            var canon_streams: [canon_layouts.len]MeshData.Stream = undefined;
+            inline for (canon_layouts, 0..) |layout, i| {
+                canon_bytes[i] = try allocator.alloc(u8, layout.stride * mesh_data.vertex_count);
+                allocated_count += 1;
+                canon_streams[i] = .{ .layout = layout, .data = canon_bytes[i] };
             }
+
+            const canon_mesh_data: MeshData = .{
+                .streams = &canon_streams,
+                .indices = mesh_data.indices,
+                .vertex_count = mesh_data.vertex_count,
+            };
 
             var source_info: std.ArrayList(?struct {
                 src_stream_index: usize,
                 src_offset: u32,
                 src_format: gpu.VertexFormat,
             }) = .empty;
+            defer source_info.deinit(allocator);
 
             inline for (canon_layouts) |can_layout| {
                 for (can_layout.attributes) |can_attr| {
                     var missing = true;
                     for (mesh_data.streams, 0..) |src_stream, i| {
                         for (src_stream.layout.attributes) |src_attr| {
-                            if (std.mem.eql(u8, can_attr.name, src_attr)) {
+                            if (std.mem.eql(u8, can_attr.name, src_attr.name)) {
                                 std.debug.assert(missing);
                                 missing = false;
                                 try source_info.append(allocator, .{
@@ -859,33 +881,32 @@ pub fn Renderer(config: RendererConfig) type {
                     }
                     if (missing) {
                         std.debug.panic("No defaults in the current version", .{});
-                        try source_info.append(allocator, null);
                     }
                 }
             }
 
-            var info_index = 0;
-            inline for (canon_layouts, 0..) |_, i| {
-                var can_stream = &canon_mesh_data.streams[i];
-                for (can_stream.layout.attributes) |can_attr| {
-                    const src_attr_info = source_info.items[info_index];
-                    const should_transform = src_attr_info.format != can_attr.format;
-                    var src_base = 0;
-                    var can_base = 0;
+            var info_index: usize = 0;
+            inline for (canon_layouts, 0..) |can_layout, i| {
+                const can_bytes = canon_bytes[i];
+                for (can_layout.attributes) |can_attr| {
+                    const src_attr_info = source_info.items[info_index].?;
+                    const should_transform = src_attr_info.src_format != can_attr.format;
+                    var src_base: usize = 0;
+                    var can_base: usize = 0;
                     const src_stream = mesh_data.streams[src_attr_info.src_stream_index];
                     const src_stride = src_stream.layout.stride;
-                    const can_stride = can_stream.layout.stride;
-                    const src_attr_size = src_attr_info.src_format.byteSize();
-                    const can_attr_size = can_attr.format.byteSize();
+                    const can_stride = can_layout.stride;
+                    const src_attr_size: usize = @intCast(src_attr_info.src_format.byteSize());
+                    const can_attr_size: usize = @intCast(can_attr.format.byteSize());
                     for (0..mesh_data.vertex_count) |_| {
                         if (should_transform) {
                             can_attr.format.encode(
                                 src_attr_info.src_format.decode(src_stream.data[src_base + src_attr_info.src_offset ..][0..src_attr_size]),
-                                can_stream.data[can_base + can_attr.offset ..][0..can_attr_size],
+                                can_bytes[can_base + can_attr.offset ..][0..can_attr_size],
                             );
                         } else {
                             @memcpy(
-                                can_stream.data[can_base + can_attr.offset ..][0..can_attr_size],
+                                can_bytes[can_base + can_attr.offset ..][0..can_attr_size],
                                 src_stream.data[src_base + src_attr_info.src_offset ..][0..src_attr_size],
                             );
                         }
@@ -901,25 +922,23 @@ pub fn Renderer(config: RendererConfig) type {
 
         pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), render_state: gpu.MaterialRenderState) !Material(Reflected) {
             const Shader = gpu.Shader(Reflected);
-            const shader_id = try self.getOrCreateShader(allocator, Shader, "vs_main", "fs_main");
+            const shader_id = try self.getOrCreateShader(allocator, Reflected, "vs_main", "fs_main");
             const render_state_id = try self.getOrCreateRenderState(allocator, render_state);
-            const resources: Shader.Resources(1) = undefined;
+            var resources: Shader.Resources(1) = undefined;
             const uniform_count = if (Reflected.Uniforms[1]) |bg| bg.len else 0;
             // TODO: no need for one buffer per binding
-            var uniforms = try allocator.alloc(c.WGPUBuffer, uniform_count);
+            var uniforms = try allocator.alloc(gpu.BindGroupEntry.BufferEntry, uniform_count);
             if (Reflected.Uniforms[1]) |elements| {
                 inline for (elements, 0..) |el, i| {
                     const data = @field(params, el.name);
                     const size = @sizeOf(@TypeOf(data));
                     const buffer = try gpu.createBuffer(
                         self.gpu_context,
-                        .{
-                            .label = el.name,
-                            .size = size,
-                            .usage = .{ .copy_dst = true, .uniform = true },
-                        },
+                        size,
+                        .{ .copy_dst = true, .uniform = true },
+                        .{ .label = el.name },
                     );
-                    gpu.writeBuffer(self.gpu_context, buffer, 0, data);
+                    gpu.writeBuffer(self.gpu_context, buffer, 0, std.mem.asBytes(&data));
                     const buffer_entry = gpu.BindGroupEntry.BufferEntry{ .buffer = buffer, .size = size };
                     @field(resources, el.name) = buffer_entry;
                     uniforms[i] = buffer_entry;
@@ -929,8 +948,8 @@ pub fn Renderer(config: RendererConfig) type {
                 inline for (elements) |el| {
                     const data = @field(params, el.name);
                     switch (el.resource_type) {
-                        .texture => @field(resources, el.name) = data.tex.createView(data.config),
-                        .smp => @field(resources, el.name) = gpu.createSampler(self.gpu_context, data),
+                        .texture => @field(resources, el.name) = data.tex.createView(data.view_config),
+                        .sampler => @field(resources, el.name) = gpu.createSampler(self.gpu_context, data),
                         .storage => @field(resources, el.name) = data,
                     }
                 }
@@ -959,8 +978,8 @@ pub fn Renderer(config: RendererConfig) type {
             try self.materials.append(allocator, material_record);
             const material_id = self.materials.items.len - 1;
             return .{
-                .material_id = @intFromEnum(material_id),
-                .shader_program_id = @intFromEnum(shader_id),
+                .material_id = @enumFromInt(material_id),
+                .shader_program_id = shader_id,
             };
         }
 
@@ -1036,8 +1055,8 @@ pub fn Renderer(config: RendererConfig) type {
                 if (a.transparent != b.transparent) return !a.transparent;
                 if (a.transparent) return a.depth > b.depth;
                 if (a.pipeline != b.pipeline) return @as(usize, @intFromPtr(a.pipeline)) < @as(usize, @intFromPtr(b.pipeline));
-                if (a.material_id != b.material_id) return a.material_id < b.material_id;
-                if (a.mesh_id != b.mesh_id) return a.mesh_id < b.mesh_id;
+                if (a.material_id != b.material_id) return @intFromEnum(a.material_id) < @intFromEnum(b.material_id);
+                if (a.mesh_id != b.mesh_id) return @as(u32, @bitCast(a.mesh_id)) < @as(u32, @bitCast(b.mesh_id));
                 if (a.world_offset != b.world_offset) return a.world_offset < b.world_offset;
                 return (a.block_offset orelse 0) < (b.block_offset orelse 0);
             }
@@ -1089,7 +1108,7 @@ pub fn Renderer(config: RendererConfig) type {
                     try self.renderer.growWorldUniformsGpu(allocator, @intCast(self.renderer.world_uniforms_cpu.items.len));
                 }
                 gpu.writeBuffer(self.renderer.gpu_context, self.renderer.world_uniforms_gpu, 0, self.renderer.world_uniforms_cpu.items);
-                std.mem.sort(DrawCmd, self.renderer.draw_commands, {}, DrawCmd.lessThan);
+                std.mem.sort(DrawCmd, self.renderer.draw_commands.items, {}, DrawCmd.lessThan);
                 var active_batch: *DrawBatch = undefined;
                 for (self.renderer.draw_commands.items) |cmd| {
                     if (self.renderer.draw_batches.items.len == 0 or
@@ -1100,10 +1119,11 @@ pub fn Renderer(config: RendererConfig) type {
                         active_batch.world_offset != cmd.world_offset or
                         active_batch.block_offset != cmd.block_offset)
                     {
-                        const first_instance = std.math.divCeil(u32, self.renderer.sorted_instances_cpu.items.len, cmd.instance_size);
+                        const first_instance = try std.math.divCeil(u32, @intCast(self.renderer.sorted_instances_cpu.items.len), cmd.instance_size);
                         try self.renderer.draw_batches.append(allocator, .{
                             .first_instance = first_instance,
                             .instance_count = 0,
+                            .pipeline = cmd.pipeline,
                             .material_id = cmd.material_id,
                             .mesh_id = cmd.mesh_id,
                             .pass = cmd.pass,
@@ -1117,10 +1137,10 @@ pub fn Renderer(config: RendererConfig) type {
                     active_batch.instance_count += 1;
                     try self.renderer.sorted_instances_cpu.appendSlice(allocator, self.renderer.instances_cpu.items[cmd.instance_offset..][0..cmd.instance_size]);
                 }
-                if (self.renderer.instances_gpu_capacity < self.renderer.instances_cpu.items.len) {
-                    try self.renderer.growInstancesGpu(allocator, @intCast(self.renderer.instances_cpu.items.len));
+                if (self.renderer.instances_gpu_capacity < self.renderer.sorted_instances_cpu.items.len) {
+                    try self.renderer.growInstancesGpu(allocator, @intCast(self.renderer.sorted_instances_cpu.items.len));
                 }
-                gpu.writeBuffer(self.renderer.gpu_context, self.renderer.instances_gpu, 0, self.renderer.instances_cpu.items);
+                gpu.writeBuffer(self.renderer.gpu_context, self.renderer.instances_gpu, 0, self.renderer.sorted_instances_cpu.items);
                 var dynamic_offsets = [2]u32{ 0, 0 };
                 const surface_view = self.surface_texture.createView(.{ .label = "surface view" });
                 defer c.wgpuTextureViewRelease(surface_view);
@@ -1198,7 +1218,7 @@ pub fn Renderer(config: RendererConfig) type {
                         if (batch.block_offset) |bo| dynamic_offsets[1] = bo;
                         c.wgpuRenderPassEncoderSetPipeline(render_pass, batch.pipeline);
                         c.wgpuRenderPassEncoderSetBindGroup(render_pass, 0, module.world_bind_group, if (batch.block_offset == null) 1 else 2, &dynamic_offsets);
-                        c.wgpuRenderPassEncoderSetBindGroup(render_pass, 1, mat.bind_group, null, 0);
+                        c.wgpuRenderPassEncoderSetBindGroup(render_pass, 1, mat.bind_group, 0, null);
                         const location = self.renderer.geometry_pool.get(batch.mesh_id).?;
                         const page = self.renderer.geometry_pool.pages.items[location.page_index];
                         inline for (config.geometry_pool.layouts, 0..) |layout, slot| {
@@ -1224,7 +1244,7 @@ pub fn Renderer(config: RendererConfig) type {
             pub fn deinit(self: *@This()) void {
                 c.wgpuCommandEncoderRelease(self.encoder);
                 self.surface_texture.deinit();
-                self.* = null;
+                self.* = undefined;
             }
         };
 
@@ -1295,9 +1315,9 @@ pub fn Renderer(config: RendererConfig) type {
                 allocator: std.mem.Allocator,
                 params: DrawParams(@TypeOf(mat).InstanceType),
             ) !void {
-                const material_record = self.renderer.materials.items[mat.material_id];
+                const material_record = self.renderer.materials.items[@intFromEnum(mat.material_id)];
                 const module_id = self.renderer.shaders.items[@intFromEnum(material_record.shader_id)].module_id;
-                const render_state = self.renderer.render_states.items[material_record.render_state_id];
+                const render_state = self.renderer.render_states.items[@intFromEnum(material_record.render_state_id)];
                 const pipeline = try self.renderer.getOrCreatePipeline(allocator, .{
                     .pipeline_pass_state = self.renderer.resolvePipelinePassState(self.desc),
                     .shader_program_id = mat.shader_program_id,
@@ -1309,20 +1329,19 @@ pub fn Renderer(config: RendererConfig) type {
                     if (comptime @hasField(@TypeOf(params), "position")) {
                         const world: World = @bitCast(self.renderer.world_uniforms_cpu.items[world_offset..][0..@sizeOf(World)].*);
                         const view_proj: l.Mat4x4(f32) = @bitCast(world.vp_matrix);
-                        break :blk view_proj.mulVec(.init(params.position.x, params.position.y, params.position.z, 1)).z;
+                        break :blk view_proj.mulVec(.init(params.position[0], params.position[1], params.position[2], 1)).z;
                     }
                     break :blk 0;
                 };
-                const block_offset = blk: {
-                    const bindings: []const gpu.BindGroupUniformEntryMeta = mat.Shader.Uniforms[0];
-                    if (bindings[1] == null or !std.mem.eql(u8, bindings[1].name, "plugins")) break :blk null;
-                    if (state.last_module_id != null and state.last_module_id.?.last_id == module_id and state.last_snapshot_index == state.snapshot_index) {
+                const block_offset: ?u32 = blk: {
+                    const Plugins = comptime pluginsType(@TypeOf(mat).Shader) orelse break :blk null;
+                    if (state.last_module_id != null and state.last_module_id.? == module_id and state.last_snapshot_index == state.snapshot_index) {
                         break :blk state.last_block_offset;
                     }
                     if (self.renderer.pass_blocks.get(.{ .module_id = module_id, .snapshot_index = state.snapshot_index })) |block_offset| {
                         break :blk block_offset;
                     }
-                    const block_fields = std.meta.fields(bindings[1].Type);
+                    const block_fields = std.meta.fields(Plugins);
                     var group0_size = 0;
                     inline for (block_fields) |field| {
                         group0_size += @sizeOf(field.type);
@@ -1351,14 +1370,16 @@ pub fn Renderer(config: RendererConfig) type {
                     );
                     break :blk slots.offset;
                 };
-                state.last_block_offset = block_offset;
-                state.last_module_id = @enumFromInt(module_id);
-                state.last_snapshot_index = state.snapshot_index;
+                if (block_offset) |bo| {
+                    state.last_block_offset = bo;
+                    state.last_module_id = module_id;
+                    state.last_snapshot_index = state.snapshot_index;
+                }
                 const InstanceType: type = @TypeOf(mat).InstanceType;
                 try self.renderer.draw_commands.append(allocator, .{
                     .block_offset = block_offset,
                     .pass = self.index,
-                    .world_offset = state.world_offset,
+                    .world_offset = world_offset,
                     .material_id = mat.material_id,
                     .mesh_id = mesh_id,
                     .transparent = render_state.blend_state != null,
@@ -1379,7 +1400,7 @@ pub fn Renderer(config: RendererConfig) type {
                     }
                     @field(instances, field.name) = @field(params, field.name);
                 }
-                try self.renderer.instances_cpu.appendSlice(allocator, std.mem.toBytes(instances));
+                try self.renderer.instances_cpu.appendSlice(allocator, std.mem.asBytes(&instances));
             }
         };
 
@@ -1480,25 +1501,25 @@ pub fn Renderer(config: RendererConfig) type {
             const module = self.modules.items[@intFromEnum(program.module_id)];
             const render_state = self.render_states.items[@intFromEnum(key.render_state_id)];
             var vertex_layouts: [config.geometry_pool.layouts.len]gpu.VertexBufferLayout = undefined;
-            const total_attribute_count = blk: {
+            const total_attribute_count = comptime blk: {
                 var total = 0;
-                inline for (config.geometry_pool.layouts) |l| {
-                    total += l.attributes.len;
+                for (config.geometry_pool.layouts) |layout| {
+                    total += layout.attributes.len;
                 }
                 break :blk total;
             };
             var attributes: [total_attribute_count]gpu.VertexBufferLayout.VertexAttribute = undefined;
-            var attr_index = 0;
-            var match_count = 0;
+            var attr_index: usize = 0;
+            var match_count: usize = 0;
             const vs = blk: {
                 for (module.vs) |vs| {
                     if (std.mem.eql(u8, vs.fn_name, program.vertex_entry)) break :blk vs;
                 }
                 return error.UnknownVertexShaderEntry;
             };
-            for (config.geometry_pool.layouts, 0..) |l, i| {
+            for (config.geometry_pool.layouts, 0..) |layout, i| {
                 const attr_start = attr_index;
-                for (l.attributes) |attr| {
+                for (layout.attributes) |attr| {
                     for (vs.params) |par| {
                         if (std.mem.eql(u8, par.name, attr.name)) {
                             attributes[attr_index] = .{
@@ -1514,7 +1535,7 @@ pub fn Renderer(config: RendererConfig) type {
                 }
                 vertex_layouts[i] = .{
                     .step_mode = .vertex,
-                    .array_stride = l.stride,
+                    .array_stride = layout.stride,
                     .attributes = attributes[attr_start..attr_index],
                 };
             }
