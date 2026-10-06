@@ -150,6 +150,7 @@ pub fn Renderer(config: RendererConfig) type {
         world_uniforms_capacity: u32 = world_uniforms_initial_capacity,
         world_uniforms_mirror: std.ArrayList(u8),
         instances: c.WGPUBuffer,
+        instances_capacity: u32 = instances_initial_capacity,
         instances_layout: c.WGPUBindGroupLayout,
         instances_bind_group: c.WGPUBindGroup,
         material_unfiorms: std.ArrayList(c.WGPUBuffer),
@@ -163,6 +164,7 @@ pub fn Renderer(config: RendererConfig) type {
         pub const ShaderProgramID = enum(u32) { _ };
 
         pub const world_uniforms_initial_capacity: u32 = 256 * config.max_pass_count;
+        pub const instances_initial_capacity: u32 = 524_288;
 
         pub const PassValueEntry = struct {
             name_hash: u64,
@@ -177,15 +179,15 @@ pub fn Renderer(config: RendererConfig) type {
         };
 
         pub const PassBlockKey = struct {
-            snapshot: u32,
-            module: ModuleID,
+            snapshot_index: u32,
+            module_id: ModuleID,
         };
 
         pub const PassState = struct {
-            snapshot: u32,
+            snapshot_index: u32,
             world_offset: ?u32,
-            last_module: ?ModuleID,
-            last_snapshot: u32,
+            last_module_id: ?ModuleID,
+            last_snapshot_index: u32,
             last_block_offset: u32,
         };
 
@@ -382,7 +384,7 @@ pub fn Renderer(config: RendererConfig) type {
         };
 
         pub const MaterialRecord = struct {
-            shaderID: ShaderProgramID,
+            shader_id: ShaderProgramID,
             render_state_id: RenderStateID,
             // bind group 1
             bind_group: c.WGPUBindGroup,
@@ -407,7 +409,7 @@ pub fn Renderer(config: RendererConfig) type {
         };
 
         pub const ShaderProgramRecord = struct {
-            module: ModuleID,
+            module_id: ModuleID,
             vertex_entry: []const u8,
             fragment_entry: ?[]const u8,
         };
@@ -429,6 +431,11 @@ pub fn Renderer(config: RendererConfig) type {
                 };
                 c.wgpuBindGroupLayoutRelease(shader.group_layouts[0]);
                 shader.group_layouts[0] = try gpu.createBindGroupLayout(allocator, self.gpu_context, &world_entries);
+            }
+            if (comptime S.layouts.len > 2 and S.layouts[2] != null) {
+                c.wgpuBindGroupLayoutRelease(shader.group_layouts[2]);
+                c.wgpuBindGroupLayoutAddRef(self.instances_layout);
+                shader.group_layouts[2] = self.instances_layout;
             }
             const pass_uniforms: []const PassUniform = comptime blk: {
                 if (S.Uniforms.len == 0 or S.Uniforms[0] == null) break :blk &.{};
@@ -455,7 +462,7 @@ pub fn Renderer(config: RendererConfig) type {
         pub fn getOrCreateShader(self: *Self, allocator: std.mem.Allocator, S: type, vertex_entry: []const u8, fragment_entry: []const u8) !ShaderProgramID {
             const module_id = try self.getOrCreateModule(allocator, S);
             for (self.shaders.items, 0..) |s, i| {
-                if (s.module == module_id and
+                if (s.module_id == module_id and
                     std.mem.eql(u8, s.vertex_entry, vertex_entry) and
                     std.mem.eql(u8, s.fragment_entry, fragment_entry))
                 {
@@ -463,7 +470,7 @@ pub fn Renderer(config: RendererConfig) type {
                 }
             }
             try self.shaders.append(allocator, .{
-                .module = module_id,
+                .module_id = module_id,
                 .vertex_entry = vertex_entry,
                 .fragment_entry = fragment_entry,
             });
@@ -537,11 +544,11 @@ pub fn Renderer(config: RendererConfig) type {
             );
             const world_instances = try gpu.createBuffer(
                 gpu_context,
-                524_288,
+                instances_initial_capacity,
                 .{ .storage = true, .copy_dst = true },
                 .{ .label = "world instances" },
             );
-            const world_instances_layout = try gpu.createBindGroupLayout(allocator, gpu_context, &.{.{
+            const instances_layout = try gpu.createBindGroupLayout(allocator, gpu_context, &.{.{
                 .binding = 0,
                 .type = .{ .buffer = .{
                     .type = .read_only_storage,
@@ -549,11 +556,11 @@ pub fn Renderer(config: RendererConfig) type {
                     .min_binding_size = 0,
                 } },
             }});
-            const world_instances_bind_group = try gpu.createBindGroup(allocator, gpu_context, .{
-                .layout = world_instances_layout,
+            const instances_bind_group = try gpu.createBindGroup(allocator, gpu_context, .{
+                .layout = instances_layout,
                 .entries = &.{.{
                     .binding = 0,
-                    .resource = .{ .buffer = .{ .buffer = world_instances, .size = 524_288 } },
+                    .resource = .{ .buffer = .{ .buffer = world_instances, .size = instances_initial_capacity } },
                 }},
             });
             var pass_blocks: std.AutoHashMapUnmanaged(PassBlockKey, u32) = .empty;
@@ -586,8 +593,8 @@ pub fn Renderer(config: RendererConfig) type {
                 .world_uniforms = world_uniforms,
                 .world_uniforms_mirror = try .initCapacity(allocator, world_uniforms_initial_capacity),
                 .instances = world_instances,
-                .instances_layout = world_instances_layout,
-                .instances_bind_group = world_instances_bind_group,
+                .instances_layout = instances_layout,
+                .instances_bind_group = instances_bind_group,
             };
         }
 
@@ -843,11 +850,11 @@ pub fn Renderer(config: RendererConfig) type {
             const bind_group = try gpu.ShaderBindGroup(Reflected, 1).create(
                 allocator,
                 self.gpu_context,
-                self.modules.items[@intFromEnum(self.shaders.items[@intFromEnum(shader_id)].module)].group_layouts[1],
+                self.modules.items[@intFromEnum(self.shaders.items[@intFromEnum(shader_id)].module_id)].group_layouts[1],
                 resources,
             );
             const material_record: MaterialRecord = .{
-                .shaderID = shader_id,
+                .shader_id = shader_id,
                 .render_state_id = render_state_id,
                 .bind_group = bind_group,
                 .uniforms = uniforms,
@@ -862,10 +869,12 @@ pub fn Renderer(config: RendererConfig) type {
 
         pub fn Material(S: type) type {
             const IT: type = comptime blk: {
-                for (S.Resources) |group| {
+                for (S.Resources, 0..) |group, group_index| {
                     if (group == null) continue;
                     for (group.?) |r| {
                         if (std.mem.eql(u8, r.name, "instances")) {
+                            if (group_index != 2) @compileError("instances must be declared in group 2");
+                            if (r.binding != 0) @compileError("instances must be declared at binding 0");
                             if (r.resource_type != .storage) @compileError("instances must be defined as a storage array");
                             if (r.resource_type.storage != .array) @compileError("instances must be defined as a storage array");
                             break :blk r.resource_type.storage.array;
@@ -880,8 +889,15 @@ pub fn Renderer(config: RendererConfig) type {
                 for (S.Uniforms, 0..) |group, group_index| {
                     if (group == null) continue;
                     for (group.?) |u| {
+                        if (std.mem.eql(u8, u.name, "plugins")) {
+                            if (group_index != 0) @compileError("plugins must be declared in group 0");
+                            if (u.binding != 1) @compileError("plugins must be declared at binding 1");
+                            if (@typeInfo(u.Type) != .@"struct") @compileError("plugins must be defined as a struct");
+                            continue;
+                        }
                         if (!std.mem.eql(u8, u.name, "world")) continue;
                         if (group_index != 0) @compileError("world must be declared in group 0");
+                        if (u.binding != 0) @compileError("world must be declared at binding 0");
                         if (@typeInfo(u.Type) != .@"struct") @compileError("world must be defined as a struct");
                         if (!@hasField(u.Type, "vp_matrix")) @compileError("world must have a vp_matrix field");
                         if (@FieldType(u.Type, "vp_matrix") != [4][4]f32) @compileError("world.vp_matrix must be defined as mat4x4<f32>");
@@ -889,7 +905,11 @@ pub fn Renderer(config: RendererConfig) type {
                     }
                 }
                 if (S.Resources.len > 0 and S.Resources[0] != null) @compileError("group 0 may only contain uniforms");
+                if (S.Resources[2].?.len != 1 or (S.Uniforms.len > 2 and S.Uniforms[2] != null)) @compileError("group 2 may only contain instances");
                 if (!found_world) @compileError("Shader has no world uniform which is required");
+                for (S.Uniforms[0].?) |u| {
+                    if (!std.mem.eql(u8, u.name, "world") and !std.mem.eql(u8, u.name, "plugins")) @compileError("group 0 may only contain world and plugins");
+                }
             }
 
             return struct {
@@ -909,16 +929,20 @@ pub fn Renderer(config: RendererConfig) type {
             material: MaterialID,
             mesh: MeshID,
             depth: f32 = 0,
+            block_offset: ?u32,
 
             instance_offset: u32,
             instance_size: u32,
 
             pub fn lessThan(_: void, a: DrawCmd, b: DrawCmd) bool {
+                if (a.pass != b.pass) return a.pass < b.pass;
                 if (a.transparent != b.transparent) return !a.transparent;
                 if (a.transparent) return a.depth > b.depth;
                 if (a.pipeline != b.pipeline) return @as(usize, @intFromPtr(a.pipeline)) < @as(usize, @intFromPtr(b.pipeline));
                 if (a.material != b.material) return a.material < b.material;
-                return a.mesh < b.mesh;
+                if (a.mesh != b.mesh) return a.mesh < b.mesh;
+                if (a.world_offset != b.world_offset) return a.world_offset < b.world_offset;
+                return (a.block_offset orelse 0) < (b.block_offset orelse 0);
             }
         };
 
@@ -946,10 +970,10 @@ pub fn Renderer(config: RendererConfig) type {
                     .entry_count = 0,
                 });
                 self.renderer.pass_states[index] = .{
-                    .snapshot = snapshot,
+                    .snapshot_index = snapshot,
                     .world_offset = null,
-                    .last_module = null,
-                    .last_snapshot = snapshot,
+                    .last_module_id = null,
+                    .last_snapshot_index = snapshot,
                     .last_block_offset = 0,
                 };
                 self.passes[index] = descriptor;
@@ -1013,7 +1037,7 @@ pub fn Renderer(config: RendererConfig) type {
                             .first_entry = pass_value_entries_old_size,
                             .entry_coutn = snapshot.entry_count,
                         });
-                        self.renderer.pass_states[self.index].snapshot = self.renderer.pass_snapshots.items.len - 1;
+                        self.renderer.pass_states[self.index].snapshot_index = self.renderer.pass_snapshots.items.len - 1;
                         return;
                     }
                 }
@@ -1027,7 +1051,7 @@ pub fn Renderer(config: RendererConfig) type {
                     .first_entry = pass_value_entries_old_size,
                     .entry_coutn = snapshot.entry_count + 1,
                 });
-                self.renderer.pass_states[self.index].snapshot = self.renderer.pass_snapshots.items.len - 1;
+                self.renderer.pass_states[self.index].snapshot_index = self.renderer.pass_snapshots.items.len - 1;
             }
 
             pub fn draw(
@@ -1038,17 +1062,69 @@ pub fn Renderer(config: RendererConfig) type {
                 params: DrawParams(@TypeOf(mat).InstanceType),
             ) !void {
                 const material_record = self.renderer.materials.items[mat.material_id];
+                const module_id = self.renderer.shaders.items[@intFromEnum(material_record.shader_id)].module_id;
                 const render_state = self.renderer.render_states.items[material_record.render_state_id];
                 const pipeline = try self.renderer.getOrCreatePipeline(allocator, .{
                     .pipeline_pass_state = self.renderer.resolvePipelinePassState(self.desc),
                     .shader_program_id = mat.shader_program_id,
                     .render_state_id = material_record.render_state_id,
                 });
-                const depth = if (comptime @hasField(@TypeOf(params), "position")) params.position[2] else 0;
+                const state = &self.renderer.pass_states[self.index];
+                const world_offset = state.world_offset orelse return error.MissingCamera;
+                const depth = blk: {
+                    if (comptime @hasField(@TypeOf(params), "position")) {
+                        const world: World = @bitCast(self.renderer.world_uniforms_mirror.items[world_offset..][0..@sizeOf(World)].*);
+                        const view_proj: l.Mat4x4(f32) = @bitCast(world.vp_matrix);
+                        break :blk view_proj.mulVec(.init(params.position.x, params.position.y, params.position.z, 1)).z;
+                    }
+                    break :blk 0;
+                };
+                const block_offset = blk: {
+                    const bindings: []const gpu.BindGroupUniformEntryMeta = mat.Shader.Uniforms[0];
+                    if (bindings[1] == null or !std.mem.eql(u8, bindings[1].name, "plugins")) break :blk null;
+                    if (state.last_module_id != null and state.last_module_id.?.last_id == module_id and state.last_snapshot_index == state.snapshot_index) {
+                        break :blk state.last_block_offset;
+                    }
+                    if (self.renderer.pass_blocks.get(.{ .module_id = module_id, .snapshot_index = state.snapshot_index })) |block_offset| {
+                        break :blk block_offset;
+                    }
+                    const block_fields = std.meta.fields(bindings[1].Type);
+                    var group0_size = 0;
+                    inline for (block_fields) |field| {
+                        group0_size += @sizeOf(field.type);
+                    }
+                    const slots = try self.renderer.stageWorldUniforms(allocator, group0_size);
+                    var slot_offset = 0;
+                    const snapshot = self.renderer.pass_snapshots.items[state.snapshot_index];
+                    inline for (block_fields) |field| {
+                        comptime if (std.mem.startsWith(u8, field.name, "pad_")) continue;
+                        var found = false;
+                        for (self.renderer.pass_value_entries.items[snapshot.first_entry..][0..snapshot.entry_count]) |entry| {
+                            if (nameHash(field.name) == entry.name_hash) {
+                                std.debug.assert(layoutFingerprint(field.type) == entry.fingerprint);
+                                @memcpy(slots.bytes[slot_offset..][0..entry.size], self.renderer.pass_values.items[entry.offset..][0..entry.size]);
+                                slot_offset += @sizeOf(field.type);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) return error.MissingBlockValue;
+                    }
+                    try self.renderer.pass_blocks.put(
+                        allocator,
+                        .{ .module_id = module_id, .snapshot_index = state.snapshot_index },
+                        slots.offset,
+                    );
+                    break :blk slots.offset;
+                };
+                state.last_block_offset = block_offset;
+                state.last_module_id = @enumFromInt(module_id);
+                state.last_snapshot_index = state.snapshot_index;
                 const InstanceType: type = @TypeOf(mat).InstanceType;
                 try self.renderer.draw_commands.append(allocator, .{
+                    .block_offset = block_offset,
                     .pass = self.index,
-                    .world_offset = self.world_offset.?,
+                    .world_offset = state.world_offset,
                     .material = mat.material_id,
                     .mesh = mesh_id,
                     .transparent = render_state.blend_state != null,
@@ -1069,7 +1145,7 @@ pub fn Renderer(config: RendererConfig) type {
                     }
                     @field(instances, field.name) = @field(params, field.name);
                 }
-                try self.renderer.instance_buffer.appendSlice(allocator, std.mem.toBytes(&instances));
+                try self.renderer.instance_buffer.appendSlice(allocator, std.mem.toBytes(instances));
             }
         };
 
@@ -1167,7 +1243,7 @@ pub fn Renderer(config: RendererConfig) type {
         pub fn getOrCreatePipeline(self: *Self, allocator: std.mem.Allocator, key: PipelineKey) !c.WGPURenderPipeline {
             if (self.pipelines.get(key)) |pipeline| return pipeline;
             const program = self.shaders.items[@intFromEnum(key.shader_program_id)];
-            const module = self.modules.items[@intFromEnum(program.module)];
+            const module = self.modules.items[@intFromEnum(program.module_id)];
             const render_state = self.render_states.items[@intFromEnum(key.render_state_id)];
             var vertex_layouts: [config.geometry_pool.layouts.len]gpu.VertexBufferLayout = undefined;
             const total_attribute_count = blk: {
