@@ -24,6 +24,7 @@ raw-gpu program: proof of mechanics, not the spec.
 - [[Scaling and Baking]] — why immediate mode holds, the bake escape hatch
 - [[Reflection Pipeline]] — tree-sitter WGSL → generated Zig → `gpu.Shader`
 - [[GPU Layer]] — gpu.zig rules (fixed identity, erased bindings)
+- [[Web Port]] — emdawnwebgpu is API-compatible with in-tree Dawn; build/runtime rules for the browser build
 - [[Helpers]] — everything shipped outside the core
 - [[Open Questions]] — undecided points, tracked
 
