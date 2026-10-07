@@ -162,7 +162,7 @@ pub fn run() !void {
     defer instance.deinit();
     const surface = c.SDL_GetWGPUSurface(instance.webgpu_instance, window);
 
-    var renderer = try Renderer.init(io, allocator, instance.webgpu_instance, surface);
+    var renderer = try Renderer.init(allocator, io, instance.webgpu_instance, surface);
     defer renderer.deinit(allocator);
 
     renderer.setSampleCount(4);
@@ -215,17 +215,17 @@ pub fn run() !void {
     const checker_mat = try renderer.material(allocator, Basic, .{
         .texture = .{ .tex = checker_tex },
         .smp = .{},
-    }, .@"opaque"());
+    }, .{});
 
     const white_mat = try renderer.material(allocator, Basic, .{
         .texture = .{ .tex = white_tex },
         .smp = .{},
-    }, .@"opaque"());
+    }, .{});
 
     const glass_mat = try renderer.material(allocator, Basic, .{
         .texture = .{ .tex = checker_tex },
         .smp = .{},
-    }, .transparent());
+    }, .{ .render_state = .transparent() });
 
     var cam: r.Camera = .{ .pos = .init(0, 1, 5) };
 
@@ -282,7 +282,7 @@ pub fn run() !void {
         };
         defer frame.deinit();
 
-        var main_pass = try frame.pass(allocator, .{
+        const main_pass = try frame.pass(allocator, .{
             .label = "main",
             .color_attachment = .{
                 .target = .surface,
@@ -292,32 +292,32 @@ pub fn run() !void {
         });
         try main_pass.setCamera(allocator, cam);
 
-        try main_pass.draw(cube, checker_mat, allocator, .{
+        try main_pass.draw(allocator, cube, checker_mat, .{
             .position = .{ 0, -1, 0 },
             .scale = .{ 8, 1, 8 },
             .tint = .{ 1, 1, 1, 1 },
         });
-        try main_pass.draw(cube, checker_mat, allocator, .{
+        try main_pass.draw(allocator, cube, checker_mat, .{
             .position = .{ 2, 0, 0 },
             .rotation = .{ 0, std.math.degreesToRadians(30), 0 },
             .tint = .{ 0, 0, 1, 1 },
         });
-        try main_pass.draw(cube, white_mat, allocator, .{
+        try main_pass.draw(allocator, cube, white_mat, .{
             .position = .{ 4, 0, 0 },
             .rotation = .{ 0, std.math.degreesToRadians(45), 0 },
             .tint = .{ 1, 0.5, 0, 1 },
         });
-        try main_pass.draw(cube, white_mat, allocator, .{
+        try main_pass.draw(allocator, cube, white_mat, .{
             .position = .{ -4, 0, 0 },
             .rotation = .{ 0, std.math.degreesToRadians(60), 0 },
             .tint = .{ 0.6, 0, 1, 1 },
         });
-        try main_pass.draw(cube, glass_mat, allocator, .{
+        try main_pass.draw(allocator, cube, glass_mat, .{
             .position = .{ 0, 0, 0 },
             .rotation = .{ 0, std.math.degreesToRadians(15), 0 },
             .tint = .{ 0, 1, 0, 0.3 },
         });
-        try main_pass.draw(cube, glass_mat, allocator, .{
+        try main_pass.draw(allocator, cube, glass_mat, .{
             .position = .{ -2, 0, 0 },
             .tint = .{ 1, 0, 0, 0.3 },
         });

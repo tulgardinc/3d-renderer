@@ -572,7 +572,7 @@ pub fn Renderer(config: RendererConfig) type {
             );
         }
 
-        pub fn init(io: std.Io, allocator: std.mem.Allocator, instance: c.WGPUInstance, surface: c.WGPUSurface) !Self {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, instance: c.WGPUInstance, surface: c.WGPUSurface) !Self {
             const gpu_context = try gpu.GPUContext.initSync(io, instance, surface);
             const world_uniforms_gpu = try gpu.createBuffer(
                 gpu_context,
@@ -817,6 +817,46 @@ pub fn Renderer(config: RendererConfig) type {
             );
         }
 
+        pub fn MaterialConfig(Reflected: type) type {
+            const vertex_entries: []const gpu.VertexEntryMeta = Reflected.VS orelse &.{};
+            const fragment_entries: []const []const u8 = Reflected.FS orelse &.{};
+            if (vertex_entries.len == 0) @compileError(Reflected.NAME ++ ": shader has no vertex entry point");
+
+            var vertex_names: [vertex_entries.len][]const u8 = undefined;
+            var vertex_values: [vertex_entries.len]u32 = undefined;
+            for (vertex_entries, &vertex_names, &vertex_values, 0..) |entry, *name, *value, i| {
+                name.* = entry.fn_name;
+                value.* = i;
+            }
+            var fragment_values: [fragment_entries.len]u32 = undefined;
+            for (&fragment_values, 0..) |*value, i| value.* = i;
+
+            const VertexEntry = @Enum(u32, .exhaustive, &vertex_names, &vertex_values);
+            const FragmentEntry = @Enum(u32, .exhaustive, fragment_entries, &fragment_values);
+
+            const vertex_attrs: std.builtin.Type.StructField.Attributes = if (vertex_entries.len == 1)
+                .{ .default_value_ptr = @ptrCast(&@as(VertexEntry, @enumFromInt(0))) }
+            else
+                .{};
+            const fragment_attrs: std.builtin.Type.StructField.Attributes = switch (fragment_entries.len) {
+                0 => .{ .default_value_ptr = @ptrCast(&@as(?FragmentEntry, null)) },
+                1 => .{ .default_value_ptr = @ptrCast(&@as(?FragmentEntry, @enumFromInt(0))) },
+                else => .{},
+            };
+
+            return @Struct(
+                .auto,
+                null,
+                &.{ "render_state", "vertex", "fragment" },
+                &.{ gpu.MaterialRenderState, VertexEntry, ?FragmentEntry },
+                &.{
+                    .{ .default_value_ptr = @ptrCast(&gpu.MaterialRenderState{}) },
+                    vertex_attrs,
+                    fragment_attrs,
+                },
+            );
+        }
+
         pub const MaterialTexture = struct {
             tex: gpu.Texture,
             view_config: gpu.Texture.ViewConfig = .{},
@@ -920,10 +960,17 @@ pub fn Renderer(config: RendererConfig) type {
             return try self.geometry_pool.append(allocator, canon_mesh_data);
         }
 
-        pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), render_state: gpu.MaterialRenderState) !Material(Reflected) {
+        pub fn material(self: *Self, allocator: std.mem.Allocator, Reflected: type, params: MaterialParams(Reflected), material_config: MaterialConfig(Reflected)) !Material(Reflected) {
             const Shader = gpu.Shader(Reflected);
-            const shader_id = try self.getOrCreateShader(allocator, Reflected, "vs_main", "fs_main");
-            const render_state_id = try self.getOrCreateRenderState(allocator, render_state);
+            const FragmentEntry = @typeInfo(@FieldType(MaterialConfig(Reflected), "fragment")).optional.child;
+            const fragment_entry: ?[]const u8 = if (comptime @typeInfo(FragmentEntry).@"enum".fields.len == 0)
+                null
+            else if (material_config.fragment) |entry|
+                @tagName(entry)
+            else
+                null;
+            const shader_id = try self.getOrCreateShader(allocator, Reflected, @tagName(material_config.vertex), fragment_entry);
+            const render_state_id = try self.getOrCreateRenderState(allocator, material_config.render_state);
             var resources: Shader.Resources(1) = undefined;
             const uniform_count = if (Reflected.Uniforms[1]) |bg| bg.len else 0;
             // TODO: no need for one buffer per binding
@@ -1253,7 +1300,7 @@ pub fn Renderer(config: RendererConfig) type {
             index: u8,
             desc: PassDescriptor,
 
-            pub fn setCamera(self: *@This(), allocator: std.mem.Allocator, camera: Camera) !void {
+            pub fn setCamera(self: @This(), allocator: std.mem.Allocator, camera: Camera) !void {
                 const slot = try self.renderer.stageWorldUniforms(allocator, @sizeOf(World));
                 const width, const height = blk: {
                     if (self.desc.color_attachment) |ca| {
@@ -1310,9 +1357,9 @@ pub fn Renderer(config: RendererConfig) type {
 
             pub fn draw(
                 self: @This(),
+                allocator: std.mem.Allocator,
                 mesh_id: MeshID,
                 mat: anytype,
-                allocator: std.mem.Allocator,
                 params: DrawParams(@TypeOf(mat).InstanceType),
             ) !void {
                 const material_record = self.renderer.materials.items[@intFromEnum(mat.material_id)];

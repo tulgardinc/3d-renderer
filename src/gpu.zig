@@ -1425,8 +1425,8 @@ pub fn Shader(Reflected: type) type {
 
         pub fn createBindGroup(
             self: Self,
-            comptime index: u32,
             allocator: std.mem.Allocator,
+            comptime index: u32,
             ctx: GPUContext,
             resources: Resources(index),
         ) !c.WGPUBindGroup {
@@ -1926,9 +1926,11 @@ fn indexOfVertexInput(vertex_meta: []const VertexInputMeta, name: []const u8) ?u
 }
 
 pub const MaterialRenderState = struct {
-    depth_stencil_state: DepthStencilState,
-    blend_state: ?BlendState,
-    cull_mode: CullMode,
+    // default opaque
+
+    depth_stencil_state: DepthStencilState = .{},
+    blend_state: ?BlendState = null,
+    cull_mode: CullMode = .back,
 
     pub fn @"opaque"() MaterialRenderState {
         return .{
